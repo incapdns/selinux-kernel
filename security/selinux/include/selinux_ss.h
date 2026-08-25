@@ -61,9 +61,6 @@ int selinux_ss_context_to_sid_force(struct selinux_state *state,
 				    const char *scontext, u32 scontext_len,
 				    u32 *sid, gfp_t gfp);
 
-int selinux_ss_get_user_sids(struct selinux_state *state, u32 callsid,
-			     const char *username, u32 **sids, u32 *nel);
-
 int selinux_ss_port_sid(struct selinux_state *state, u8 protocol, u16 port,
 			u32 *out_sid);
 
