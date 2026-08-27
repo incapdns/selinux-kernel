@@ -771,7 +771,11 @@ static int selinux_set_mnt_opts(struct super_block *sb,
 	/*
 	 * If this is a user namespace mount and the filesystem type is not
 	 * explicitly whitelisted, then no contexts are allowed on the command
-	 * line and security labels must be ignored.
+	 * line.  Ignore filesystem labels unless both the SELinux state and the
+	 * superblock are private to the caller's namespace.  A child SELinux
+	 * namespace may safely interpret labels from its own superblocks without
+	 * allowing an ordinary user namespace to inject labels into the host
+	 * policy.
 	 */
 	if (sb->s_user_ns != &init_user_ns &&
 	    strcmp(sb->s_type->name, "tmpfs") &&
@@ -783,17 +787,20 @@ static int selinux_set_mnt_opts(struct super_block *sb,
 			rc = -EACCES;
 			goto out;
 		}
-		if (sbsec->behavior == SECURITY_FS_USE_XATTR) {
-			sbsec->behavior = SECURITY_FS_USE_MNTPOINT;
-			rc = security_transition_sid(current_selinux_state,
-						     current_sid(),
-						     current_sid(),
-						     SECCLASS_FILE, NULL,
-						     &sbsec->mntpoint_sid);
-			if (rc)
-				goto out;
+		if (current_selinux_state == init_selinux_state ||
+		    sb->s_user_ns != current_user_ns()) {
+			if (sbsec->behavior == SECURITY_FS_USE_XATTR) {
+				sbsec->behavior = SECURITY_FS_USE_MNTPOINT;
+				rc = security_transition_sid(current_selinux_state,
+							     current_sid(),
+							     current_sid(),
+							     SECCLASS_FILE, NULL,
+							     &sbsec->mntpoint_sid);
+				if (rc)
+					goto out;
+			}
+			goto out_set_opts;
 		}
-		goto out_set_opts;
 	}
 
 	/* sets the context of the superblock for the fs being mounted. */
