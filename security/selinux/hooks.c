@@ -3014,7 +3014,7 @@ static const struct fs_parameter_spec selinux_fs_parameters[] = {
 	fsparam_string(ROOTCONTEXT_STR,	Opt_rootcontext),
 	fsparam_flag  (SECLABEL_STR,	Opt_seclabel),
 #ifdef CONFIG_SECURITY_SELINUX_NS
-	fsparam_flag ("selinuxns_defer",	Opt_defer_to_userns),
+	fsparam_flag (SELINUXNS_DEFER_STR,	Opt_defer_to_userns),
 #endif
 	{}
 };

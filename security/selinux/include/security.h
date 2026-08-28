@@ -75,6 +75,7 @@
 #define ROOTCONTEXT_STR "rootcontext"
 #define DEFCONTEXT_STR	"defcontext"
 #define SECLABEL_STR	"seclabel"
+#define SELINUXNS_DEFER_STR "selinuxns_defer"
 
 struct netlbl_lsm_secattr;
 
