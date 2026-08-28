@@ -47,10 +47,21 @@ struct task_security_struct {
 	} avdcache;
 } __randomize_layout;
 
+static inline bool task_avdcache_eligible(void)
+{
+	/*
+	 * A chained credential is checked against multiple policies, each with
+	 * its own sequence number and enforcing state.  The per-task cache only
+	 * records the current policy, so it cannot safely represent that result.
+	 */
+	return !selinux_cred(current_cred())->parent_cred;
+}
+
 static inline bool task_avdcache_permnoaudit(struct task_security_struct *tsec,
 					     u32 sid)
 {
-	return (tsec->avdcache.permissive_neveraudit &&
+	return (task_avdcache_eligible() &&
+		tsec->avdcache.permissive_neveraudit &&
 		sid == tsec->avdcache.sid &&
 		tsec->avdcache.seqno ==
 			avc_policy_seqno(current_selinux_state));

@@ -3272,6 +3272,9 @@ static inline int task_avdcache_search(struct task_security_struct *tsec,
 {
 	int orig, iter;
 
+	if (!task_avdcache_eligible())
+		return -ENOENT;
+
 	/* focused on path walk optimization, only cache directories */
 	if (isec->sclass != SECCLASS_DIR)
 		return -ENOENT;
@@ -3311,6 +3314,9 @@ static inline void task_avdcache_update(struct task_security_struct *tsec,
 					struct av_decision *avd)
 {
 	int spot;
+
+	if (!task_avdcache_eligible())
+		return;
 
 	/* focused on path walk optimization, only cache directories */
 	if (isec->sclass != SECCLASS_DIR)
