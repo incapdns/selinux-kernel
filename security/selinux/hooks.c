@@ -652,6 +652,9 @@ static int selinux_set_mnt_opts(struct super_block *sb,
 	u32 fscontext_sid = 0, context_sid = 0, rootcontext_sid = 0;
 	u32 defcontext_sid = 0;
 	int rc = 0;
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	bool claimed_deferred = false;
+#endif
 
 	/*
 	 * Specifying internal flags without providing a place to
@@ -695,8 +698,10 @@ static int selinux_set_mnt_opts(struct super_block *sb,
 
 	if (sbsec->flags & SE_SBDEFERRED_NS) {
 		if (current_selinux_state == init_selinux_state ||
+		    !selinux_initialized(current_selinux_state) ||
 		    sb->s_user_ns != current_user_ns())
 			goto out;
+		claimed_deferred = true;
 		sbsec->flags &= ~SE_SBDEFERRED_NS;
 	}
 #endif
@@ -929,6 +934,11 @@ static int selinux_set_mnt_opts(struct super_block *sb,
 out_set_opts:
 	rc = sb_finish_set_opts(sb);
 out:
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	if (rc && claimed_deferred &&
+	    !(sbsec->flags & SE_SBINITIALIZED))
+		sbsec->flags |= SE_SBDEFERRED_NS;
+#endif
 	mutex_unlock(&sbsec->lock);
 	return rc;
 out_double_mount:
