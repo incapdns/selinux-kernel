@@ -392,6 +392,9 @@ struct selinux_mnt_opts {
 	u32 context_sid;
 	u32 rootcontext_sid;
 	u32 defcontext_sid;
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	bool defer_to_userns;
+#endif
 };
 
 static void selinux_free_mnt_opts(void *mnt_opts)
@@ -406,6 +409,9 @@ enum {
 	Opt_fscontext = 2,
 	Opt_rootcontext = 3,
 	Opt_seclabel = 4,
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	Opt_defer_to_userns = 5,
+#endif
 };
 
 #define A(s, has_arg) {#s, sizeof(#s) - 1, Opt_##s, has_arg}
@@ -655,6 +661,45 @@ static int selinux_set_mnt_opts(struct super_block *sb,
 		return -EINVAL;
 
 	mutex_lock(&sbsec->lock);
+
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	/*
+	 * A privileged mount broker may materialize a filesystem context that
+	 * belongs to a child user namespace.  Finalizing the SELinux labels in
+	 * the broker's namespace would permanently associate the superblock with
+	 * the host policy.  Keep only the host-policy filesystem SID required by
+	 * sb_kern_mount and defer inode/superblock initialization until the owner
+	 * user namespace loads its private SELinux policy.
+	 */
+	if (opts && opts->defer_to_userns) {
+		u16 mount_behavior;
+
+		if (current_selinux_state != init_selinux_state ||
+		    !selinux_initialized(current_selinux_state) ||
+		    sb->s_user_ns == &init_user_ns ||
+		    sb->s_user_ns == current_user_ns() ||
+		    sbsec->flags & (SE_SBINITIALIZED | SE_SBDEFERRED_NS) ||
+		    opts->fscontext_sid || opts->context_sid ||
+		    opts->rootcontext_sid || opts->defcontext_sid) {
+			rc = -EINVAL;
+			goto out;
+		}
+		rc = security_fs_use(current_selinux_state, sb->s_type->name,
+				     &mount_behavior, &sbsec->sid);
+		if (rc)
+			goto out;
+		sbsec->creator_sid = current_sid();
+		sbsec->flags |= SE_SBDEFERRED_NS;
+		goto out;
+	}
+
+	if (sbsec->flags & SE_SBDEFERRED_NS) {
+		if (current_selinux_state == init_selinux_state ||
+		    sb->s_user_ns != current_user_ns())
+			goto out;
+		sbsec->flags &= ~SE_SBDEFERRED_NS;
+	}
+#endif
 
 	if (!selinux_initialized(current_selinux_state)) {
 		if (!opts) {
@@ -2769,6 +2814,12 @@ static int selinux_sb_mnt_opts_compat(struct super_block *sb, void *mnt_opts)
 	struct selinux_mnt_opts *opts = mnt_opts;
 	struct superblock_security_struct *sbsec = selinux_superblock(sb);
 
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	/* A deferred superblock is private and must never be reused. */
+	if (sbsec->flags & SE_SBDEFERRED_NS)
+		return 1;
+#endif
+
 	/*
 	 * Superblock not initialized (i.e. no options) - reject if any
 	 * options specified, otherwise accept.
@@ -2813,6 +2864,11 @@ static int selinux_sb_remount(struct super_block *sb, void *mnt_opts)
 {
 	struct selinux_mnt_opts *opts = mnt_opts;
 	struct superblock_security_struct *sbsec = selinux_superblock(sb);
+
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	if (sbsec->flags & SE_SBDEFERRED_NS)
+		return -EBUSY;
+#endif
 
 	if (!(sbsec->flags & SE_SBINITIALIZED))
 		return 0;
@@ -2947,6 +3003,9 @@ static const struct fs_parameter_spec selinux_fs_parameters[] = {
 	fsparam_string(FSCONTEXT_STR,	Opt_fscontext),
 	fsparam_string(ROOTCONTEXT_STR,	Opt_rootcontext),
 	fsparam_flag  (SECLABEL_STR,	Opt_seclabel),
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	fsparam_flag ("selinuxns_defer",	Opt_defer_to_userns),
+#endif
 	{}
 };
 
@@ -2959,6 +3018,26 @@ static int selinux_fs_context_parse_param(struct fs_context *fc,
 	opt = fs_parse(fc, selinux_fs_parameters, param, &result);
 	if (opt < 0)
 		return opt;
+
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	if (opt == Opt_defer_to_userns) {
+		struct selinux_mnt_opts *opts = fc->security;
+
+		if (!capable(CAP_SYS_ADMIN) ||
+		    fc->user_ns == &init_user_ns)
+			return -EPERM;
+		if (opts && opts->defer_to_userns)
+			return -EEXIST;
+		if (!opts) {
+			opts = kzalloc_obj(*opts);
+			if (!opts)
+				return -ENOMEM;
+			fc->security = opts;
+		}
+		opts->defer_to_userns = true;
+		return 0;
+	}
+#endif
 
 	return selinux_add_opt(opt, param->string, &fc->security);
 }
