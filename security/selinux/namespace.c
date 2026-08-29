@@ -294,7 +294,7 @@ int selinux_ns_control_add_map(struct selinux_ns_control *control,
 	struct selinux_global_sid_handle *target_handle = NULL;
 	struct selinux_state *source_state, *target_state;
 	u32 source_sid, target_sid;
-	int rc;
+	int rc = 0;
 
 	if (!selinux_ns_control_parent(control, actor))
 		return -EPERM;
