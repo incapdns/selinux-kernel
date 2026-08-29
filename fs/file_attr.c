@@ -75,7 +75,8 @@ void fileattr_fill_flags(struct file_kattr *fa, u32 flags)
 EXPORT_SYMBOL(fileattr_fill_flags);
 
 /**
- * vfs_fileattr_get - retrieve miscellaneous file attributes
+ * vfs_fileattr_get_mnt - retrieve miscellaneous file attributes
+ * @mnt: mount selecting the LSM label view
  * @dentry:	the object to retrieve from
  * @fa:		fileattr pointer
  *
@@ -83,7 +84,8 @@ EXPORT_SYMBOL(fileattr_fill_flags);
  *
  * Return: 0 on success, or a negative error on failure.
  */
-int vfs_fileattr_get(struct dentry *dentry, struct file_kattr *fa)
+int vfs_fileattr_get_mnt(const struct vfsmount *mnt, struct dentry *dentry,
+			 struct file_kattr *fa)
 {
 	struct inode *inode = d_inode(dentry);
 	int error;
@@ -91,11 +93,17 @@ int vfs_fileattr_get(struct dentry *dentry, struct file_kattr *fa)
 	if (!inode->i_op->fileattr_get)
 		return -ENOIOCTLCMD;
 
-	error = security_inode_file_getattr(dentry, fa);
+	error = security_inode_file_getattr_mnt(mnt, dentry, fa);
 	if (error)
 		return error;
 
 	return inode->i_op->fileattr_get(dentry, fa);
+}
+EXPORT_SYMBOL(vfs_fileattr_get_mnt);
+
+int vfs_fileattr_get(struct dentry *dentry, struct file_kattr *fa)
+{
+	return vfs_fileattr_get_mnt(NULL, dentry, fa);
 }
 EXPORT_SYMBOL(vfs_fileattr_get);
 
@@ -250,8 +258,9 @@ static int fileattr_set_prepare(struct inode *inode,
 }
 
 /**
- * vfs_fileattr_set - change miscellaneous file attributes
+ * vfs_fileattr_set_mnt - change miscellaneous file attributes
  * @idmap:	idmap of the mount
+ * @mnt:	mount selecting the LSM label view
  * @dentry:	the object to change
  * @fa:		fileattr pointer
  *
@@ -265,8 +274,9 @@ static int fileattr_set_prepare(struct inode *inode,
  *
  * Return: 0 on success, or a negative error on failure.
  */
-int vfs_fileattr_set(struct mnt_idmap *idmap, struct dentry *dentry,
-		     struct file_kattr *fa)
+int vfs_fileattr_set_mnt(struct mnt_idmap *idmap,
+			 const struct vfsmount *mnt, struct dentry *dentry,
+			 struct file_kattr *fa)
 {
 	struct inode *inode = d_inode(dentry);
 	struct file_kattr old_ma = {};
@@ -279,7 +289,7 @@ int vfs_fileattr_set(struct mnt_idmap *idmap, struct dentry *dentry,
 		return -EPERM;
 
 	inode_lock(inode);
-	err = vfs_fileattr_get(dentry, &old_ma);
+	err = vfs_fileattr_get_mnt(mnt, dentry, &old_ma);
 	if (!err) {
 		/* initialize missing bits from old_ma */
 		if (fa->flags_valid) {
@@ -295,7 +305,7 @@ int vfs_fileattr_set(struct mnt_idmap *idmap, struct dentry *dentry,
 		err = fileattr_set_prepare(inode, &old_ma, fa);
 		if (err)
 			goto out;
-		err = security_inode_file_setattr(dentry, fa);
+		err = security_inode_file_setattr_mnt(mnt, dentry, fa);
 		if (err)
 			goto out;
 		err = inode->i_op->fileattr_set(idmap, dentry, fa);
@@ -308,6 +318,13 @@ out:
 	inode_unlock(inode);
 	return err;
 }
+EXPORT_SYMBOL(vfs_fileattr_set_mnt);
+
+int vfs_fileattr_set(struct mnt_idmap *idmap, struct dentry *dentry,
+		     struct file_kattr *fa)
+{
+	return vfs_fileattr_set_mnt(idmap, NULL, dentry, fa);
+}
 EXPORT_SYMBOL(vfs_fileattr_set);
 
 int ioctl_getflags(struct file *file, unsigned int __user *argp)
@@ -315,7 +332,7 @@ int ioctl_getflags(struct file *file, unsigned int __user *argp)
 	struct file_kattr fa = { .flags_valid = true }; /* hint only */
 	int err;
 
-	err = vfs_fileattr_get(file->f_path.dentry, &fa);
+	err = vfs_fileattr_get_mnt(file->f_path.mnt, file->f_path.dentry, &fa);
 	if (!err)
 		err = put_user(fa.flags, argp);
 	return err;
@@ -334,7 +351,8 @@ int ioctl_setflags(struct file *file, unsigned int __user *argp)
 		err = mnt_want_write_file(file);
 		if (!err) {
 			fileattr_fill_flags(&fa, flags);
-			err = vfs_fileattr_set(idmap, dentry, &fa);
+			err = vfs_fileattr_set_mnt(idmap, file->f_path.mnt, dentry,
+						   &fa);
 			mnt_drop_write_file(file);
 		}
 	}
@@ -346,7 +364,7 @@ int ioctl_fsgetxattr(struct file *file, void __user *argp)
 	struct file_kattr fa = { .fsx_valid = true }; /* hint only */
 	int err;
 
-	err = vfs_fileattr_get(file->f_path.dentry, &fa);
+	err = vfs_fileattr_get_mnt(file->f_path.mnt, file->f_path.dentry, &fa);
 	if (!err)
 		err = copy_fsxattr_to_user(&fa, argp);
 
@@ -364,7 +382,8 @@ int ioctl_fssetxattr(struct file *file, void __user *argp)
 	if (!err) {
 		err = mnt_want_write_file(file);
 		if (!err) {
-			err = vfs_fileattr_set(idmap, dentry, &fa);
+			err = vfs_fileattr_set_mnt(idmap, file->f_path.mnt, dentry,
+						   &fa);
 			mnt_drop_write_file(file);
 		}
 	}
@@ -411,7 +430,7 @@ SYSCALL_DEFINE5(file_getattr, int, dfd, const char __user *, filename,
 			return error;
 	}
 
-	error = vfs_fileattr_get(filepath.dentry, &fa);
+	error = vfs_fileattr_get_mnt(filepath.mnt, filepath.dentry, &fa);
 	if (error == -ENOIOCTLCMD || error == -ENOTTY)
 		error = -EOPNOTSUPP;
 	if (error)
@@ -475,8 +494,8 @@ SYSCALL_DEFINE5(file_setattr, int, dfd, const char __user *, filename,
 
 	error = mnt_want_write(filepath.mnt);
 	if (!error) {
-		error = vfs_fileattr_set(mnt_idmap(filepath.mnt),
-					 filepath.dentry, &fa);
+		error = vfs_fileattr_set_mnt(mnt_idmap(filepath.mnt), filepath.mnt,
+					     filepath.dentry, &fa);
 		if (error == -ENOIOCTLCMD || error == -ENOTTY)
 			error = -EOPNOTSUPP;
 		mnt_drop_write(filepath.mnt);

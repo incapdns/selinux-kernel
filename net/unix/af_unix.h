@@ -17,6 +17,7 @@ struct unix_skb_parms {
 	struct scm_fp_list	*fp;		/* Passed files		*/
 #ifdef CONFIG_SECURITY_NETWORK
 	u32			secid;		/* Security ID		*/
+	struct lsm_scm_security *security;	/* Immutable LSM state */
 #endif
 	u32			consumed;
 } __randomize_layout;

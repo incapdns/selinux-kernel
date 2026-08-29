@@ -379,7 +379,8 @@ int kernfs_get_tree(struct fs_context *fc)
 	INIT_LIST_HEAD(&info->node);
 
 	fc->s_fs_info = info;
-	sb = sget_fc(fc, kernfs_test_super, kernfs_set_super);
+	sb = sget_fc_intrinsic(fc, kernfs_test_super, kernfs_set_super,
+			       kfc->root->security);
 	if (IS_ERR(sb))
 		return PTR_ERR(sb);
 

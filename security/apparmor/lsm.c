@@ -48,6 +48,16 @@
 /* Flag indicating whether initialization completed */
 int apparmor_initialized;
 
+struct apparmor_prop_ref_security {
+	struct aa_label *label;
+};
+
+static inline struct apparmor_prop_ref_security *
+apparmor_prop_ref(const struct lsm_prop_ref *ref)
+{
+	return (void *)ref->security + apparmor_blob_sizes.lbs_prop_ref;
+}
+
 union aa_buffer {
 	struct list_head list;
 	DECLARE_FLEX_ARRAY(char, buffer);
@@ -996,6 +1006,148 @@ static void apparmor_task_getlsmprop_obj(struct task_struct *p,
 	aa_put_label(label);
 }
 
+static int apparmor_prop_ref_publish(struct lsm_prop_ref *ref,
+				     struct aa_label *label, bool scalar_source)
+{
+	struct apparmor_prop_ref_security *rsec = apparmor_prop_ref(ref);
+
+	if (!label || rsec->label)
+		return -EOPNOTSUPP;
+	rsec->label = label;
+	ref->prop.apparmor.label = label;
+	if (scalar_source)
+		ref->source_secid = label->secid;
+	return 0;
+}
+
+static int apparmor_prop_ref_capture(struct lsm_prop_ref *ref,
+				     const struct lsm_prop_ref_source *source,
+				     gfp_t gfp)
+{
+	struct aa_label *label;
+	int rc;
+
+	if (apparmor_prop_ref(ref)->label)
+		return -EEXIST;
+
+	switch (source->kind) {
+	case LSM_PROP_REF_CRED_SUBJ:
+	case LSM_PROP_REF_CURRENT_SUBJ:
+		label = aa_get_newest_cred_label(source->cred);
+		break;
+	case LSM_PROP_REF_TASK_OBJ:
+		label = aa_get_task_label(source->task);
+		break;
+	case LSM_PROP_REF_SECCTX:
+		label = aa_label_strn_parse(&root_ns->unconfined->label,
+					    source->secctx.data,
+					    source->secctx.len, gfp, false,
+					    false);
+		if (IS_ERR(label)) {
+			rc = PTR_ERR(label);
+			if (source->lsmid == LSM_ID_UNDEF &&
+			    (rc == -EINVAL || rc == -ENOENT))
+				return -EOPNOTSUPP;
+			return rc;
+		}
+		break;
+	case LSM_PROP_REF_SECID:
+		label = aa_secid_to_label_ref(source->secid);
+		if (!label)
+			return -EOPNOTSUPP;
+		break;
+	case LSM_PROP_REF_INODE_OBJ:
+	case LSM_PROP_REF_IPC_OBJ:
+		/* AppArmor has no durable label identity on these objects. */
+		return -EOPNOTSUPP;
+	default:
+		return -EINVAL;
+	}
+
+	rc = apparmor_prop_ref_publish(
+		ref, label, source->kind == LSM_PROP_REF_SECCTX ||
+			    source->kind == LSM_PROP_REF_SECID);
+	if (rc)
+		aa_put_label(label);
+	return rc;
+}
+
+static void apparmor_prop_ref_free(struct lsm_prop_ref *ref)
+{
+	struct apparmor_prop_ref_security *rsec = apparmor_prop_ref(ref);
+
+	aa_put_label(rsec->label);
+	rsec->label = NULL;
+}
+
+static int apparmor_prop_ref_to_secctx(const struct lsm_prop_ref *ref,
+				       const struct cred *observer,
+				       struct lsm_context *cp)
+{
+	const struct apparmor_prop_ref_security *rsec = apparmor_prop_ref(ref);
+	struct aa_label *observer_label;
+	struct aa_label *label;
+	struct aa_ns *view;
+	int flags = FLAG_VIEW_SUBNS | FLAG_HIDDEN_UNCONFINED | FLAG_ABS_ROOT;
+	int len;
+
+	if (!rsec->label)
+		return -EOPNOTSUPP;
+	if (ref->prop.apparmor.label != rsec->label)
+		return -ESTALE;
+
+	label = aa_get_newest_label(rsec->label);
+	observer_label = aa_get_newest_cred_label(observer);
+	view = labels_ns(observer_label);
+	if (labels_ns(label) != labels_ns(rsec->label) ||
+	    !aa_ns_visible(view, labels_ns(label), true)) {
+		len = -EOPNOTSUPP;
+		goto out;
+	}
+	if (apparmor_display_secid_mode)
+		flags |= FLAG_SHOW_MODE;
+	len = aa_label_asxprint(&cp->context, view, label, flags, GFP_ATOMIC);
+	if (len < 0) {
+		len = -ENOMEM;
+		goto out;
+	}
+	cp->len = len;
+	cp->id = LSM_ID_APPARMOR;
+out:
+	aa_put_label(observer_label);
+	aa_put_label(label);
+	return len;
+}
+
+static int apparmor_kernel_act_as_ref(struct cred *new,
+				      const struct lsm_prop_ref *ref)
+{
+	const struct apparmor_prop_ref_security *rsec = apparmor_prop_ref(ref);
+	struct aa_label *label;
+	struct aa_label *old;
+
+	if (!rsec->label)
+		return 0;
+	if (ref->prop.apparmor.label != rsec->label)
+		return -ESTALE;
+
+	label = aa_get_newest_label(rsec->label);
+	old = cred_label(new);
+	/*
+	 * A kernel override may add confinement in the same policy namespace;
+	 * it must not discard any already-active confined profile.
+	 */
+	if (!old || labels_ns(label) != labels_ns(rsec->label) ||
+	    labels_ns(old) != labels_ns(label) ||
+	    !aa_label_is_unconfined_subset(label, old)) {
+		aa_put_label(label);
+		return -EOPNOTSUPP;
+	}
+	set_cred_label(new, label);
+	aa_put_label(old);
+	return 0;
+}
+
 static int apparmor_task_setrlimit(struct task_struct *task,
 		unsigned int resource, struct rlimit *new_rlim)
 {
@@ -1658,6 +1810,7 @@ static int apparmor_inet_conn_request(const struct sock *sk, struct sk_buff *skb
 struct lsm_blob_sizes apparmor_blob_sizes __ro_after_init = {
 	.lbs_cred = sizeof(struct aa_label *),
 	.lbs_file = sizeof(struct aa_file_ctx),
+	.lbs_prop_ref = sizeof(struct apparmor_prop_ref_security),
 	.lbs_task = sizeof(struct aa_task_ctx),
 	.lbs_sock = sizeof(struct aa_sk_ctx),
 };
@@ -1766,6 +1919,10 @@ static struct security_hook_list apparmor_hooks[] __ro_after_init = {
 	LSM_HOOK_INIT(secid_to_secctx, apparmor_secid_to_secctx),
 	LSM_HOOK_INIT(lsmprop_to_secctx, apparmor_lsmprop_to_secctx),
 	LSM_HOOK_INIT(secctx_to_secid, apparmor_secctx_to_secid),
+	LSM_HOOK_INIT(prop_ref_capture, apparmor_prop_ref_capture),
+	LSM_HOOK_INIT(prop_ref_free, apparmor_prop_ref_free),
+	LSM_HOOK_INIT(prop_ref_to_secctx, apparmor_prop_ref_to_secctx),
+	LSM_HOOK_INIT(kernel_act_as_ref, apparmor_kernel_act_as_ref),
 	LSM_HOOK_INIT(release_secctx, apparmor_release_secctx),
 
 #ifdef CONFIG_IO_URING

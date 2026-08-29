@@ -304,7 +304,7 @@ static int tcx_link_init(struct tcx_link *tcx,
 	bpf_link_init(&tcx->link, BPF_LINK_TYPE_TCX, &tcx_link_lops, prog,
 		      attr->link_create.attach_type);
 	tcx->dev = dev;
-	return bpf_link_prime(&tcx->link, link_primer);
+	return bpf_link_prime(&tcx->link, link_primer, NULL, NULL);
 }
 
 int tcx_link_attach(const union bpf_attr *attr, struct bpf_prog *prog)

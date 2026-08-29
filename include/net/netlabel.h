@@ -21,6 +21,7 @@
 #include <linux/skbuff.h>
 #include <linux/in.h>
 #include <linux/in6.h>
+#include <linux/security.h>
 #include <net/netlink.h>
 #include <net/request_sock.h>
 #include <linux/refcount.h>
@@ -162,6 +163,7 @@ struct netlbl_lsm_catmap {
  * @type: indicate the NLTYPE of the attributes
  * @domain: the NetLabel LSM domain
  * @cache: NetLabel LSM specific cache
+ * @prop_ref: strong immutable LSM property carrier
  * @attr.mls: MLS sensitivity label
  * @attr.mls.cat: MLS category bitmap
  * @attr.mls.lvl: MLS sensitivity level
@@ -187,6 +189,7 @@ struct netlbl_lsm_secattr {
 #define NETLBL_SECATTR_MLS_LVL          0x00000004
 #define NETLBL_SECATTR_MLS_CAT          0x00000008
 #define NETLBL_SECATTR_SECID            0x00000010
+#define NETLBL_SECATTR_PROP_REF         0x00000020
 	/* bitmap meta-values for 'flags' */
 #define NETLBL_SECATTR_FREE_DOMAIN      0x01000000
 #define NETLBL_SECATTR_CACHEABLE        (NETLBL_SECATTR_MLS_LVL | \
@@ -195,6 +198,7 @@ struct netlbl_lsm_secattr {
 	u32 type;
 	char *domain;
 	struct netlbl_lsm_cache *cache;
+	struct lsm_prop_ref *prop_ref;
 	struct {
 		struct {
 			struct netlbl_lsm_catmap *cat;
@@ -369,6 +373,8 @@ static inline void netlbl_secattr_destroy(struct netlbl_lsm_secattr *secattr)
 		netlbl_secattr_cache_free(secattr->cache);
 	if (secattr->flags & NETLBL_SECATTR_MLS_CAT)
 		netlbl_catmap_free(secattr->attr.mls.cat);
+	if (secattr->flags & NETLBL_SECATTR_PROP_REF)
+		security_lsm_prop_ref_put(secattr->prop_ref);
 }
 
 /**
@@ -421,6 +427,13 @@ int netlbl_cfg_unlbl_static_add(struct net *net,
 				u16 family,
 				u32 secid,
 				struct netlbl_audit *audit_info);
+int netlbl_cfg_unlbl_static_add_ref(struct net *net,
+				    const char *dev_name,
+				    const void *addr,
+				    const void *mask,
+				    u16 family,
+				    struct lsm_prop_ref *prop_ref,
+				    struct netlbl_audit *audit_info);
 int netlbl_cfg_unlbl_static_del(struct net *net,
 				const char *dev_name,
 				const void *addr,
@@ -531,6 +544,13 @@ static inline int netlbl_cfg_unlbl_static_add(struct net *net,
 					      u16 family,
 					      u32 secid,
 					      struct netlbl_audit *audit_info)
+{
+	return -ENOSYS;
+}
+static inline int netlbl_cfg_unlbl_static_add_ref(
+	struct net *net, const char *dev_name, const void *addr, const void *mask,
+	u16 family, struct lsm_prop_ref *prop_ref,
+	struct netlbl_audit *audit_info)
 {
 	return -ENOSYS;
 }

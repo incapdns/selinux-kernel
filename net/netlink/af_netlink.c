@@ -2024,6 +2024,14 @@ __netlink_kernel_create(struct net *net, int unit, struct module *module,
 	if (__netlink_create(net, sock, unit, 1) < 0)
 		goto out_sock_release_nosk;
 
+	/*
+	 * sock_create_lite() ran the LSM post-create hooks before struct sock
+	 * existed.  Complete security initialization now that the final kernel
+	 * Netlink socket, including its network namespace, is available.
+	 */
+	if (security_socket_post_create(sock, PF_NETLINK, SOCK_DGRAM, unit, 1))
+		goto out_sock_release_nosk;
+
 	sk = sock->sk;
 
 	if (!cfg || cfg->groups < 32)

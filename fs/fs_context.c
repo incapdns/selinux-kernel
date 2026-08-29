@@ -197,7 +197,7 @@ int vfs_parse_monolithic_sep(struct fs_context *fc, void *data,
 	if (!options)
 		return 0;
 
-	ret = security_sb_eat_lsm_opts(options, &fc->security);
+	ret = security_sb_eat_lsm_opts(options, fc);
 	if (ret)
 		return ret;
 
@@ -320,24 +320,35 @@ struct fs_context *fs_context_for_reconfigure(struct dentry *dentry,
 }
 
 /**
- * fs_context_for_submount: allocate a new fs_context for a submount
+ * __fs_context_for_submount - Allocate a new fs_context for a submount
  * @type: file_system_type of the new context
- * @reference: reference dentry from which to copy relevant info
+ * @reference: reference path from which to copy relevant info
+ * @cred: credentials to bind to the context, or NULL to use current credentials
  *
  * Allocate a new fs_context suitable for a submount. This also ensures that
- * the fc->security object is inherited from @reference (if needed).
+ * the fc->security object is inherited from @reference (if needed).  Passing
+ * the complete path preserves the selecting mount for mount-scoped security
+ * state.
+ *
+ * Return: A new filesystem context or an error pointer.
  */
-struct fs_context *fs_context_for_submount(struct file_system_type *type,
-					   struct dentry *reference)
+static struct fs_context *__fs_context_for_submount(
+	struct file_system_type *type, const struct path *reference,
+	const struct cred *cred)
 {
 	struct fs_context *fc;
 	int ret;
 
-	fc = alloc_fs_context(type, reference, 0, 0, FS_CONTEXT_FOR_SUBMOUNT);
+	fc = alloc_fs_context(type, reference->dentry, 0, 0,
+			      FS_CONTEXT_FOR_SUBMOUNT);
 	if (IS_ERR(fc))
 		return fc;
+	if (cred && fc->cred != cred) {
+		put_cred(fc->cred);
+		fc->cred = get_cred(cred);
+	}
 
-	ret = security_fs_context_submount(fc, reference->d_sb);
+	ret = security_fs_context_submount(fc, reference);
 	if (ret) {
 		put_fs_context(fc);
 		return ERR_PTR(ret);
@@ -345,7 +356,46 @@ struct fs_context *fs_context_for_submount(struct file_system_type *type,
 
 	return fc;
 }
+
+/**
+ * fs_context_for_submount - Allocate a new fs_context for a submount
+ * @type: file_system_type of the new context
+ * @reference: reference path from which to copy relevant info
+ *
+ * Allocate a new fs_context suitable for a submount using the current
+ * credentials.  The complete reference path preserves the selecting mount for
+ * mount-scoped security state.
+ *
+ * Return: A new filesystem context or an error pointer.
+ */
+struct fs_context *fs_context_for_submount(struct file_system_type *type,
+					   const struct path *reference)
+{
+	return __fs_context_for_submount(type, reference, NULL);
+}
 EXPORT_SYMBOL(fs_context_for_submount);
+
+/**
+ * fs_context_for_submount_cred - Allocate a credential-bound submount context
+ * @type: file_system_type of the new context
+ * @reference: reference path from which to copy relevant info
+ * @cred: credentials to bind to the new context
+ *
+ * Allocate a new fs_context suitable for a submount while binding it to an
+ * explicit credential.  The complete reference path preserves the selecting
+ * mount for mount-scoped security state.
+ *
+ * Return: A new filesystem context or an error pointer.
+ */
+struct fs_context *fs_context_for_submount_cred(
+	struct file_system_type *type, const struct path *reference,
+	const struct cred *cred)
+{
+	if (!cred)
+		return ERR_PTR(-EINVAL);
+	return __fs_context_for_submount(type, reference, cred);
+}
+EXPORT_SYMBOL(fs_context_for_submount_cred);
 
 void fc_drop_locked(struct fs_context *fc)
 {

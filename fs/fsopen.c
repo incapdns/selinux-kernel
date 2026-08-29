@@ -235,7 +235,7 @@ static int vfs_cmd_create(struct fs_context *fc, bool exclusive)
 	}
 
 	sb = fc->root->d_sb;
-	ret = security_sb_kern_mount(sb);
+	ret = security_sb_kern_mount(sb, fc);
 	if (unlikely(ret)) {
 		fc_drop_locked(fc);
 		fc->phase = FS_CONTEXT_FAILED;

@@ -13,6 +13,23 @@
 #include <net/flow.h>
 #include <net/xfrm.h>
 
+struct selinux_label_view;
+struct selinux_net_assertion;
+struct selinux_net_provenance;
+struct selinux_state;
+
+/*
+ * SELinux-private lifetime metadata prefixes the public XFRM context.  The
+ * aligned byte array holds an unmodified struct xfrm_sec_ctx and ctx_str.
+ */
+struct selinux_xfrm_sec_ctx {
+	struct selinux_state *state;
+	const struct selinux_label_view *view;
+	struct selinux_net_assertion *assertion;
+	struct selinux_net_provenance *provenance;
+	u8 ctx[] __aligned(__alignof__(struct xfrm_sec_ctx));
+};
+
 int selinux_xfrm_policy_alloc(struct xfrm_sec_ctx **ctxp,
 			      struct xfrm_user_sec_ctx *uctx, gfp_t gfp);
 int selinux_xfrm_policy_clone(struct xfrm_sec_ctx *old_ctx,
@@ -22,13 +39,16 @@ int selinux_xfrm_policy_delete(struct xfrm_sec_ctx *ctx);
 int selinux_xfrm_state_alloc(struct xfrm_state *x,
 			     struct xfrm_user_sec_ctx *uctx);
 int selinux_xfrm_state_alloc_acquire(struct xfrm_state *x,
-				     struct xfrm_sec_ctx *polsec, u32 secid);
+				     struct xfrm_sec_ctx *polsec, u32 secid,
+				     const struct xfrm_flow_origin *origin);
 void selinux_xfrm_state_free(struct xfrm_state *x);
 int selinux_xfrm_state_delete(struct xfrm_state *x);
-int selinux_xfrm_policy_lookup(struct xfrm_sec_ctx *ctx, u32 fl_secid);
+int selinux_xfrm_policy_lookup(struct xfrm_sec_ctx *ctx, u32 fl_secid,
+			       const struct xfrm_flow_origin *origin);
 int selinux_xfrm_state_pol_flow_match(struct xfrm_state *x,
 				      struct xfrm_policy *xp,
-				      const struct flowi_common *flic);
+				      const struct flowi_common *flic,
+				      const struct xfrm_flow_origin *origin);
 
 #ifdef CONFIG_SECURITY_NETWORK_XFRM
 extern atomic_t selinux_xfrm_refcount;
@@ -46,6 +66,12 @@ int selinux_xfrm_postroute_last(u32 sk_sid, struct sk_buff *skb,
 				struct common_audit_data *ad, u8 proto);
 int selinux_xfrm_decode_session(struct sk_buff *skb, u32 *sid, int ckall);
 int selinux_xfrm_skb_sid(struct sk_buff *skb, u32 *sid);
+int selinux_xfrm_skb_provenance(struct sk_buff *skb,
+				struct selinux_net_provenance **provenancep);
+int selinux_xfrm_skb_provenance_ingress(
+	struct sk_buff *skb, struct selinux_net_provenance **provenancep);
+int selinux_xfrm_skb_provenance_egress(
+	struct sk_buff *skb, struct selinux_net_provenance **provenancep);
 
 static inline void selinux_xfrm_notify_policyload(void)
 {
@@ -91,6 +117,27 @@ static inline void selinux_xfrm_notify_policyload(void)
 static inline int selinux_xfrm_skb_sid(struct sk_buff *skb, u32 *sid)
 {
 	*sid = SECSID_NULL;
+	return 0;
+}
+
+static inline int selinux_xfrm_skb_provenance(
+	struct sk_buff *skb, struct selinux_net_provenance **provenancep)
+{
+	*provenancep = NULL;
+	return 0;
+}
+
+static inline int selinux_xfrm_skb_provenance_ingress(
+	struct sk_buff *skb, struct selinux_net_provenance **provenancep)
+{
+	*provenancep = NULL;
+	return 0;
+}
+
+static inline int selinux_xfrm_skb_provenance_egress(
+	struct sk_buff *skb, struct selinux_net_provenance **provenancep)
+{
+	*provenancep = NULL;
 	return 0;
 }
 #endif

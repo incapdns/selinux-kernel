@@ -695,16 +695,19 @@ EXPORT_SYMBOL(generic_shutdown_super);
 bool mount_capable(struct fs_context *fc)
 {
 	if (!(fc->fs_type->fs_flags & FS_USERNS_MOUNT))
-		return capable(CAP_SYS_ADMIN);
+		return security_capable(fc->cred, &init_user_ns, CAP_SYS_ADMIN,
+					CAP_OPT_NONE) == 0;
 	else
-		return ns_capable(fc->user_ns, CAP_SYS_ADMIN);
+		return security_capable(fc->cred, fc->user_ns, CAP_SYS_ADMIN,
+					CAP_OPT_NONE) == 0;
 }
 
 /**
- * sget_fc - Find or create a superblock
+ * sget_fc_intrinsic - Find or create a superblock with intrinsic provenance
  * @fc:	Filesystem context.
  * @test: Comparison callback
  * @set: Setup callback
+ * @security_carrier: optional caller-owned security provenance
  *
  * Create a new superblock or find an existing one.
  *
@@ -732,9 +735,11 @@ bool mount_capable(struct fs_context *fc)
  * Return: On success, an extant or newly created superblock is
  *         returned. On failure an error pointer is returned.
  */
-struct super_block *sget_fc(struct fs_context *fc,
+struct super_block *sget_fc_intrinsic(
+			    struct fs_context *fc,
 			    int (*test)(struct super_block *, struct fs_context *),
-			    int (*set)(struct super_block *, struct fs_context *))
+			    int (*set)(struct super_block *, struct fs_context *),
+			    const void *security_carrier)
 {
 	struct super_block *s = NULL;
 	struct super_block *old;
@@ -766,6 +771,12 @@ retry:
 		s = alloc_super(fc->fs_type, fc->sb_flags, user_ns);
 		if (!s)
 			return ERR_PTR(-ENOMEM);
+		/* s is unpublished and s_umount is held; sb_lock is not held. */
+		err = security_sb_pre_fill(s, fc, security_carrier, true);
+		if (err) {
+			destroy_unused_super(s);
+			return ERR_PTR(err);
+		}
 		goto retry;
 	}
 
@@ -806,7 +817,32 @@ share_extant_sb:
 	if (!grab_super(old))
 		goto retry;
 	destroy_unused_super(s);
+	/* grab_super() dropped sb_lock and returns with s_umount held. */
+	err = security_sb_pre_fill(old, fc, security_carrier, false);
+	if (err) {
+		deactivate_locked_super(old);
+		return ERR_PTR(err);
+	}
 	return old;
+}
+EXPORT_SYMBOL(sget_fc_intrinsic);
+
+/**
+ * sget_fc - Find or create a superblock without an intrinsic carrier
+ * @fc: Filesystem context
+ * @test: Comparison callback
+ * @set: Setup callback
+ *
+ * Compatibility wrapper for callers whose superblock provenance is fully
+ * represented by @fc.
+ *
+ * Return: an existing or newly created superblock, or an error pointer.
+ */
+struct super_block *sget_fc(struct fs_context *fc,
+			    int (*test)(struct super_block *, struct fs_context *),
+			    int (*set)(struct super_block *, struct fs_context *))
+{
+	return sget_fc_intrinsic(fc, test, set, NULL);
 }
 EXPORT_SYMBOL(sget_fc);
 
@@ -1713,6 +1749,12 @@ int vfs_get_tree(struct fs_context *fc)
 	sb = fc->root->d_sb;
 	WARN_ON(!sb->s_bdi);
 
+	error = security_sb_set_mnt_opts(sb, fc->security, 0, NULL);
+	if (unlikely(error)) {
+		fc_drop_locked(fc);
+		return error;
+	}
+
 	/*
 	 * super_wake() contains a memory barrier which also care of
 	 * ordering for super_cache_count(). We place it before setting
@@ -1721,12 +1763,6 @@ int vfs_get_tree(struct fs_context *fc)
 	 * the SB_BORN flag.
 	 */
 	super_wake(sb, SB_BORN);
-
-	error = security_sb_set_mnt_opts(sb, fc->security, 0, NULL);
-	if (unlikely(error)) {
-		fc_drop_locked(fc);
-		return error;
-	}
 
 	/*
 	 * filesystems should never set s_maxbytes larger than MAX_LFS_FILESIZE

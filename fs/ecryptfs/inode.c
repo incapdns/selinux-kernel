@@ -614,6 +614,8 @@ ecryptfs_rename(struct mnt_idmap *idmap, struct inode *old_dir,
 	target_inode = d_inode(new_dentry);
 
 	rd.mnt_idmap  = &nop_mnt_idmap;
+	rd.old_mnt = ecryptfs_superblock_to_private(old_dir->i_sb)->lower_mnt;
+	rd.new_mnt = rd.old_mnt;
 	rd.old_parent = lower_old_dir_dentry;
 	rd.new_parent = lower_new_dir_dentry;
 	rc = start_renaming_two_dentries(&rd, lower_old_dentry, lower_new_dentry);
@@ -734,6 +736,7 @@ static int __ecryptfs_truncate(struct dentry *dentry, const struct iattr *ia)
 {
 	struct dentry *lower_dentry = ecryptfs_dentry_to_lower(dentry);
 	struct inode *inode = d_inode(dentry);
+	struct vfsmount *lower_mnt;
 	struct ecryptfs_crypt_stat *crypt_stat;
 	loff_t i_size = i_size_read(inode);
 	loff_t lower_size_before_truncate;
@@ -741,6 +744,8 @@ static int __ecryptfs_truncate(struct dentry *dentry, const struct iattr *ia)
 	struct iattr lower_ia;
 	size_t num_zeros;
 	int rc;
+
+	lower_mnt = ecryptfs_superblock_to_private(inode->i_sb)->lower_mnt;
 
 	ecryptfs_iattr_to_lower(&lower_ia, ia);
 
@@ -821,7 +826,8 @@ static int __ecryptfs_truncate(struct dentry *dentry, const struct iattr *ia)
 set_size:
 	lower_ia.ia_valid |= ATTR_SIZE;
 	inode_lock(d_inode(lower_dentry));
-	rc = notify_change(&nop_mnt_idmap, lower_dentry, &lower_ia, NULL);
+	rc = notify_change_mnt(&nop_mnt_idmap, lower_mnt, lower_dentry,
+			       &lower_ia, NULL);
 	inode_unlock(d_inode(lower_dentry));
 out:
 	ecryptfs_put_lower_file(inode);
@@ -852,8 +858,10 @@ static int
 ecryptfs_permission(struct mnt_idmap *idmap, struct inode *inode,
 		    int mask)
 {
-	return inode_permission(&nop_mnt_idmap,
-				ecryptfs_inode_to_lower(inode), mask);
+	return inode_permission_mnt(
+		&nop_mnt_idmap,
+		ecryptfs_superblock_to_private(inode->i_sb)->lower_mnt,
+		ecryptfs_inode_to_lower(inode), mask);
 }
 
 /**
@@ -875,8 +883,11 @@ static int ecryptfs_setattr(struct mnt_idmap *idmap,
 	struct inode *inode = d_inode(dentry);
 	struct dentry *lower_dentry = ecryptfs_dentry_to_lower(dentry);
 	struct inode *lower_inode = ecryptfs_inode_to_lower(inode);
+	struct vfsmount *lower_mnt;
 	struct ecryptfs_crypt_stat *crypt_stat;
 	int rc;
+
+	lower_mnt = ecryptfs_superblock_to_private(inode->i_sb)->lower_mnt;
 
 	crypt_stat = &ecryptfs_inode_to_private(d_inode(dentry))->crypt_stat;
 	if (!(crypt_stat->flags & ECRYPTFS_STRUCT_INITIALIZED))
@@ -930,8 +941,8 @@ static int ecryptfs_setattr(struct mnt_idmap *idmap,
 		ecryptfs_iattr_to_lower(&lower_ia, ia);
 
 		inode_lock(d_inode(lower_dentry));
-		rc = notify_change(&nop_mnt_idmap, lower_dentry, &lower_ia,
-				NULL);
+		rc = notify_change_mnt(&nop_mnt_idmap, lower_mnt, lower_dentry,
+				       &lower_ia, NULL);
 		inode_unlock(d_inode(lower_dentry));
 	}
 out:
@@ -1075,16 +1086,20 @@ out:
 
 static int ecryptfs_fileattr_get(struct dentry *dentry, struct file_kattr *fa)
 {
-	return vfs_fileattr_get(ecryptfs_dentry_to_lower(dentry), fa);
+	struct path lower_path = ecryptfs_lower_path(dentry);
+
+	return vfs_fileattr_get_mnt(lower_path.mnt, lower_path.dentry, fa);
 }
 
 static int ecryptfs_fileattr_set(struct mnt_idmap *idmap,
 				 struct dentry *dentry, struct file_kattr *fa)
 {
-	struct dentry *lower_dentry = ecryptfs_dentry_to_lower(dentry);
+	struct path lower_path = ecryptfs_lower_path(dentry);
+	struct dentry *lower_dentry = lower_path.dentry;
 	int rc;
 
-	rc = vfs_fileattr_set(&nop_mnt_idmap, lower_dentry, fa);
+	rc = vfs_fileattr_set_mnt(&nop_mnt_idmap, lower_path.mnt,
+				  lower_dentry, fa);
 	fsstack_copy_attr_all(d_inode(dentry), d_inode(lower_dentry));
 
 	return rc;

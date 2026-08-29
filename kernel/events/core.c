@@ -13732,6 +13732,10 @@ perf_event_set_output(struct perf_event *event, struct perf_event *output_event)
 		mutex_lock(&event->mmap_mutex);
 		goto set;
 	}
+	ret = security_perf_event_relation(
+		output_event, PERF_SECURITY_RELATION_WRITE);
+	if (ret)
+		goto out;
 
 	/* don't allow circular references */
 	if (event == output_event)
@@ -13987,6 +13991,12 @@ SYSCALL_DEFINE5(perf_event_open,
 			output_event = group_leader;
 		if (flags & PERF_FLAG_FD_NO_GROUP)
 			group_leader = NULL;
+		else {
+			err = security_perf_event_relation(
+				group_leader, PERF_SECURITY_RELATION_WRITE);
+			if (err)
+				goto err_fd;
+		}
 	}
 
 	if (pid != -1 && !(flags & PERF_FLAG_PID_CGROUP)) {

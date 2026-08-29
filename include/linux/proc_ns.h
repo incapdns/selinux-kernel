@@ -17,11 +17,15 @@ struct inode;
 struct proc_ns_operations {
 	const char *name;
 	const char *real_ns_name;
+	bool (*get_lifetime)(struct ns_common *ns);
+	bool (*is_current)(struct ns_common *ns);
 	struct ns_common *(*get)(struct task_struct *task);
 	void (*put)(struct ns_common *ns);
 	int (*install)(struct nsset *nsset, struct ns_common *ns);
 	struct user_namespace *(*owner)(struct ns_common *ns);
 	struct ns_common *(*get_parent)(struct ns_common *ns);
+	long (*ioctl)(struct ns_common *ns, unsigned int cmd,
+		      unsigned long arg);
 } __randomize_layout;
 
 extern const struct proc_ns_operations netns_operations;
@@ -34,6 +38,9 @@ extern const struct proc_ns_operations mntns_operations;
 extern const struct proc_ns_operations cgroupns_operations;
 extern const struct proc_ns_operations timens_operations;
 extern const struct proc_ns_operations timens_for_children_operations;
+#ifdef CONFIG_SECURITY_SELINUX_NS
+extern const struct proc_ns_operations selinuxns_operations;
+#endif
 
 /*
  * We always define these enumerators

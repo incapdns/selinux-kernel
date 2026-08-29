@@ -15,15 +15,31 @@
 #include <linux/spinlock_types.h>
 #include <linux/log2.h>
 #include <linux/hashtable.h>
+#include <linux/rcupdate.h>
 
 #include "context.h"
 
 #ifdef CONFIG_SECURITY_SELINUX_NS
+struct selinux_label_domain;
+struct selinux_label_ref;
+struct selinux_policy;
 #if CONFIG_SECURITY_SELINUX_SS_SID_CACHE_SIZE > 0
+struct sidtab_ss_sid_cache_entry {
+	u64 domain_id;
+	const struct selinux_policy *policy_cookie;
+	unsigned long policycaps;
+	u64 chain_epoch;
+	u32 seqno;
+	u32 ss_sid;
+	bool initialized;
+	bool active;
+	struct rcu_head rcu;
+};
+
 struct sidtab_ss_sid_cache {
-	u32 ss_sid[CONFIG_SECURITY_SELINUX_SS_SID_CACHE_SIZE];
-	struct selinux_state *state[CONFIG_SECURITY_SELINUX_SS_SID_CACHE_SIZE];
-	int first, last;
+	struct sidtab_ss_sid_cache_entry __rcu
+		*slots[CONFIG_SECURITY_SELINUX_SS_SID_CACHE_SIZE];
+	u32 next;
 };
 #endif
 #endif
@@ -34,8 +50,8 @@ struct sidtab_entry {
 	struct context context;
 	struct hlist_node list;
 #ifdef CONFIG_SECURITY_SELINUX_NS
-	u32 ss_sid;
-	struct selinux_state *state;
+	struct selinux_label_domain *origin_domain;
+	struct selinux_label_ref *label_ref;
 #if CONFIG_SECURITY_SELINUX_SS_SID_CACHE_SIZE > 0
 	struct sidtab_ss_sid_cache ss_sid_cache;
 #endif
@@ -115,6 +131,7 @@ int sidtab_init(struct sidtab *s);
 int sidtab_set_initial(struct sidtab *s, u32 sid, struct context *context);
 struct sidtab_entry *sidtab_search_entry(struct sidtab *s, u32 sid);
 struct sidtab_entry *sidtab_search_entry_force(struct sidtab *s, u32 sid);
+struct sidtab_entry *sidtab_search_entry_exact(struct sidtab *s, u32 sid);
 
 static inline struct context *sidtab_search(struct sidtab *s, u32 sid)
 {
@@ -143,7 +160,10 @@ int sidtab_context_to_sid(struct sidtab *s, struct context *context, u32 *sid);
 
 #ifdef CONFIG_SECURITY_SELINUX_NS
 int sidtab_context_ss_to_sid(struct sidtab *s, struct context *context,
-			     struct selinux_state *state, u32 ss_sid, u32 *sid);
+			     struct selinux_state *state, u32 *sid);
+int sidtab_set_initial_domain(struct sidtab *s, u32 sid,
+			      struct context *context,
+			      struct selinux_label_domain *domain);
 #endif
 
 void sidtab_destroy(struct sidtab *s);
@@ -153,6 +173,10 @@ int sidtab_hash_stats(struct sidtab *sidtab, char *page);
 #ifdef CONFIG_SECURITY_SELINUX_NS
 extern void sidtab_invalidate_state(struct sidtab *s,
 				    struct selinux_state *state);
+#ifdef CONFIG_SECURITY_SELINUX_KUNIT_TEST
+void selinux_kunit_sidtab_invalidate_state_entry(struct sidtab_entry *entry,
+						 struct selinux_state *state);
+#endif
 #endif /* CONFIG_SECURITY_SELINUX_NS */
 
 #endif /* _SS_SIDTAB_H_ */

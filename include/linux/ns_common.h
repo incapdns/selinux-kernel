@@ -22,8 +22,8 @@ static __always_inline bool is_ns_init_inum(const struct ns_common *ns)
 
 static __always_inline bool is_ns_init_id(const struct ns_common *ns)
 {
-	VFS_WARN_ON_ONCE(ns->ns_id == 0);
-	return ns->ns_id <= NS_LAST_INIT_ID;
+	/* Zero is a private, unassigned constructor state. */
+	return ns->ns_id && ns->ns_id <= NS_LAST_INIT_ID;
 }
 
 #define NS_COMMON_INIT(nsname)										\
@@ -133,16 +133,7 @@ void __ns_ref_active_put(struct ns_common *ns);
 #define ns_ref_active_put(__ns) \
 	do { if (__ns) __ns_ref_active_put(to_ns_common(__ns)); } while (0)
 
-static __always_inline struct ns_common *__must_check ns_get_unless_inactive(struct ns_common *ns)
-{
-	if (!__ns_ref_active_read(ns)) {
-		VFS_WARN_ON_ONCE(is_ns_init_id(ns));
-		return NULL;
-	}
-	if (!__ns_ref_get(ns))
-		return NULL;
-	return ns;
-}
+struct ns_common *__must_check ns_get_unless_inactive(struct ns_common *ns);
 
 void __ns_ref_active_get(struct ns_common *ns);
 

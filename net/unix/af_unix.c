@@ -256,16 +256,25 @@ static void unix_table_double_unlock(struct net *net,
 static void unix_get_secdata(struct scm_cookie *scm, struct sk_buff *skb)
 {
 	UNIXCB(skb).secid = scm->secid;
+	UNIXCB(skb).security = security_scm_get(scm->security);
 }
 
 static inline void unix_set_secdata(struct scm_cookie *scm, struct sk_buff *skb)
 {
 	scm->secid = UNIXCB(skb).secid;
+	scm->security = security_scm_get(UNIXCB(skb).security);
 }
 
 static inline bool unix_secdata_eq(struct scm_cookie *scm, struct sk_buff *skb)
 {
-	return (scm->secid == UNIXCB(skb).secid);
+	return scm->secid == UNIXCB(skb).secid &&
+	       security_scm_secdata_eq(scm->security, UNIXCB(skb).security);
+}
+
+static inline void unix_drop_secdata(struct sk_buff *skb)
+{
+	security_scm_put(UNIXCB(skb).security);
+	UNIXCB(skb).security = NULL;
 }
 #else
 static inline void unix_get_secdata(struct scm_cookie *scm, struct sk_buff *skb)
@@ -277,6 +286,10 @@ static inline void unix_set_secdata(struct scm_cookie *scm, struct sk_buff *skb)
 static inline bool unix_secdata_eq(struct scm_cookie *scm, struct sk_buff *skb)
 {
 	return true;
+}
+
+static inline void unix_drop_secdata(struct sk_buff *skb)
+{
 }
 #endif /* CONFIG_SECURITY_NETWORK */
 
@@ -1967,6 +1980,7 @@ static void unix_destruct_scm(struct sk_buff *skb)
 	struct scm_cookie scm = {};
 
 	swap(scm.pid, UNIXCB(skb).pid);
+	unix_drop_secdata(skb);
 
 	if (UNIXCB(skb).fp)
 		unix_detach_fds(&scm, skb);
@@ -1989,10 +2003,10 @@ static int unix_scm_to_skb(struct scm_cookie *scm, struct sk_buff *skb, bool sen
 	UNIXCB(skb).gid = scm->creds.gid;
 	UNIXCB(skb).fp = NULL;
 	unix_get_secdata(scm, skb);
+	skb->destructor = unix_wfree;
 	if (scm->fp && send_fds)
 		err = unix_attach_fds(scm, skb);
 
-	skb->destructor = unix_wfree;
 	return err;
 }
 
@@ -3021,7 +3035,7 @@ unlock:
 			/* Never glue messages from different writers */
 			if (!unix_skb_scm_eq(skb, &scm))
 				break;
-		} else if (unix_may_passcred(sk)) {
+		} else if (unix_may_passcred(sk) || sk->sk_scm_security) {
 			/* Copy credentials */
 			unix_skb_to_scm(skb, &scm);
 			check_creds = true;

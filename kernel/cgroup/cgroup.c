@@ -5332,7 +5332,8 @@ static int cgroup_procs_show(struct seq_file *s, void *v)
 	return 0;
 }
 
-static int cgroup_may_write(const struct cgroup *cgrp, struct super_block *sb)
+static int cgroup_may_write(const struct cgroup *cgrp, struct super_block *sb,
+			    const struct vfsmount *mnt)
 {
 	int ret;
 	struct inode *inode;
@@ -5343,7 +5344,7 @@ static int cgroup_may_write(const struct cgroup *cgrp, struct super_block *sb)
 	if (!inode)
 		return -ENOMEM;
 
-	ret = inode_permission(&nop_mnt_idmap, inode, MAY_WRITE);
+	ret = inode_permission_mnt(&nop_mnt_idmap, mnt, inode, MAY_WRITE);
 	iput(inode);
 	return ret;
 }
@@ -5351,6 +5352,7 @@ static int cgroup_may_write(const struct cgroup *cgrp, struct super_block *sb)
 static int cgroup_procs_write_permission(struct cgroup *src_cgrp,
 					 struct cgroup *dst_cgrp,
 					 struct super_block *sb,
+					 const struct vfsmount *mnt,
 					 struct cgroup_namespace *ns)
 {
 	struct cgroup *com_cgrp = src_cgrp;
@@ -5363,7 +5365,7 @@ static int cgroup_procs_write_permission(struct cgroup *src_cgrp,
 		com_cgrp = cgroup_parent(com_cgrp);
 
 	/* %current should be authorized to migrate to the common ancestor */
-	ret = cgroup_may_write(com_cgrp, sb);
+	ret = cgroup_may_write(com_cgrp, sb, mnt);
 	if (ret)
 		return ret;
 
@@ -5381,12 +5383,14 @@ static int cgroup_procs_write_permission(struct cgroup *src_cgrp,
 
 static int cgroup_attach_permissions(struct cgroup *src_cgrp,
 				     struct cgroup *dst_cgrp,
-				     struct super_block *sb, bool threadgroup,
+				     struct super_block *sb,
+				     const struct vfsmount *mnt,
+				     bool threadgroup,
 				     struct cgroup_namespace *ns)
 {
 	int ret = 0;
 
-	ret = cgroup_procs_write_permission(src_cgrp, dst_cgrp, sb, ns);
+	ret = cgroup_procs_write_permission(src_cgrp, dst_cgrp, sb, mnt, ns);
 	if (ret)
 		return ret;
 
@@ -5431,6 +5435,7 @@ static ssize_t __cgroup_procs_write(struct kernfs_open_file *of, char *buf,
 	scoped_with_creds(of->file->f_cred)
 		ret = cgroup_attach_permissions(src_cgrp, dst_cgrp,
 						of->file->f_path.dentry->d_sb,
+						of->file->f_path.mnt,
 						threadgroup, ctx->ns);
 	if (ret)
 		goto out_finish;
@@ -6833,7 +6838,7 @@ static int cgroup_css_set_fork(struct kernel_clone_args *kargs)
 	 * usually done by the vfs layer but since we're not going through
 	 * the vfs layer here we need to do it "manually".
 	 */
-	ret = cgroup_may_write(dst_cgrp, sb);
+	ret = cgroup_may_write(dst_cgrp, sb, fd_file(f)->f_path.mnt);
 	if (ret)
 		goto err;
 
@@ -6852,6 +6857,7 @@ static int cgroup_css_set_fork(struct kernel_clone_args *kargs)
 	 * to always use the caller's credentials.
 	 */
 	ret = cgroup_attach_permissions(cset->dfl_cgrp, dst_cgrp, sb,
+					fd_file(f)->f_path.mnt,
 					!(kargs->flags & CLONE_THREAD),
 					current->nsproxy->cgroup_ns);
 	if (ret)

@@ -3,6 +3,7 @@
  * Copyright (c) 2016,2017 Facebook
  */
 #include <linux/bpf.h>
+#include <linux/security.h>
 #include <linux/btf.h>
 #include <linux/err.h>
 #include <linux/slab.h>
@@ -885,10 +886,36 @@ int bpf_fd_array_map_lookup_elem(struct bpf_map *map, void *key, u32 *value)
 
 	rcu_read_lock();
 	elem = array_map_lookup_elem(map, key);
-	if (elem && (ptr = READ_ONCE(*elem)))
-		*value = map->ops->map_fd_sys_lookup_elem(ptr);
-	else
-		ret = -ENOENT;
+	ptr = elem ? READ_ONCE(*elem) : NULL;
+	if (!ptr) {
+		rcu_read_unlock();
+		return -ENOENT;
+	}
+	if (map->map_type == BPF_MAP_TYPE_PROG_ARRAY) {
+		struct bpf_prog *prog = bpf_prog_inc_not_zero(ptr);
+
+		rcu_read_unlock();
+		if (IS_ERR(prog))
+			return PTR_ERR(prog);
+		ret = security_bpf_prog(prog);
+		if (!ret)
+			*value = map->ops->map_fd_sys_lookup_elem(prog);
+		bpf_prog_put(prog);
+		return ret;
+	}
+	if (map->map_type == BPF_MAP_TYPE_ARRAY_OF_MAPS) {
+		struct bpf_map *inner = __bpf_map_inc_not_zero(ptr, false);
+
+		rcu_read_unlock();
+		if (IS_ERR(inner))
+			return PTR_ERR(inner);
+		ret = security_bpf_map(inner, FMODE_READ);
+		if (!ret)
+			*value = map->ops->map_fd_sys_lookup_elem(inner);
+		bpf_map_put(inner);
+		return ret;
+	}
+	*value = map->ops->map_fd_sys_lookup_elem(ptr);
 	rcu_read_unlock();
 
 	return ret;
@@ -901,6 +928,7 @@ int bpf_fd_array_map_update_elem(struct bpf_map *map, struct file *map_file,
 	struct bpf_array *array = container_of(map, struct bpf_array, map);
 	void *new_ptr, *old_ptr;
 	u32 index = *(u32 *)key, ufd;
+	int ret;
 
 	if (map_flags != BPF_ANY)
 		return -EINVAL;
@@ -912,6 +940,16 @@ int bpf_fd_array_map_update_elem(struct bpf_map *map, struct file *map_file,
 	new_ptr = map->ops->map_fd_get_ptr(map, map_file, ufd);
 	if (IS_ERR(new_ptr))
 		return PTR_ERR(new_ptr);
+	if (map->map_type == BPF_MAP_TYPE_PROG_ARRAY)
+		ret = security_bpf_map_relation(map, NULL, new_ptr);
+	else if (map->map_type == BPF_MAP_TYPE_ARRAY_OF_MAPS)
+		ret = security_bpf_map_relation(map, new_ptr, NULL);
+	else
+		ret = 0;
+	if (ret) {
+		map->ops->map_fd_put_ptr(map, new_ptr, false);
+		return ret;
+	}
 
 	if (map->ops->map_poke_run) {
 		mutex_lock(&array->aux->poke_mutex);
@@ -1268,6 +1306,7 @@ static void *perf_event_fd_array_get_ptr(struct bpf_map *map,
 	struct perf_event *event;
 	struct file *perf_file;
 	u64 value;
+	int err;
 
 	perf_file = perf_event_get(fd);
 	if (IS_ERR(perf_file))
@@ -1275,6 +1314,11 @@ static void *perf_event_fd_array_get_ptr(struct bpf_map *map,
 
 	ee = ERR_PTR(-EOPNOTSUPP);
 	event = perf_file->private_data;
+	err = security_perf_event_relation(event, PERF_SECURITY_RELATION_READ);
+	if (err) {
+		ee = ERR_PTR(err);
+		goto err_out;
+	}
 	if (perf_event_read_local(event, &value, NULL, NULL) == -EOPNOTSUPP)
 		goto err_out;
 

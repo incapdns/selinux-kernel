@@ -9,6 +9,7 @@
  */
 
 #include <linux/errno.h>
+#include <linux/hash.h>
 #include <linux/kernel.h>
 #include <linux/list.h>
 #include <linux/rcupdate.h>
@@ -17,6 +18,7 @@
 #include <linux/spinlock.h>
 #include <asm/barrier.h>
 #include "flask.h"
+#include "label.h"
 #include "security.h"
 #include "sidtab.h"
 #include "services.h"
@@ -43,7 +45,18 @@ int sidtab_init(struct sidtab *s)
 	return 0;
 }
 
-static u32 context_to_sid(struct sidtab *s, struct context *context, u32 hash)
+static u32 context_domain_hash(const struct context *context,
+			       const struct selinux_label_domain *domain)
+{
+	u32 hash = context_compute_hash(context);
+
+	if (domain)
+		hash ^= hash_64(domain->id, 32);
+	return hash;
+}
+
+static u32 context_to_sid(struct sidtab *s, struct context *context, u32 hash,
+			  const struct selinux_label_domain *domain)
 {
 	struct sidtab_entry *entry;
 	u32 sid = 0;
@@ -52,6 +65,10 @@ static u32 context_to_sid(struct sidtab *s, struct context *context, u32 hash)
 	hash_for_each_possible_rcu(s->context_to_sid, entry, list, hash) {
 		if (entry->hash != hash)
 			continue;
+#ifdef CONFIG_SECURITY_SELINUX_NS
+		if (entry->origin_domain != domain)
+			continue;
+#endif
 		if (context_equal(&entry->context, context)) {
 			sid = entry->sid;
 			break;
@@ -61,9 +78,14 @@ static u32 context_to_sid(struct sidtab *s, struct context *context, u32 hash)
 	return sid;
 }
 
-int sidtab_set_initial(struct sidtab *s, u32 sid, struct context *context)
+static int sidtab_set_initial_common(struct sidtab *s, u32 sid,
+				     struct context *context,
+				     struct selinux_label_domain *domain)
 {
 	struct sidtab_isid_entry *isid;
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	struct selinux_label_ref *label_ref = NULL;
+#endif
 	u32 hash;
 	int rc;
 
@@ -76,9 +98,23 @@ int sidtab_set_initial(struct sidtab *s, u32 sid, struct context *context)
 	if (rc)
 		return rc;
 
+	hash = context_domain_hash(context, domain);
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	if (domain) {
+		label_ref = selinux_label_ref_intern(domain, context->str,
+						     context->len, GFP_KERNEL);
+		if (IS_ERR(label_ref)) {
+			rc = PTR_ERR(label_ref);
+			context_destroy(&isid->entry.context);
+			return rc;
+		}
+	}
+	isid->entry.origin_domain = selinux_label_domain_get(domain);
+	isid->entry.label_ref = label_ref;
+#endif
 	isid->set = 1;
-
-	hash = context_compute_hash(context);
+	isid->entry.sid = sid;
+	isid->entry.hash = hash;
 
 	/*
 	 * Multiple initial sids may map to the same context. Check that this
@@ -86,14 +122,27 @@ int sidtab_set_initial(struct sidtab *s, u32 sid, struct context *context)
 	 * to avoid duplicate entries and long linked lists upon hash
 	 * collision.
 	 */
-	if (!context_to_sid(s, context, hash)) {
-		isid->entry.sid = sid;
-		isid->entry.hash = hash;
+	if (!context_to_sid(s, context, hash, domain))
 		hash_add(s->context_to_sid, &isid->entry.list, hash);
-	}
 
 	return 0;
 }
+
+int sidtab_set_initial(struct sidtab *s, u32 sid, struct context *context)
+{
+	return sidtab_set_initial_common(s, sid, context, NULL);
+}
+
+#ifdef CONFIG_SECURITY_SELINUX_NS
+int sidtab_set_initial_domain(struct sidtab *s, u32 sid,
+			      struct context *context,
+			      struct selinux_label_domain *domain)
+{
+	if (!domain)
+		return -EINVAL;
+	return sidtab_set_initial_common(s, sid, context, domain);
+}
+#endif
 
 int sidtab_hash_stats(struct sidtab *sidtab, char *page)
 {
@@ -248,20 +297,38 @@ struct sidtab_entry *sidtab_search_entry_force(struct sidtab *s, u32 sid)
 	return sidtab_search_core(s, sid, 1);
 }
 
+struct sidtab_entry *sidtab_search_entry_exact(struct sidtab *s, u32 sid)
+{
+	if (!sid)
+		return NULL;
+	if (sid > SECINITSID_NUM)
+		return sidtab_lookup(s, sid_to_index(sid));
+	return sidtab_lookup_initial(s, sid);
+}
+
 #ifdef CONFIG_SECURITY_SELINUX_NS
 int sidtab_context_ss_to_sid(struct sidtab *s, struct context *context,
-			     struct selinux_state *state, u32 ss_sid, u32 *sid)
+			     struct selinux_state *state, u32 *sid)
 #else
 int sidtab_context_to_sid(struct sidtab *s, struct context *context, u32 *sid)
 #endif
 {
 	unsigned long flags;
-	u32 count, hash = context_compute_hash(context);
+	struct selinux_label_domain *domain = NULL;
+	u32 count, hash;
 	struct sidtab_convert_params *convert;
 	struct sidtab_entry *dst, *dst_convert;
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	struct selinux_label_ref *label_ref = NULL;
+#endif
 	int rc;
 
-	*sid = context_to_sid(s, context, hash);
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	if (state)
+		domain = state->label_domain;
+#endif
+	hash = context_domain_hash(context, domain);
+	*sid = context_to_sid(s, context, hash, domain);
 	if (*sid)
 		return 0;
 
@@ -269,7 +336,7 @@ int sidtab_context_to_sid(struct sidtab *s, struct context *context, u32 *sid)
 	spin_lock_irqsave(&s->lock, flags);
 
 	rc = 0;
-	*sid = context_to_sid(s, context, hash);
+	*sid = context_to_sid(s, context, hash, domain);
 	if (*sid)
 		goto out_unlock;
 
@@ -297,14 +364,29 @@ int sidtab_context_to_sid(struct sidtab *s, struct context *context, u32 *sid)
 
 	dst->sid = index_to_sid(count);
 #ifdef CONFIG_SECURITY_SELINUX_NS
-	dst->state = state;
-	dst->ss_sid = ss_sid;
+	if (domain) {
+		label_ref = selinux_label_ref_intern(domain, context->str,
+						     context->len, GFP_ATOMIC);
+		if (IS_ERR(label_ref)) {
+			rc = PTR_ERR(label_ref);
+			goto out_unlock;
+		}
+	}
+	dst->origin_domain = selinux_label_domain_get(domain);
+	dst->label_ref = label_ref;
 #endif
 	dst->hash = hash;
 
 	rc = context_cpy(&dst->context, context);
-	if (rc)
+	if (rc) {
+#ifdef CONFIG_SECURITY_SELINUX_NS
+		selinux_label_ref_put(dst->label_ref);
+		dst->label_ref = NULL;
+		selinux_label_domain_put(dst->origin_domain);
+		dst->origin_domain = NULL;
+#endif
 		goto out_unlock;
+	}
 
 	/*
 	 * if we are building a new sidtab, we need to convert the context
@@ -314,10 +396,28 @@ int sidtab_context_to_sid(struct sidtab *s, struct context *context, u32 *sid)
 	if (convert) {
 		struct sidtab *target = convert->target;
 
+		/* Global provenance entries are immutable and never converted. */
+#ifdef CONFIG_SECURITY_SELINUX_NS
+		if (WARN_ON_ONCE(domain)) {
+			rc = -EOPNOTSUPP;
+			context_destroy(&dst->context);
+			selinux_label_ref_put(dst->label_ref);
+			dst->label_ref = NULL;
+			selinux_label_domain_put(dst->origin_domain);
+			dst->origin_domain = NULL;
+			goto out_unlock;
+		}
+#endif
 		rc = -ENOMEM;
 		dst_convert = sidtab_do_lookup(target, count, 1);
 		if (!dst_convert) {
 			context_destroy(&dst->context);
+#ifdef CONFIG_SECURITY_SELINUX_NS
+			selinux_label_ref_put(dst->label_ref);
+			dst->label_ref = NULL;
+			selinux_label_domain_put(dst->origin_domain);
+			dst->origin_domain = NULL;
+#endif
 			goto out_unlock;
 		}
 
@@ -326,6 +426,12 @@ int sidtab_context_to_sid(struct sidtab *s, struct context *context, u32 *sid)
 					      GFP_ATOMIC);
 		if (rc) {
 			context_destroy(&dst->context);
+#ifdef CONFIG_SECURITY_SELINUX_NS
+			selinux_label_ref_put(dst->label_ref);
+			dst->label_ref = NULL;
+			selinux_label_domain_put(dst->origin_domain);
+			dst->origin_domain = NULL;
+#endif
 			goto out_unlock;
 		}
 		dst_convert->sid = index_to_sid(count);
@@ -351,7 +457,7 @@ out_unlock:
 #ifdef CONFIG_SECURITY_SELINUX_NS
 int sidtab_context_to_sid(struct sidtab *s, struct context *context, u32 *sid)
 {
-	return sidtab_context_ss_to_sid(s, context, NULL, 0, sid);
+	return sidtab_context_ss_to_sid(s, context, NULL, sid);
 }
 #endif
 
@@ -363,7 +469,12 @@ static void sidtab_convert_hashtable(struct sidtab *s, u32 count)
 	for (i = 0; i < count; i++) {
 		entry = sidtab_do_lookup(s, i, 0);
 		entry->sid = index_to_sid(i);
-		entry->hash = context_compute_hash(&entry->context);
+#ifdef CONFIG_SECURITY_SELINUX_NS
+		entry->hash = context_domain_hash(&entry->context,
+						  entry->origin_domain);
+#else
+		entry->hash = context_domain_hash(&entry->context, NULL);
+#endif
 
 		hash_add_rcu(s->context_to_sid, &entry->list, entry->hash);
 	}
@@ -502,6 +613,20 @@ void sidtab_freeze_end(struct sidtab *s, unsigned long *flags)
 
 static void sidtab_destroy_entry(struct sidtab_entry *entry)
 {
+#ifdef CONFIG_SECURITY_SELINUX_NS
+#if CONFIG_SECURITY_SELINUX_SS_SID_CACHE_SIZE > 0
+	struct sidtab_ss_sid_cache_entry *cached;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(entry->ss_sid_cache.slots); i++) {
+		cached = rcu_dereference_protected(entry->ss_sid_cache.slots[i],
+						   1);
+		kfree(cached);
+	}
+#endif
+	selinux_label_ref_put(entry->label_ref);
+	selinux_label_domain_put(entry->origin_domain);
+#endif
 	context_destroy(&entry->context);
 }
 
@@ -551,93 +676,38 @@ void sidtab_destroy(struct sidtab *s)
 }
 
 #ifdef CONFIG_SECURITY_SELINUX_NS
+#ifdef CONFIG_SECURITY_SELINUX_KUNIT_TEST
 static void sidtab_invalidate_state_entry(struct sidtab_entry *entry,
 					  struct selinux_state *state)
 {
 #if CONFIG_SECURITY_SELINUX_SS_SID_CACHE_SIZE > 0
 	struct sidtab_ss_sid_cache *cache;
-	int i, first, last;
+	struct sidtab_ss_sid_cache_entry *cached;
+	int i;
 #endif
-
-	if (entry->state == state) {
-		WRITE_ONCE(entry->ss_sid, 0);
-		WRITE_ONCE(entry->state, NULL);
-	}
 
 #if CONFIG_SECURITY_SELINUX_SS_SID_CACHE_SIZE > 0
 	cache = &entry->ss_sid_cache;
-	first = cache->first;
-	last = cache->last;
-	for (i = first; i >= 0 && i <= last; i++) {
-		if (cache->state[i] == state) {
-			WRITE_ONCE(cache->ss_sid[i], 0);
-			WRITE_ONCE(cache->state[i], NULL);
-			if (first == i) {
-				for (first = i + 1; first <= last &&
-					     !cache->ss_sid[first]; first++)
-					;
-				if (first == (i+1))
-					first = -1;
-				WRITE_ONCE(cache->first, first);
-			}
-			if (last == i) {
-				for (last = i - 1; last >= first &&
-					     last >= 0 &&
-					     !cache->ss_sid[last]; last--)
-					;
-				if (last == (i-1))
-					last = -1;
-				WRITE_ONCE(cache->last, last);
-			}
-			return;
+	for (i = 0; i < ARRAY_SIZE(cache->slots); i++) {
+		cached = rcu_dereference_protected(cache->slots[i], 1);
+		if (cached && state && state->label_domain &&
+		    cached->domain_id == state->label_domain->id) {
+			rcu_assign_pointer(cache->slots[i], NULL);
+			kfree_rcu(cached, rcu);
 		}
 	}
 #endif
 }
 
-static void sidtab_invalidate_state_tree(union sidtab_entry_inner entry,
-					 u32 level,
-					 struct selinux_state *state)
+void selinux_kunit_sidtab_invalidate_state_entry(struct sidtab_entry *entry,
+						 struct selinux_state *state)
 {
-	u32 i;
-
-	if (level != 0) {
-		struct sidtab_node_inner *node = entry.ptr_inner;
-
-		if (!node)
-			return;
-
-		for (i = 0; i < SIDTAB_INNER_ENTRIES; i++)
-			sidtab_invalidate_state_tree(node->entries[i],
-						     level - 1, state);
-	} else {
-		struct sidtab_node_leaf *node = entry.ptr_leaf;
-
-		if (!node)
-			return;
-
-		for (i = 0; i < SIDTAB_LEAF_ENTRIES; i++)
-			sidtab_invalidate_state_entry(&node->entries[i], state);
-	}
+	sidtab_invalidate_state_entry(entry, state);
 }
+#endif
 
 void sidtab_invalidate_state(struct sidtab *s, struct selinux_state *state)
 {
-	u32 i, level;
-	unsigned long flags;
-
-	spin_lock_irqsave(&s->lock, flags);
-
-	for (i = 0; i < SECINITSID_NUM; i++)
-		if (s->isids[i].set)
-			sidtab_invalidate_state_entry(&s->isids[i].entry, state);
-
-	level = SIDTAB_MAX_LEVEL;
-	while (level && !s->roots[level].ptr_inner)
-		--level;
-
-	sidtab_invalidate_state_tree(s->roots[level], level, state);
-
-	spin_unlock_irqrestore(&s->lock, flags);
+	/* Weak generation cookies do not retain state and expire on lookup. */
 }
 #endif /* CONFIG_SECURITY_SELINUX_NS */

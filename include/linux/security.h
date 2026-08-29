@@ -31,8 +31,12 @@
 #include <linux/err.h>
 #include <linux/string.h>
 #include <linux/mm.h>
+#include <linux/refcount.h>
 #include <linux/sockptr.h>
 #include <linux/bpf.h>
+#include <linux/btf.h>
+#include <linux/bitmap.h>
+#include <linux/lsm_count.h>
 #include <uapi/linux/lsm.h>
 #include <linux/lsm/selinux.h>
 #include <linux/lsm/smack.h>
@@ -41,10 +45,13 @@
 
 struct linux_binprm;
 struct cred;
+struct task_struct;
 struct rlimit;
 struct kernel_siginfo;
 struct sembuf;
 struct kern_ipc_perm;
+struct ipc_namespace;
+struct ipc_namespace_security_txn;
 struct audit_context;
 struct super_block;
 struct inode;
@@ -168,6 +175,58 @@ struct lsm_prop {
 	struct lsm_prop_bpf bpf;
 };
 
+/*
+ * Strong, immutable ownership for an LSM property.  The scalar values in
+ * @prop are compatibility projections and are valid only while this carrier
+ * is owned.  Individual LSMs retain their source identity in @security.
+ *
+ * The core owns @source_lsmid, @source_secid and @provider_count.  They are
+ * published together with the carrier and never change afterwards.
+ * @source_secid is available only for a SECCTX/SECID source accepted by one
+ * provider; object sources and multi-provider carriers leave it unset.
+ */
+struct lsm_prop_ref {
+	refcount_t refs;
+	int source_lsmid;
+	u32 source_secid;
+	u16 provider_count;
+	u16 reserved;
+	struct lsm_prop prop;
+	u8 security[] __aligned(sizeof(void *));
+};
+
+enum lsm_prop_ref_source_kind {
+	LSM_PROP_REF_CRED_SUBJ,
+	LSM_PROP_REF_CURRENT_SUBJ,
+	LSM_PROP_REF_TASK_OBJ,
+	LSM_PROP_REF_INODE_OBJ,
+	LSM_PROP_REF_IPC_OBJ,
+	LSM_PROP_REF_SECCTX,
+	LSM_PROP_REF_SECID,
+};
+
+/* The selected source is stable for the duration of prop_ref_capture(). */
+struct lsm_prop_ref_source {
+	enum lsm_prop_ref_source_kind kind;
+	int lsmid;
+	union {
+		const struct cred *cred;
+		struct task_struct *task;
+		struct inode *inode;
+		struct kern_ipc_perm *ipc;
+		struct {
+			const char *data;
+			u32 len;
+		} secctx;
+		u32 secid;
+	};
+};
+
+/* Per-LSM immutable carrier prepared while a secmark rule is authorized. */
+struct lsm_secmark {
+	struct lsm_secmark_selinux selinux;
+};
+
 extern const char *const lockdown_reasons[LOCKDOWN_CONFIDENTIALITY_MAX+1];
 
 /* These functions are in security/commoncap.c */
@@ -190,8 +249,8 @@ int cap_inode_removexattr(struct mnt_idmap *idmap,
 int cap_inode_need_killpriv(struct dentry *dentry);
 int cap_inode_killpriv(struct mnt_idmap *idmap, struct dentry *dentry);
 int cap_inode_getsecurity(struct mnt_idmap *idmap,
-			  struct inode *inode, const char *name, void **buffer,
-			  bool alloc);
+			  const struct vfsmount *mnt, struct inode *inode,
+			  const char *name, void **buffer, bool alloc);
 extern int cap_mmap_addr(unsigned long addr);
 extern int cap_task_fix_setuid(struct cred *new, const struct cred *old, int flags);
 extern int cap_task_prctl(int option, unsigned long arg2, unsigned long arg3,
@@ -211,6 +270,7 @@ struct dst_entry;
 struct xfrm_selector;
 struct xfrm_policy;
 struct xfrm_state;
+struct xfrm_flow_origin;
 struct xfrm_user_sec_ctx;
 struct seq_file;
 struct sctp_association;
@@ -233,6 +293,15 @@ struct lsm_context {
 	char	*context;	/* Provided by the module */
 	u32	len;
 	int	id;		/* Identifies the module */
+};
+
+/*
+ * Immutable, refcounted security metadata carried by SCM and AF_UNIX skb
+ * lifetimes.  Individual LSM slots are populated before publication.
+ */
+struct lsm_scm_security {
+	refcount_t refs;
+	u8 security[] __aligned(sizeof(void *));
 };
 
 /*
@@ -271,6 +340,25 @@ extern int mmap_min_addr_handler(const struct ctl_table *table, int write,
 /* security_inode_init_security callback function to write xattrs */
 typedef int (*initxattrs) (struct inode *inode,
 			   const struct xattr *xattr_array, void *fs_data);
+
+struct security_inode_create_plan {
+	void *security;
+#ifdef CONFIG_SECURITY
+	DECLARE_BITMAP(prepared_lsms, MAX_LSM_COUNT);
+#endif
+	enum security_inode_create_kind kind;
+	u32 requirements;
+};
+
+#define SECURITY_INODE_CREATE_REQUIRE_COMMIT	BIT(0)
+#define SECURITY_INODE_CREATE_REQUIRE_XATTR	BIT(1)
+
+struct security_inode_setxattr_plan {
+	void *security;
+#ifdef CONFIG_SECURITY
+	DECLARE_BITMAP(prepared_lsms, MAX_LSM_COUNT);
+#endif
+};
 
 
 /* Keep the kernel_load_data_id enum in sync with kernel_read_file_id */
@@ -312,7 +400,7 @@ static inline void lsmprop_init(struct lsm_prop *prop)
  *
  * Returns true if there is a value set, false otherwise
  */
-static inline bool lsmprop_is_set(struct lsm_prop *prop)
+static inline bool lsmprop_is_set(const struct lsm_prop *prop)
 {
 	const struct lsm_prop empty = {};
 
@@ -351,6 +439,7 @@ int security_capable(const struct cred *cred,
 		       int cap,
 		       unsigned int opts);
 int security_quotactl(int cmds, int type, int id, const struct super_block *sb);
+int security_quota_on_mnt(const struct vfsmount *mnt, struct dentry *dentry);
 int security_quota_on(struct dentry *dentry);
 int security_syslog(int type);
 int security_settime64(const struct timespec64 *ts, const struct timezone *tz);
@@ -360,19 +449,38 @@ int security_bprm_creds_from_file(struct linux_binprm *bprm, const struct file *
 int security_bprm_check(struct linux_binprm *bprm);
 void security_bprm_committing_creds(const struct linux_binprm *bprm);
 void security_bprm_committed_creds(const struct linux_binprm *bprm);
-int security_fs_context_submount(struct fs_context *fc, struct super_block *reference);
+int security_fs_context_submount(struct fs_context *fc,
+				 const struct path *reference);
 int security_fs_context_dup(struct fs_context *fc, struct fs_context *src_fc);
 int security_fs_context_parse_param(struct fs_context *fc, struct fs_parameter *param);
+int security_mnt_alloc(struct vfsmount *mnt, const struct vfsmount *src_mnt,
+		       struct fs_context *fc);
+void security_mnt_free(struct vfsmount *mnt);
+struct security_mnt_topology {
+	void *security;
+};
+
+struct security_mnt_topology *security_mnt_topology_alloc(void);
+int security_mnt_topology_add(struct security_mnt_topology *topology,
+			      const struct vfsmount *source,
+			      const struct vfsmount *target);
+int security_mnt_topology_apply(struct security_mnt_topology *topology,
+				struct vfsmount *mnt,
+				const struct vfsmount *target);
+void security_mnt_topology_free(struct security_mnt_topology *topology);
 int security_sb_alloc(struct super_block *sb);
+int security_sb_pre_fill(struct super_block *sb, struct fs_context *fc,
+			 const void *security_carrier, bool is_new);
 void security_sb_delete(struct super_block *sb);
 void security_sb_free(struct super_block *sb);
 void security_free_mnt_opts(void **mnt_opts);
-int security_sb_eat_lsm_opts(char *options, void **mnt_opts);
+int security_sb_eat_lsm_opts(char *options, struct fs_context *fc);
 int security_sb_mnt_opts_compat(struct super_block *sb, void *mnt_opts);
 int security_sb_remount(struct super_block *sb, void *mnt_opts);
-int security_sb_kern_mount(const struct super_block *sb);
+int security_sb_kern_mount(const struct super_block *sb,
+			   struct fs_context *fc);
 int security_sb_show_options(struct seq_file *m, struct super_block *sb);
-int security_sb_statfs(struct dentry *dentry);
+int security_sb_statfs(struct dentry *dentry, const struct vfsmount *mnt);
 int security_sb_mount(const char *dev_name, const struct path *path,
 		      const char *type, unsigned long flags, void *data);
 int security_sb_umount(struct vfsmount *mnt, int flags);
@@ -401,42 +509,103 @@ void security_inode_free(struct inode *inode);
 int security_inode_init_security(struct inode *inode, struct inode *dir,
 				 const struct qstr *qstr,
 				 initxattrs initxattrs, void *fs_data);
+struct security_inode_create_plan *
+security_inode_create_plan_prepare(const struct vfsmount *mnt,
+				   struct inode *dir, struct dentry *dentry,
+				   umode_t mode,
+				   enum security_inode_create_kind kind,
+				   u32 supported_ops);
+int security_inode_create_plan_finish(struct security_inode_create_plan *plan,
+				      int result,
+				      struct inode *created_inode);
+int security_inode_create_plan_attempt_abort(struct inode *inode);
+struct security_inode_setxattr_plan *security_inode_setxattr_plan_prepare(
+	struct mnt_idmap *idmap, const struct vfsmount *mnt,
+	struct dentry *dentry, const char *name, const void **value,
+	size_t *size, int flags);
+int security_inode_setxattr_plan_finish(
+	struct security_inode_setxattr_plan *plan, int result);
 int security_inode_init_security_anon(struct inode *inode,
 				      const struct qstr *name,
 				      const struct inode *context_inode);
+int security_inode_create_mnt(const struct vfsmount *mnt, struct inode *dir,
+			      struct dentry *dentry, umode_t mode);
 int security_inode_create(struct inode *dir, struct dentry *dentry, umode_t mode);
 void security_inode_post_create_tmpfile(struct mnt_idmap *idmap,
 					struct inode *inode);
+int security_inode_link_mnt(const struct vfsmount *old_mnt,
+			    struct dentry *old_dentry,
+			    const struct vfsmount *new_mnt, struct inode *dir,
+			    struct dentry *new_dentry);
 int security_inode_link(struct dentry *old_dentry, struct inode *dir,
 			 struct dentry *new_dentry);
+int security_inode_unlink_mnt(const struct vfsmount *mnt, struct inode *dir,
+			      struct dentry *dentry);
 int security_inode_unlink(struct inode *dir, struct dentry *dentry);
+int security_inode_symlink_mnt(const struct vfsmount *mnt, struct inode *dir,
+			       struct dentry *dentry, const char *old_name);
 int security_inode_symlink(struct inode *dir, struct dentry *dentry,
 			   const char *old_name);
+int security_inode_mkdir_mnt(const struct vfsmount *mnt, struct inode *dir,
+			     struct dentry *dentry, umode_t mode);
 int security_inode_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode);
+int security_inode_rmdir_mnt(const struct vfsmount *mnt, struct inode *dir,
+			     struct dentry *dentry);
 int security_inode_rmdir(struct inode *dir, struct dentry *dentry);
+int security_inode_mknod_mnt(const struct vfsmount *mnt, struct inode *dir,
+			     struct dentry *dentry, umode_t mode, dev_t dev);
 int security_inode_mknod(struct inode *dir, struct dentry *dentry, umode_t mode, dev_t dev);
+int security_inode_rename_mnt(const struct vfsmount *old_mnt,
+			      struct inode *old_dir, struct dentry *old_dentry,
+			      const struct vfsmount *new_mnt,
+			      struct inode *new_dir, struct dentry *new_dentry,
+			      unsigned int flags);
 int security_inode_rename(struct inode *old_dir, struct dentry *old_dentry,
 			  struct inode *new_dir, struct dentry *new_dentry,
 			  unsigned int flags);
+int security_inode_readlink_mnt(const struct vfsmount *mnt,
+				struct dentry *dentry);
 int security_inode_readlink(struct dentry *dentry);
+int security_inode_follow_link_mnt(const struct vfsmount *mnt,
+				   struct dentry *dentry,
+				   struct inode *inode, bool rcu);
 int security_inode_follow_link(struct dentry *dentry, struct inode *inode,
 			       bool rcu);
-int security_inode_permission(struct inode *inode, int mask);
+int security_inode_permission(const struct vfsmount *mnt, struct inode *inode,
+			      int mask);
+int security_inode_setattr_mnt(struct mnt_idmap *idmap,
+			       const struct vfsmount *mnt,
+			       struct dentry *dentry, struct iattr *attr);
 int security_inode_setattr(struct mnt_idmap *idmap,
 			   struct dentry *dentry, struct iattr *attr);
 void security_inode_post_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 				 int ia_valid);
 int security_inode_getattr(const struct path *path);
+int security_inode_setxattr_mnt(struct mnt_idmap *idmap,
+				const struct vfsmount *mnt,
+				struct dentry *dentry, const char *name,
+				const void *value, size_t size, int flags);
 int security_inode_setxattr(struct mnt_idmap *idmap,
 			    struct dentry *dentry, const char *name,
 			    const void *value, size_t size, int flags);
+int security_inode_set_acl_mnt(struct mnt_idmap *idmap,
+			       const struct vfsmount *mnt,
+			       struct dentry *dentry, const char *acl_name,
+			       struct posix_acl *kacl);
 int security_inode_set_acl(struct mnt_idmap *idmap,
 			   struct dentry *dentry, const char *acl_name,
 			   struct posix_acl *kacl);
 void security_inode_post_set_acl(struct dentry *dentry, const char *acl_name,
 				 struct posix_acl *kacl);
+int security_inode_get_acl_mnt(struct mnt_idmap *idmap,
+			       const struct vfsmount *mnt,
+			       struct dentry *dentry, const char *acl_name);
 int security_inode_get_acl(struct mnt_idmap *idmap,
 			   struct dentry *dentry, const char *acl_name);
+int security_inode_remove_acl_mnt(struct mnt_idmap *idmap,
+				  const struct vfsmount *mnt,
+				  struct dentry *dentry,
+				  const char *acl_name);
 int security_inode_remove_acl(struct mnt_idmap *idmap,
 			      struct dentry *dentry, const char *acl_name);
 void security_inode_post_remove_acl(struct mnt_idmap *idmap,
@@ -444,32 +613,56 @@ void security_inode_post_remove_acl(struct mnt_idmap *idmap,
 				    const char *acl_name);
 void security_inode_post_setxattr(struct dentry *dentry, const char *name,
 				  const void *value, size_t size, int flags);
+int security_inode_getxattr_mnt(const struct vfsmount *mnt,
+				struct dentry *dentry, const char *name);
 int security_inode_getxattr(struct dentry *dentry, const char *name);
+int security_inode_listxattr_mnt(const struct vfsmount *mnt,
+				 struct dentry *dentry);
 int security_inode_listxattr(struct dentry *dentry);
+int security_inode_removexattr_mnt(struct mnt_idmap *idmap,
+				   const struct vfsmount *mnt,
+				   struct dentry *dentry, const char *name);
 int security_inode_removexattr(struct mnt_idmap *idmap,
 			       struct dentry *dentry, const char *name);
 void security_inode_post_removexattr(struct dentry *dentry, const char *name);
+int security_inode_file_setattr_mnt(const struct vfsmount *mnt,
+				    struct dentry *dentry,
+				    struct file_kattr *fa);
 int security_inode_file_setattr(struct dentry *dentry,
 			      struct file_kattr *fa);
+int security_inode_file_getattr_mnt(const struct vfsmount *mnt,
+				    struct dentry *dentry,
+				    struct file_kattr *fa);
 int security_inode_file_getattr(struct dentry *dentry,
 			      struct file_kattr *fa);
 int security_inode_need_killpriv(struct dentry *dentry);
 int security_inode_killpriv(struct mnt_idmap *idmap, struct dentry *dentry);
 int security_inode_getsecurity(struct mnt_idmap *idmap,
-			       struct inode *inode, const char *name,
-			       void **buffer, bool alloc);
+			       const struct vfsmount *mnt, struct inode *inode,
+			       const char *name, void **buffer, bool alloc);
 int security_inode_setsecurity(struct inode *inode, const char *name, const void *value, size_t size, int flags);
 int security_inode_listsecurity(struct inode *inode, char **buffer, ssize_t *remaining_size);
 void security_inode_getlsmprop(struct inode *inode, struct lsm_prop *prop);
-int security_inode_copy_up(struct dentry *src, struct cred **new);
+int security_inode_copy_up(const struct path *src,
+			   const struct vfsmount *dst_mnt, struct cred **new);
+int security_inode_copy_up_post(const struct path *src,
+				const struct vfsmount *dst_mnt,
+				struct dentry *dst);
 int security_inode_copy_up_xattr(struct dentry *src, const char *name);
 int security_inode_setintegrity(const struct inode *inode,
 				enum lsm_integrity_type type, const void *value,
 				size_t size);
+int security_kernfs_root_alloc(void **root_security);
+void security_kernfs_root_free(void *root_security);
+int security_kernfs_root_to_sb(struct super_block *sb,
+			       const void *root_security);
 int security_kernfs_init_security(struct kernfs_node *kn_dir,
-				  struct kernfs_node *kn);
+				  struct kernfs_node *kn,
+				  const void *root_security);
 int security_file_permission(struct file *file, int mask);
 int security_file_alloc(struct file *file);
+int security_file_set_path(struct file *file);
+int security_file_init_security_anon(struct file *file);
 void security_file_release(struct file *file);
 void security_file_free(struct file *file);
 int security_backing_file_alloc(struct file *backing_file,
@@ -503,6 +696,36 @@ int security_prepare_creds(struct cred *new, const struct cred *old, gfp_t gfp);
 void security_transfer_creds(struct cred *new, const struct cred *old);
 void security_cred_getsecid(const struct cred *c, u32 *secid);
 void security_cred_getlsmprop(const struct cred *c, struct lsm_prop *prop);
+struct lsm_prop_ref *
+security_lsm_prop_ref_get(struct lsm_prop_ref *ref);
+void security_lsm_prop_ref_put(struct lsm_prop_ref *ref);
+const struct lsm_prop *
+security_lsm_prop_ref_prop(const struct lsm_prop_ref *ref);
+int security_lsm_prop_ref_lsmid(const struct lsm_prop_ref *ref);
+unsigned int
+security_lsm_prop_ref_provider_count(const struct lsm_prop_ref *ref);
+bool security_lsm_prop_ref_source_secid(const struct lsm_prop_ref *ref,
+					u32 *secid);
+int security_cred_getlsmprop_ref(const struct cred *cred, gfp_t gfp,
+				 struct lsm_prop_ref **out);
+int security_current_getlsmprop_ref_subj(gfp_t gfp,
+					 struct lsm_prop_ref **out);
+int security_task_getlsmprop_ref_obj(struct task_struct *task, gfp_t gfp,
+				     struct lsm_prop_ref **out);
+int security_inode_getlsmprop_ref(struct inode *inode, gfp_t gfp,
+				  struct lsm_prop_ref **out);
+int security_ipc_getlsmprop_ref(struct kern_ipc_perm *ipc, gfp_t gfp,
+				struct lsm_prop_ref **out);
+int security_secctx_to_lsmprop_ref(const char *secdata, u32 seclen,
+				   int lsmid, gfp_t gfp,
+				   struct lsm_prop_ref **out);
+int security_secid_to_lsmprop_ref(u32 secid, int lsmid, gfp_t gfp,
+				  struct lsm_prop_ref **out);
+int security_lsm_prop_ref_to_secctx(const struct lsm_prop_ref *ref,
+				    const struct cred *observer, int lsmid,
+				    struct lsm_context *cp);
+int security_kernel_act_as_ref(struct cred *new,
+			       const struct lsm_prop_ref *ref);
 int security_kernel_act_as(struct cred *new, u32 secid);
 int security_kernel_create_files_as(struct cred *new, struct inode *inode);
 int security_kernel_module_request(char *kmod_name);
@@ -540,11 +763,27 @@ int security_task_prctl(int option, unsigned long arg2, unsigned long arg3,
 			unsigned long arg4, unsigned long arg5);
 void security_task_to_inode(struct task_struct *p, struct inode *inode);
 int security_create_user_ns(const struct cred *cred);
+int security_ipc_namespace_alloc(struct ipc_namespace *ns,
+				 const struct ipc_namespace *old_ns,
+				 const struct cred *cred, bool initial);
+void security_ipc_namespace_free(struct ipc_namespace *ns);
+int security_ipc_namespace_reanchor_prepare(
+	struct ipc_namespace_security_txn *txn, struct ipc_namespace *ns,
+	const struct cred *cred, struct cred *mutable_cred,
+	struct cred **replacement_cred);
+void security_ipc_namespace_reanchor_commit(
+	struct ipc_namespace_security_txn *txn);
+void security_ipc_namespace_reanchor_abort(
+	struct ipc_namespace_security_txn *txn);
+int security_ipc_namespace_create_gate(struct ipc_namespace *ns,
+				       const struct cred *cred);
+void security_ipc_namespace_object_published(struct ipc_namespace *ns);
 int security_ipc_permission(struct kern_ipc_perm *ipcp, short flag);
 void security_ipc_getlsmprop(struct kern_ipc_perm *ipcp, struct lsm_prop *prop);
 int security_msg_msg_alloc(struct msg_msg *msg);
 void security_msg_msg_free(struct msg_msg *msg);
-int security_msg_queue_alloc(struct kern_ipc_perm *msq);
+int security_msg_queue_alloc(struct ipc_namespace *ns,
+			     struct kern_ipc_perm *msq);
 void security_msg_queue_free(struct kern_ipc_perm *msq);
 int security_msg_queue_associate(struct kern_ipc_perm *msq, int msqflg);
 int security_msg_queue_msgctl(struct kern_ipc_perm *msq, int cmd);
@@ -552,12 +791,12 @@ int security_msg_queue_msgsnd(struct kern_ipc_perm *msq,
 			      struct msg_msg *msg, int msqflg);
 int security_msg_queue_msgrcv(struct kern_ipc_perm *msq, struct msg_msg *msg,
 			      struct task_struct *target, long type, int mode);
-int security_shm_alloc(struct kern_ipc_perm *shp);
+int security_shm_alloc(struct ipc_namespace *ns, struct kern_ipc_perm *shp);
 void security_shm_free(struct kern_ipc_perm *shp);
 int security_shm_associate(struct kern_ipc_perm *shp, int shmflg);
 int security_shm_shmctl(struct kern_ipc_perm *shp, int cmd);
 int security_shm_shmat(struct kern_ipc_perm *shp, char __user *shmaddr, int shmflg);
-int security_sem_alloc(struct kern_ipc_perm *sma);
+int security_sem_alloc(struct ipc_namespace *ns, struct kern_ipc_perm *sma);
 void security_sem_free(struct kern_ipc_perm *sma);
 int security_sem_associate(struct kern_ipc_perm *sma, int semflg);
 int security_sem_semctl(struct kern_ipc_perm *sma, int cmd);
@@ -573,7 +812,8 @@ int security_getprocattr(struct task_struct *p, int lsmid, const char *name,
 int security_setprocattr(int lsmid, const char *name, void *value, size_t size);
 int security_ismaclabel(const char *name);
 int security_secid_to_secctx(u32 secid, struct lsm_context *cp);
-int security_lsmprop_to_secctx(struct lsm_prop *prop, struct lsm_context *cp,
+int security_lsmprop_to_secctx(const struct lsm_prop *prop,
+			       struct lsm_context *cp,
 			       int lsmid);
 int security_secctx_to_secid(const char *secdata, u32 seclen, u32 *secid);
 void security_release_secctx(struct lsm_context *cp);
@@ -597,7 +837,7 @@ int security_bdev_setintegrity(struct block_device *bdev,
  *
  * Returns true if there is a value set, false otherwise
  */
-static inline bool lsmprop_is_set(struct lsm_prop *prop)
+static inline bool lsmprop_is_set(const struct lsm_prop *prop)
 {
 	return false;
 }
@@ -707,9 +947,15 @@ static inline int security_quotactl(int cmds, int type, int id,
 	return 0;
 }
 
-static inline int security_quota_on(struct dentry *dentry)
+static inline int security_quota_on_mnt(const struct vfsmount *mnt,
+					 struct dentry *dentry)
 {
 	return 0;
+}
+
+static inline int security_quota_on(struct dentry *dentry)
+{
+	return security_quota_on_mnt(NULL, dentry);
 }
 
 static inline int security_syslog(int type)
@@ -753,7 +999,7 @@ static inline void security_bprm_committed_creds(const struct linux_binprm *bprm
 }
 
 static inline int security_fs_context_submount(struct fs_context *fc,
-					   struct super_block *reference)
+					   const struct path *reference)
 {
 	return 0;
 }
@@ -768,7 +1014,50 @@ static inline int security_fs_context_parse_param(struct fs_context *fc,
 	return -ENOPARAM;
 }
 
+static inline int security_mnt_alloc(struct vfsmount *mnt,
+				     const struct vfsmount *src_mnt,
+				     struct fs_context *fc)
+{
+	return 0;
+}
+
+static inline void security_mnt_free(struct vfsmount *mnt)
+{ }
+
+static inline struct security_mnt_topology *security_mnt_topology_alloc(void)
+{
+	return NULL;
+}
+
+static inline int
+security_mnt_topology_add(struct security_mnt_topology *topology,
+			  const struct vfsmount *source,
+			  const struct vfsmount *target)
+{
+	return 0;
+}
+
+static inline int
+security_mnt_topology_apply(struct security_mnt_topology *topology,
+			    struct vfsmount *mnt,
+			    const struct vfsmount *target)
+{
+	return 0;
+}
+
+static inline void
+security_mnt_topology_free(struct security_mnt_topology *topology)
+{ }
+
 static inline int security_sb_alloc(struct super_block *sb)
+{
+	return 0;
+}
+
+static inline int security_sb_pre_fill(struct super_block *sb,
+				       struct fs_context *fc,
+				       const void *security_carrier,
+				       bool is_new)
 {
 	return 0;
 }
@@ -780,7 +1069,7 @@ static inline void security_sb_free(struct super_block *sb)
 { }
 
 static inline int security_sb_eat_lsm_opts(char *options,
-					   void **mnt_opts)
+					   struct fs_context *fc)
 {
 	return 0;
 }
@@ -798,7 +1087,8 @@ static inline int security_sb_mnt_opts_compat(struct super_block *sb,
 }
 
 
-static inline int security_sb_kern_mount(struct super_block *sb)
+static inline int security_sb_kern_mount(struct super_block *sb,
+					 struct fs_context *fc)
 {
 	return 0;
 }
@@ -809,7 +1099,8 @@ static inline int security_sb_show_options(struct seq_file *m,
 	return 0;
 }
 
-static inline int security_sb_statfs(struct dentry *dentry)
+static inline int security_sb_statfs(struct dentry *dentry,
+				     const struct vfsmount *mnt)
 {
 	return 0;
 }
@@ -895,6 +1186,43 @@ static inline int security_inode_init_security(struct inode *inode,
 	return 0;
 }
 
+static inline struct security_inode_create_plan *
+security_inode_create_plan_prepare(const struct vfsmount *mnt,
+				   struct inode *dir, struct dentry *dentry,
+				   umode_t mode,
+				   enum security_inode_create_kind kind,
+				   u32 supported_ops)
+{
+	return NULL;
+}
+
+static inline int
+security_inode_create_plan_finish(struct security_inode_create_plan *plan,
+				  int result, struct inode *created_inode)
+{
+	return result;
+}
+
+static inline int security_inode_create_plan_attempt_abort(struct inode *inode)
+{
+	return 0;
+}
+
+static inline struct security_inode_setxattr_plan *
+security_inode_setxattr_plan_prepare(struct mnt_idmap *idmap,
+				    const struct vfsmount *mnt,
+				    struct dentry *dentry, const char *name,
+				    const void **value, size_t *size, int flags)
+{
+	return NULL;
+}
+
+static inline int security_inode_setxattr_plan_finish(
+	struct security_inode_setxattr_plan *plan, int result)
+{
+	return result;
+}
+
 static inline int security_inode_init_security_anon(struct inode *inode,
 						    const struct qstr *name,
 						    const struct inode *context_inode)
@@ -902,26 +1230,57 @@ static inline int security_inode_init_security_anon(struct inode *inode,
 	return 0;
 }
 
-static inline int security_inode_create(struct inode *dir,
-					 struct dentry *dentry,
-					 umode_t mode)
+static inline int security_inode_create_mnt(const struct vfsmount *mnt,
+					     struct inode *dir,
+					     struct dentry *dentry,
+					     umode_t mode)
 {
 	return 0;
+}
+
+static inline int security_inode_create(struct inode *dir,
+					 struct dentry *dentry, umode_t mode)
+{
+	return security_inode_create_mnt(NULL, dir, dentry, mode);
 }
 
 static inline void
 security_inode_post_create_tmpfile(struct mnt_idmap *idmap, struct inode *inode)
 { }
 
+static inline int security_inode_link_mnt(const struct vfsmount *old_mnt,
+					   struct dentry *old_dentry,
+					   const struct vfsmount *new_mnt,
+					   struct inode *dir,
+					   struct dentry *new_dentry)
+{
+	return 0;
+}
+
 static inline int security_inode_link(struct dentry *old_dentry,
 				       struct inode *dir,
 				       struct dentry *new_dentry)
+{
+	return security_inode_link_mnt(NULL, old_dentry, NULL, dir, new_dentry);
+}
+
+static inline int security_inode_unlink_mnt(const struct vfsmount *mnt,
+					     struct inode *dir,
+					     struct dentry *dentry)
 {
 	return 0;
 }
 
 static inline int security_inode_unlink(struct inode *dir,
 					 struct dentry *dentry)
+{
+	return security_inode_unlink_mnt(NULL, dir, dentry);
+}
+
+static inline int security_inode_symlink_mnt(const struct vfsmount *mnt,
+					      struct inode *dir,
+					      struct dentry *dentry,
+					      const char *old_name)
 {
 	return 0;
 }
@@ -930,12 +1289,26 @@ static inline int security_inode_symlink(struct inode *dir,
 					  struct dentry *dentry,
 					  const char *old_name)
 {
+	return security_inode_symlink_mnt(NULL, dir, dentry, old_name);
+}
+
+static inline int security_inode_mkdir_mnt(const struct vfsmount *mnt,
+					    struct inode *dir,
+					    struct dentry *dentry,
+					    int mode)
+{
 	return 0;
 }
 
 static inline int security_inode_mkdir(struct inode *dir,
-					struct dentry *dentry,
-					int mode)
+					struct dentry *dentry, int mode)
+{
+	return security_inode_mkdir_mnt(NULL, dir, dentry, mode);
+}
+
+static inline int security_inode_rmdir_mnt(const struct vfsmount *mnt,
+					    struct inode *dir,
+					    struct dentry *dentry)
 {
 	return 0;
 }
@@ -943,12 +1316,31 @@ static inline int security_inode_mkdir(struct inode *dir,
 static inline int security_inode_rmdir(struct inode *dir,
 					struct dentry *dentry)
 {
+	return security_inode_rmdir_mnt(NULL, dir, dentry);
+}
+
+static inline int security_inode_mknod_mnt(const struct vfsmount *mnt,
+					    struct inode *dir,
+					    struct dentry *dentry,
+					    int mode, dev_t dev)
+{
 	return 0;
 }
 
 static inline int security_inode_mknod(struct inode *dir,
 					struct dentry *dentry,
 					int mode, dev_t dev)
+{
+	return security_inode_mknod_mnt(NULL, dir, dentry, mode, dev);
+}
+
+static inline int security_inode_rename_mnt(const struct vfsmount *old_mnt,
+					     struct inode *old_dir,
+					     struct dentry *old_dentry,
+					     const struct vfsmount *new_mnt,
+					     struct inode *new_dir,
+					     struct dentry *new_dentry,
+					     unsigned int flags)
 {
 	return 0;
 }
@@ -959,22 +1351,45 @@ static inline int security_inode_rename(struct inode *old_dir,
 					 struct dentry *new_dentry,
 					 unsigned int flags)
 {
+	return security_inode_rename_mnt(NULL, old_dir, old_dentry, NULL,
+					 new_dir, new_dentry, flags);
+}
+
+static inline int security_inode_readlink_mnt(const struct vfsmount *mnt,
+					       struct dentry *dentry)
+{
 	return 0;
 }
 
 static inline int security_inode_readlink(struct dentry *dentry)
 {
-	return 0;
+	return security_inode_readlink_mnt(NULL, dentry);
 }
 
-static inline int security_inode_follow_link(struct dentry *dentry,
-					     struct inode *inode,
-					     bool rcu)
+static inline int
+security_inode_follow_link_mnt(const struct vfsmount *mnt,
+			       struct dentry *dentry, struct inode *inode,
+			       bool rcu)
 {
 	return 0;
 }
 
-static inline int security_inode_permission(struct inode *inode, int mask)
+static inline int security_inode_follow_link(struct dentry *dentry,
+					     struct inode *inode, bool rcu)
+{
+	return security_inode_follow_link_mnt(NULL, dentry, inode, rcu);
+}
+
+static inline int security_inode_permission(const struct vfsmount *mnt,
+					    struct inode *inode, int mask)
+{
+	return 0;
+}
+
+static inline int security_inode_setattr_mnt(struct mnt_idmap *idmap,
+					     const struct vfsmount *mnt,
+					     struct dentry *dentry,
+					     struct iattr *attr)
 {
 	return 0;
 }
@@ -983,7 +1398,7 @@ static inline int security_inode_setattr(struct mnt_idmap *idmap,
 					 struct dentry *dentry,
 					 struct iattr *attr)
 {
-	return 0;
+	return security_inode_setattr_mnt(idmap, NULL, dentry, attr);
 }
 
 static inline void
@@ -996,11 +1411,28 @@ static inline int security_inode_getattr(const struct path *path)
 	return 0;
 }
 
+static inline int security_inode_setxattr_mnt(struct mnt_idmap *idmap,
+		const struct vfsmount *mnt, struct dentry *dentry,
+		const char *name, const void *value, size_t size, int flags)
+{
+	return cap_inode_setxattr(dentry, name, value, size, flags);
+}
+
 static inline int security_inode_setxattr(struct mnt_idmap *idmap,
 		struct dentry *dentry, const char *name, const void *value,
 		size_t size, int flags)
 {
-	return cap_inode_setxattr(dentry, name, value, size, flags);
+	return security_inode_setxattr_mnt(idmap, NULL, dentry, name, value,
+					 size, flags);
+}
+
+static inline int security_inode_set_acl_mnt(struct mnt_idmap *idmap,
+					     const struct vfsmount *mnt,
+					     struct dentry *dentry,
+					     const char *acl_name,
+					     struct posix_acl *kacl)
+{
+	return 0;
 }
 
 static inline int security_inode_set_acl(struct mnt_idmap *idmap,
@@ -1008,7 +1440,7 @@ static inline int security_inode_set_acl(struct mnt_idmap *idmap,
 					 const char *acl_name,
 					 struct posix_acl *kacl)
 {
-	return 0;
+	return security_inode_set_acl_mnt(idmap, NULL, dentry, acl_name, kacl);
 }
 
 static inline void security_inode_post_set_acl(struct dentry *dentry,
@@ -1016,9 +1448,25 @@ static inline void security_inode_post_set_acl(struct dentry *dentry,
 					       struct posix_acl *kacl)
 { }
 
+static inline int security_inode_get_acl_mnt(struct mnt_idmap *idmap,
+					     const struct vfsmount *mnt,
+					     struct dentry *dentry,
+					     const char *acl_name)
+{
+	return 0;
+}
+
 static inline int security_inode_get_acl(struct mnt_idmap *idmap,
 					 struct dentry *dentry,
 					 const char *acl_name)
+{
+	return security_inode_get_acl_mnt(idmap, NULL, dentry, acl_name);
+}
+
+static inline int security_inode_remove_acl_mnt(struct mnt_idmap *idmap,
+						const struct vfsmount *mnt,
+						struct dentry *dentry,
+						const char *acl_name)
 {
 	return 0;
 }
@@ -1027,7 +1475,7 @@ static inline int security_inode_remove_acl(struct mnt_idmap *idmap,
 					    struct dentry *dentry,
 					    const char *acl_name)
 {
-	return 0;
+	return security_inode_remove_acl_mnt(idmap, NULL, dentry, acl_name);
 }
 
 static inline void security_inode_post_remove_acl(struct mnt_idmap *idmap,
@@ -1039,30 +1487,65 @@ static inline void security_inode_post_setxattr(struct dentry *dentry,
 		const char *name, const void *value, size_t size, int flags)
 { }
 
+static inline int security_inode_getxattr_mnt(const struct vfsmount *mnt,
+					       struct dentry *dentry,
+					       const char *name)
+{
+	return 0;
+}
+
 static inline int security_inode_getxattr(struct dentry *dentry,
 			const char *name)
+{
+	return security_inode_getxattr_mnt(NULL, dentry, name);
+}
+
+static inline int security_inode_listxattr_mnt(const struct vfsmount *mnt,
+						struct dentry *dentry)
 {
 	return 0;
 }
 
 static inline int security_inode_listxattr(struct dentry *dentry)
 {
-	return 0;
+	return security_inode_listxattr_mnt(NULL, dentry);
+}
+
+static inline int security_inode_removexattr_mnt(struct mnt_idmap *idmap,
+						 const struct vfsmount *mnt,
+						 struct dentry *dentry,
+						 const char *name)
+{
+	return cap_inode_removexattr(idmap, dentry, name);
 }
 
 static inline int security_inode_removexattr(struct mnt_idmap *idmap,
 					     struct dentry *dentry,
 					     const char *name)
 {
-	return cap_inode_removexattr(idmap, dentry, name);
+	return security_inode_removexattr_mnt(idmap, NULL, dentry, name);
 }
 
 static inline void security_inode_post_removexattr(struct dentry *dentry,
 						   const char *name)
 { }
 
+static inline int security_inode_file_setattr_mnt(const struct vfsmount *mnt,
+						  struct dentry *dentry,
+						  struct file_kattr *fa)
+{
+	return 0;
+}
+
 static inline int security_inode_file_setattr(struct dentry *dentry,
 					      struct file_kattr *fa)
+{
+	return security_inode_file_setattr_mnt(NULL, dentry, fa);
+}
+
+static inline int security_inode_file_getattr_mnt(const struct vfsmount *mnt,
+						  struct dentry *dentry,
+						  struct file_kattr *fa)
 {
 	return 0;
 }
@@ -1070,7 +1553,7 @@ static inline int security_inode_file_setattr(struct dentry *dentry,
 static inline int security_inode_file_getattr(struct dentry *dentry,
 					      struct file_kattr *fa)
 {
-	return 0;
+	return security_inode_file_getattr_mnt(NULL, dentry, fa);
 }
 
 static inline int security_inode_need_killpriv(struct dentry *dentry)
@@ -1085,11 +1568,12 @@ static inline int security_inode_killpriv(struct mnt_idmap *idmap,
 }
 
 static inline int security_inode_getsecurity(struct mnt_idmap *idmap,
+					     const struct vfsmount *mnt,
 					     struct inode *inode,
 					     const char *name, void **buffer,
 					     bool alloc)
 {
-	return cap_inode_getsecurity(idmap, inode, name, buffer, alloc);
+	return cap_inode_getsecurity(idmap, mnt, inode, name, buffer, alloc);
 }
 
 static inline int security_inode_setsecurity(struct inode *inode, const char *name, const void *value, size_t size, int flags)
@@ -1109,7 +1593,16 @@ static inline void security_inode_getlsmprop(struct inode *inode,
 	lsmprop_init(prop);
 }
 
-static inline int security_inode_copy_up(struct dentry *src, struct cred **new)
+static inline int security_inode_copy_up(const struct path *src,
+					 const struct vfsmount *dst_mnt,
+					 struct cred **new)
+{
+	return 0;
+}
+
+static inline int security_inode_copy_up_post(const struct path *src,
+					      const struct vfsmount *dst_mnt,
+					      struct dentry *dst)
 {
 	return 0;
 }
@@ -1121,8 +1614,25 @@ static inline int security_inode_setintegrity(const struct inode *inode,
 	return 0;
 }
 
+static inline int security_kernfs_root_alloc(void **root_security)
+{
+	*root_security = NULL;
+	return 0;
+}
+
+static inline void security_kernfs_root_free(void *root_security)
+{
+}
+
+static inline int security_kernfs_root_to_sb(struct super_block *sb,
+					     const void *root_security)
+{
+	return 0;
+}
+
 static inline int security_kernfs_init_security(struct kernfs_node *kn_dir,
-						struct kernfs_node *kn)
+						struct kernfs_node *kn,
+						const void *root_security)
 {
 	return 0;
 }
@@ -1138,6 +1648,16 @@ static inline int security_file_permission(struct file *file, int mask)
 }
 
 static inline int security_file_alloc(struct file *file)
+{
+	return 0;
+}
+
+static inline int security_file_set_path(struct file *file)
+{
+	return 0;
+}
+
+static inline int security_file_init_security_anon(struct file *file)
 {
 	return 0;
 }
@@ -1275,6 +1795,113 @@ static inline void security_cred_getsecid(const struct cred *c, u32 *secid)
 static inline void security_cred_getlsmprop(const struct cred *c,
 					    struct lsm_prop *prop)
 { }
+
+static inline struct lsm_prop_ref *
+security_lsm_prop_ref_get(struct lsm_prop_ref *ref)
+{
+	if (ref)
+		refcount_inc(&ref->refs);
+	return ref;
+}
+
+static inline void security_lsm_prop_ref_put(struct lsm_prop_ref *ref)
+{
+	if (ref && refcount_dec_and_test(&ref->refs))
+		kfree(ref);
+}
+
+static inline const struct lsm_prop *
+security_lsm_prop_ref_prop(const struct lsm_prop_ref *ref)
+{
+	return ref ? &ref->prop : NULL;
+}
+
+static inline int security_lsm_prop_ref_lsmid(const struct lsm_prop_ref *ref)
+{
+	return ref ? ref->source_lsmid : LSM_ID_UNDEF;
+}
+
+static inline unsigned int
+security_lsm_prop_ref_provider_count(const struct lsm_prop_ref *ref)
+{
+	return ref ? ref->provider_count : 0;
+}
+
+static inline bool
+security_lsm_prop_ref_source_secid(const struct lsm_prop_ref *ref, u32 *secid)
+{
+	if (!ref || !secid || ref->provider_count != 1 ||
+	    ref->source_lsmid == LSM_ID_UNDEF || !ref->source_secid)
+		return false;
+	*secid = ref->source_secid;
+	return true;
+}
+
+static inline int security_lsm_prop_ref_unavailable(
+	struct lsm_prop_ref **out, bool source_valid)
+{
+	if (!out)
+		return -EINVAL;
+	*out = NULL;
+	return source_valid ? -EOPNOTSUPP : -EINVAL;
+}
+
+static inline int security_cred_getlsmprop_ref(
+	const struct cred *cred, gfp_t gfp, struct lsm_prop_ref **out)
+{
+	return security_lsm_prop_ref_unavailable(out, cred);
+}
+
+static inline int security_current_getlsmprop_ref_subj(
+	gfp_t gfp, struct lsm_prop_ref **out)
+{
+	return security_lsm_prop_ref_unavailable(out, true);
+}
+
+static inline int security_task_getlsmprop_ref_obj(
+	struct task_struct *task, gfp_t gfp, struct lsm_prop_ref **out)
+{
+	return security_lsm_prop_ref_unavailable(out, task);
+}
+
+static inline int security_inode_getlsmprop_ref(
+	struct inode *inode, gfp_t gfp, struct lsm_prop_ref **out)
+{
+	return security_lsm_prop_ref_unavailable(out, inode);
+}
+
+static inline int security_ipc_getlsmprop_ref(
+	struct kern_ipc_perm *ipc, gfp_t gfp, struct lsm_prop_ref **out)
+{
+	return security_lsm_prop_ref_unavailable(out, ipc);
+}
+
+static inline int security_secctx_to_lsmprop_ref(
+	const char *secdata, u32 seclen, int lsmid, gfp_t gfp,
+	struct lsm_prop_ref **out)
+{
+	return security_lsm_prop_ref_unavailable(
+		out, secdata && seclen);
+}
+
+static inline int security_secid_to_lsmprop_ref(
+	u32 secid, int lsmid, gfp_t gfp, struct lsm_prop_ref **out)
+{
+	return security_lsm_prop_ref_unavailable(out, true);
+}
+
+static inline int security_lsm_prop_ref_to_secctx(
+	const struct lsm_prop_ref *ref, const struct cred *observer, int lsmid,
+	struct lsm_context *cp)
+{
+	return (!ref || !observer || !cp) ? -EINVAL : -EOPNOTSUPP;
+}
+
+static inline int security_kernel_act_as_ref(
+	struct cred *new, const struct lsm_prop_ref *ref)
+{
+	return (!new || !ref) ? -EINVAL : 0;
+}
 
 static inline int security_kernel_act_as(struct cred *cred, u32 secid)
 {
@@ -1431,6 +2058,44 @@ static inline int security_create_user_ns(const struct cred *cred)
 	return 0;
 }
 
+static inline int security_ipc_namespace_alloc(
+	struct ipc_namespace *ns, const struct ipc_namespace *old_ns,
+	const struct cred *cred, bool initial)
+{
+	return 0;
+}
+
+static inline void security_ipc_namespace_free(struct ipc_namespace *ns)
+{ }
+
+static inline int security_ipc_namespace_reanchor_prepare(
+	struct ipc_namespace_security_txn *txn, struct ipc_namespace *ns,
+	const struct cred *cred, struct cred *mutable_cred,
+	struct cred **replacement_cred)
+{
+	if (replacement_cred)
+		*replacement_cred = NULL;
+	return 0;
+}
+
+static inline void security_ipc_namespace_reanchor_commit(
+	struct ipc_namespace_security_txn *txn)
+{ }
+
+static inline void security_ipc_namespace_reanchor_abort(
+	struct ipc_namespace_security_txn *txn)
+{ }
+
+static inline int security_ipc_namespace_create_gate(
+	struct ipc_namespace *ns, const struct cred *cred)
+{
+	return 0;
+}
+
+static inline void security_ipc_namespace_object_published(
+	struct ipc_namespace *ns)
+{ }
+
 static inline int security_ipc_permission(struct kern_ipc_perm *ipcp,
 					  short flag)
 {
@@ -1451,7 +2116,8 @@ static inline int security_msg_msg_alloc(struct msg_msg *msg)
 static inline void security_msg_msg_free(struct msg_msg *msg)
 { }
 
-static inline int security_msg_queue_alloc(struct kern_ipc_perm *msq)
+static inline int security_msg_queue_alloc(struct ipc_namespace *ns,
+				   struct kern_ipc_perm *msq)
 {
 	return 0;
 }
@@ -1484,7 +2150,8 @@ static inline int security_msg_queue_msgrcv(struct kern_ipc_perm *msq,
 	return 0;
 }
 
-static inline int security_shm_alloc(struct kern_ipc_perm *shp)
+static inline int security_shm_alloc(struct ipc_namespace *ns,
+			     struct kern_ipc_perm *shp)
 {
 	return 0;
 }
@@ -1509,7 +2176,8 @@ static inline int security_shm_shmat(struct kern_ipc_perm *shp,
 	return 0;
 }
 
-static inline int security_sem_alloc(struct kern_ipc_perm *sma)
+static inline int security_sem_alloc(struct ipc_namespace *ns,
+			     struct kern_ipc_perm *sma)
 {
 	return 0;
 }
@@ -1574,7 +2242,7 @@ static inline int security_secid_to_secctx(u32 secid, struct lsm_context *cp)
 	return -EOPNOTSUPP;
 }
 
-static inline int security_lsmprop_to_secctx(struct lsm_prop *prop,
+static inline int security_lsmprop_to_secctx(const struct lsm_prop *prop,
 					     struct lsm_context *cp,
 					     int lsmid)
 {
@@ -1685,9 +2353,29 @@ int security_sock_rcv_skb(struct sock *sk, struct sk_buff *skb);
 int security_socket_getpeersec_stream(struct socket *sock, sockptr_t optval,
 				      sockptr_t optlen, unsigned int len);
 int security_socket_getpeersec_dgram(struct socket *sock, struct sk_buff *skb, u32 *secid);
+int security_socket_getpeersec_dgram_ctx(struct sock *observer,
+					 struct sk_buff *skb,
+					 struct lsm_context *cp);
+int security_scm_alloc(struct socket *sock, gfp_t gfp,
+		       struct lsm_scm_security **scmp);
+struct lsm_scm_security *
+security_scm_get(struct lsm_scm_security *scm);
+void security_scm_put(struct lsm_scm_security *scm);
+bool security_scm_secdata_eq(const struct lsm_scm_security *left,
+			     const struct lsm_scm_security *right);
+int security_scm_getsecctx(const struct lsm_scm_security *scm, u32 secid,
+			   const struct cred *observer_cred,
+			   struct sock *observer, struct lsm_context *cp);
 int security_sk_alloc(struct sock *sk, int family, gfp_t priority);
 void security_sk_free(struct sock *sk);
 void security_sk_clone(const struct sock *sk, struct sock *newsk);
+int security_req_alloc(struct request_sock *req, const struct sock *listener,
+		       gfp_t gfp);
+void security_req_free(struct request_sock *req);
+int security_req_clone(const struct request_sock *req,
+		       struct request_sock *newreq, gfp_t gfp);
+int security_sctp_assoc_alloc(struct sctp_association *asoc, gfp_t gfp);
+void security_sctp_assoc_free(struct sctp_association *asoc);
 void security_sk_classify_flow(const struct sock *sk,
 			       struct flowi_common *flic);
 void security_req_classify_flow(const struct request_sock *req,
@@ -1699,15 +2387,18 @@ void security_inet_csk_clone(struct sock *newsk,
 			const struct request_sock *req);
 void security_inet_conn_established(struct sock *sk,
 			struct sk_buff *skb);
-int security_secmark_relabel_packet(u32 secid);
+int security_secmark_relabel_packet(const struct net *net, u32 secid,
+				    struct lsm_secmark *secmark);
+void security_secmark_release(struct lsm_secmark *secmark);
 void security_secmark_refcount_inc(void);
 void security_secmark_refcount_dec(void);
-int security_tun_dev_alloc_security(void **security);
+int security_tun_dev_alloc_security(void **security, const struct net *net);
 void security_tun_dev_free_security(void *security);
 int security_tun_dev_create(void);
-int security_tun_dev_attach_queue(void *security);
-int security_tun_dev_attach(struct sock *sk, void *security);
-int security_tun_dev_open(void *security);
+int security_tun_dev_attach_queue(void *security, const struct net *net);
+int security_tun_dev_attach(struct sock *sk, void *security,
+			    const struct net *net);
+int security_tun_dev_open(void *security, const struct net *net);
 int security_sctp_assoc_request(struct sctp_association *asoc, struct sk_buff *skb);
 int security_sctp_bind_connect(struct sock *sk, int optname,
 			       struct sockaddr *address, int addrlen);
@@ -1839,6 +2530,46 @@ static inline int security_socket_getpeersec_dgram(struct socket *sock, struct s
 	return -ENOPROTOOPT;
 }
 
+static inline int
+security_socket_getpeersec_dgram_ctx(struct sock *observer,
+				     struct sk_buff *skb,
+				     struct lsm_context *cp)
+{
+	return -ENOPROTOOPT;
+}
+
+static inline int security_scm_alloc(struct socket *sock, gfp_t gfp,
+				     struct lsm_scm_security **scmp)
+{
+	*scmp = NULL;
+	return 0;
+}
+
+static inline struct lsm_scm_security *
+security_scm_get(struct lsm_scm_security *scm)
+{
+	return scm;
+}
+
+static inline void security_scm_put(struct lsm_scm_security *scm)
+{
+}
+
+static inline bool
+security_scm_secdata_eq(const struct lsm_scm_security *left,
+			const struct lsm_scm_security *right)
+{
+	return left == right;
+}
+
+static inline int
+security_scm_getsecctx(const struct lsm_scm_security *scm, u32 secid,
+		       const struct cred *observer_cred,
+		       struct sock *observer, struct lsm_context *cp)
+{
+	return -EOPNOTSUPP;
+}
+
 static inline int security_sk_alloc(struct sock *sk, int family, gfp_t priority)
 {
 	return 0;
@@ -1849,6 +2580,32 @@ static inline void security_sk_free(struct sock *sk)
 }
 
 static inline void security_sk_clone(const struct sock *sk, struct sock *newsk)
+{
+}
+
+static inline int security_req_alloc(struct request_sock *req,
+				     const struct sock *listener, gfp_t gfp)
+{
+	return 0;
+}
+
+static inline void security_req_free(struct request_sock *req)
+{
+}
+
+static inline int security_req_clone(const struct request_sock *req,
+				     struct request_sock *newreq, gfp_t gfp)
+{
+	return 0;
+}
+
+static inline int security_sctp_assoc_alloc(struct sctp_association *asoc,
+					    gfp_t gfp)
+{
+	return 0;
+}
+
+static inline void security_sctp_assoc_free(struct sctp_association *asoc)
 {
 }
 
@@ -1882,9 +2639,18 @@ static inline void security_inet_conn_established(struct sock *sk,
 {
 }
 
-static inline int security_secmark_relabel_packet(u32 secid)
+static inline int security_secmark_relabel_packet(const struct net *net,
+						  u32 secid,
+						  struct lsm_secmark *secmark)
 {
+	if (!secmark)
+		return -EINVAL;
+	memset(secmark, 0, sizeof(*secmark));
 	return 0;
+}
+
+static inline void security_secmark_release(struct lsm_secmark *secmark)
+{
 }
 
 static inline void security_secmark_refcount_inc(void)
@@ -1895,7 +2661,8 @@ static inline void security_secmark_refcount_dec(void)
 {
 }
 
-static inline int security_tun_dev_alloc_security(void **security)
+static inline int security_tun_dev_alloc_security(void **security,
+					  const struct net *net)
 {
 	return 0;
 }
@@ -1909,17 +2676,19 @@ static inline int security_tun_dev_create(void)
 	return 0;
 }
 
-static inline int security_tun_dev_attach_queue(void *security)
+static inline int security_tun_dev_attach_queue(void *security,
+						const struct net *net)
 {
 	return 0;
 }
 
-static inline int security_tun_dev_attach(struct sock *sk, void *security)
+static inline int security_tun_dev_attach(struct sock *sk, void *security,
+					  const struct net *net)
 {
 	return 0;
 }
 
-static inline int security_tun_dev_open(void *security)
+static inline int security_tun_dev_open(void *security, const struct net *net)
 {
 	return 0;
 }
@@ -2001,13 +2770,16 @@ void security_xfrm_policy_free(struct xfrm_sec_ctx *ctx);
 int security_xfrm_policy_delete(struct xfrm_sec_ctx *ctx);
 int security_xfrm_state_alloc(struct xfrm_state *x, struct xfrm_user_sec_ctx *sec_ctx);
 int security_xfrm_state_alloc_acquire(struct xfrm_state *x,
-				      struct xfrm_sec_ctx *polsec, u32 secid);
+				      struct xfrm_sec_ctx *polsec, u32 secid,
+				      const struct xfrm_flow_origin *origin);
 int security_xfrm_state_delete(struct xfrm_state *x);
 void security_xfrm_state_free(struct xfrm_state *x);
-int security_xfrm_policy_lookup(struct xfrm_sec_ctx *ctx, u32 fl_secid);
+int security_xfrm_policy_lookup(struct xfrm_sec_ctx *ctx, u32 fl_secid,
+				const struct xfrm_flow_origin *origin);
 int security_xfrm_state_pol_flow_match(struct xfrm_state *x,
 				       struct xfrm_policy *xp,
-				       const struct flowi_common *flic);
+				       const struct flowi_common *flic,
+				       const struct xfrm_flow_origin *origin);
 int security_xfrm_decode_session(struct sk_buff *skb, u32 *secid);
 void security_skb_classify_flow(struct sk_buff *skb, struct flowi_common *flic);
 
@@ -2041,7 +2813,8 @@ static inline int security_xfrm_state_alloc(struct xfrm_state *x,
 }
 
 static inline int security_xfrm_state_alloc_acquire(struct xfrm_state *x,
-					struct xfrm_sec_ctx *polsec, u32 secid)
+					struct xfrm_sec_ctx *polsec, u32 secid,
+					const struct xfrm_flow_origin *origin)
 {
 	return 0;
 }
@@ -2055,14 +2828,17 @@ static inline int security_xfrm_state_delete(struct xfrm_state *x)
 	return 0;
 }
 
-static inline int security_xfrm_policy_lookup(struct xfrm_sec_ctx *ctx, u32 fl_secid)
+static inline int security_xfrm_policy_lookup(
+	struct xfrm_sec_ctx *ctx, u32 fl_secid,
+	const struct xfrm_flow_origin *origin)
 {
 	return 0;
 }
 
 static inline int security_xfrm_state_pol_flow_match(struct xfrm_state *x,
 						     struct xfrm_policy *xp,
-						     const struct flowi_common *flic)
+						     const struct flowi_common *flic,
+						     const struct xfrm_flow_origin *origin)
 {
 	return 1;
 }
@@ -2221,8 +2997,10 @@ static inline void security_key_post_create_or_update(struct key *keyring,
 int security_audit_rule_init(u32 field, u32 op, char *rulestr, void **lsmrule,
 			     gfp_t gfp);
 int security_audit_rule_known(struct audit_krule *krule);
-int security_audit_rule_match(struct lsm_prop *prop, u32 field, u32 op,
+int security_audit_rule_match(const struct lsm_prop *prop, u32 field, u32 op,
 			      void *lsmrule);
+int security_audit_rule_match_ref(const struct lsm_prop_ref *ref, int status,
+				  u32 field, u32 op, void *lsmrule);
 void security_audit_rule_free(void *lsmrule);
 
 #else
@@ -2238,10 +3016,18 @@ static inline int security_audit_rule_known(struct audit_krule *krule)
 	return 0;
 }
 
-static inline int security_audit_rule_match(struct lsm_prop *prop, u32 field,
-					    u32 op, void *lsmrule)
+static inline int security_audit_rule_match(const struct lsm_prop *prop,
+					    u32 field, u32 op,
+					    void *lsmrule)
 {
 	return 0;
+}
+
+static inline int
+security_audit_rule_match_ref(const struct lsm_prop_ref *ref, int status,
+			      u32 field, u32 op, void *lsmrule)
+{
+	return status < 0 ? status : 0;
 }
 
 static inline void security_audit_rule_free(void *lsmrule)
@@ -2296,17 +3082,39 @@ static inline void securityfs_remove(struct dentry *dentry)
 union bpf_attr;
 struct bpf_map;
 struct bpf_prog;
+struct bpf_link;
 struct bpf_token;
 #ifdef CONFIG_SECURITY
 extern int security_bpf(int cmd, union bpf_attr *attr, unsigned int size, bool kernel);
 extern int security_bpf_map(struct bpf_map *map, fmode_t fmode);
+extern int security_bpf_map_relation(struct bpf_map *outer,
+				     const struct bpf_map *inner,
+				     const struct bpf_prog *prog);
 extern int security_bpf_prog(struct bpf_prog *prog);
+extern int security_bpf_prog_map_relation(struct bpf_prog *prog,
+					  const struct bpf_map *map);
 extern int security_bpf_map_create(struct bpf_map *map, union bpf_attr *attr,
 				   struct bpf_token *token, bool kernel);
 extern void security_bpf_map_free(struct bpf_map *map);
 extern int security_bpf_prog_load(struct bpf_prog *prog, union bpf_attr *attr,
 				  struct bpf_token *token, bool kernel);
+extern int security_bpf_prog_commit(struct bpf_prog *prog);
 extern void security_bpf_prog_free(struct bpf_prog *prog);
+extern int security_bpf_link_create(struct bpf_link *link,
+				    const struct bpf_prog *related_prog,
+				    const struct bpf_map *related_map);
+extern void security_bpf_link_free(struct bpf_link *link);
+extern int security_bpf_link_access(struct bpf_link *link, enum bpf_cmd cmd);
+extern int security_bpf_link_update(struct bpf_link *link,
+				    const struct bpf_prog *new_prog,
+				    const struct bpf_prog *old_prog,
+				    const struct bpf_map *new_map,
+				    const struct bpf_map *old_map);
+extern int security_bpf_btf(const struct btf *btf);
+extern int security_bpf_btf_load(struct btf *btf, const union bpf_attr *attr,
+				 struct bpf_token *token,
+				 enum bpf_btf_origin origin);
+extern void security_bpf_btf_free(struct btf *btf);
 extern int security_bpf_token_create(struct bpf_token *token, union bpf_attr *attr,
 				     const struct path *path);
 extern void security_bpf_token_free(struct bpf_token *token);
@@ -2324,7 +3132,20 @@ static inline int security_bpf_map(struct bpf_map *map, fmode_t fmode)
 	return 0;
 }
 
+static inline int security_bpf_map_relation(struct bpf_map *outer,
+					    const struct bpf_map *inner,
+					    const struct bpf_prog *prog)
+{
+	return 0;
+}
+
 static inline int security_bpf_prog(struct bpf_prog *prog)
+{
+	return 0;
+}
+
+static inline int security_bpf_prog_map_relation(struct bpf_prog *prog,
+						 const struct bpf_map *map)
 {
 	return 0;
 }
@@ -2344,7 +3165,53 @@ static inline int security_bpf_prog_load(struct bpf_prog *prog, union bpf_attr *
 	return 0;
 }
 
+static inline int security_bpf_prog_commit(struct bpf_prog *prog)
+{
+	return 0;
+}
+
 static inline void security_bpf_prog_free(struct bpf_prog *prog)
+{ }
+
+static inline int security_bpf_link_create(struct bpf_link *link,
+					   const struct bpf_prog *related_prog,
+					   const struct bpf_map *related_map)
+{
+	return 0;
+}
+
+static inline void security_bpf_link_free(struct bpf_link *link)
+{ }
+
+static inline int security_bpf_link_access(struct bpf_link *link,
+					   enum bpf_cmd cmd)
+{
+	return 0;
+}
+
+static inline int security_bpf_link_update(struct bpf_link *link,
+					   const struct bpf_prog *new_prog,
+					   const struct bpf_prog *old_prog,
+					   const struct bpf_map *new_map,
+					   const struct bpf_map *old_map)
+{
+	return 0;
+}
+
+static inline int security_bpf_btf(const struct btf *btf)
+{
+	return 0;
+}
+
+static inline int security_bpf_btf_load(struct btf *btf,
+					const union bpf_attr *attr,
+					struct bpf_token *token,
+					enum bpf_btf_origin origin)
+{
+	return 0;
+}
+
+static inline void security_bpf_btf_free(struct btf *btf)
 { }
 
 static inline int security_bpf_token_create(struct bpf_token *token, union bpf_attr *attr,
@@ -2372,12 +3239,17 @@ static inline int security_bpf_token_capable(const struct bpf_token *token, int 
 struct perf_event_attr;
 struct perf_event;
 
+#define PERF_SECURITY_RELATION_READ  0x1U
+#define PERF_SECURITY_RELATION_WRITE 0x2U
+
 #ifdef CONFIG_SECURITY
 extern int security_perf_event_open(int type);
 extern int security_perf_event_alloc(struct perf_event *event);
 extern void security_perf_event_free(struct perf_event *event);
 extern int security_perf_event_read(struct perf_event *event);
 extern int security_perf_event_write(struct perf_event *event);
+extern int security_perf_event_relation(struct perf_event *event,
+					unsigned int access);
 #else
 static inline int security_perf_event_open(int type)
 {
@@ -2399,6 +3271,12 @@ static inline int security_perf_event_read(struct perf_event *event)
 }
 
 static inline int security_perf_event_write(struct perf_event *event)
+{
+	return 0;
+}
+
+static inline int security_perf_event_relation(struct perf_event *event,
+					       unsigned int access)
 {
 	return 0;
 }

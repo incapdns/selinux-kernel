@@ -71,6 +71,9 @@ struct request_sock {
 	struct saved_syn		*saved_syn;
 	u32				secid;
 	u32				peer_secid;
+#ifdef CONFIG_SECURITY
+	void				*security;
+#endif
 	u32				timeout;
 };
 

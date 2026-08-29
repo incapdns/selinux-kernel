@@ -1545,6 +1545,9 @@ struct sctp_priv_assoc_stats {
 
 /* Here we have information about each individual association. */
 struct sctp_association {
+	/* Composite LSM blob owned by this association. */
+	void *security;
+	bool security_initialized;
 
 	/* A base structure common to endpoint and association.
 	 * In this context, it represents the associations's view

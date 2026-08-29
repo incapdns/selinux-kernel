@@ -1916,6 +1916,8 @@ struct bpf_link {
 	enum bpf_link_type type;
 	const struct bpf_link_ops *ops;
 	struct bpf_prog *prog;
+	void *security;
+	bool security_initialized;
 
 	u32 flags;
 	enum bpf_attach_type attach_type;
@@ -2681,6 +2683,8 @@ static inline void bpf_enable_instrumentation(void)
 extern const struct super_operations bpf_super_ops;
 extern const struct file_operations bpf_map_fops;
 extern const struct file_operations bpf_prog_fops;
+extern const struct file_operations bpf_link_fops;
+extern const struct file_operations bpf_link_fops_poll;
 extern const struct file_operations bpf_iter_fops;
 extern const struct file_operations bpf_token_fops;
 
@@ -2890,7 +2894,9 @@ void bpf_link_init_sleepable(struct bpf_link *link, enum bpf_link_type type,
 void bpf_tramp_link_init(struct bpf_tramp_link *link, enum bpf_link_type type,
 			 const struct bpf_link_ops *ops, struct bpf_prog *prog,
 			 enum bpf_attach_type attach_type, u64 cookie);
-int bpf_link_prime(struct bpf_link *link, struct bpf_link_primer *primer);
+int bpf_link_prime(struct bpf_link *link, struct bpf_link_primer *primer,
+		   const struct bpf_prog *related_prog,
+		   const struct bpf_map *related_map);
 int bpf_link_settle(struct bpf_link_primer *primer);
 void bpf_link_cleanup(struct bpf_link_primer *primer);
 void bpf_link_inc(struct bpf_link *link);
@@ -3320,7 +3326,9 @@ static inline void bpf_tramp_link_init(struct bpf_tramp_link *link, enum bpf_lin
 }
 
 static inline int bpf_link_prime(struct bpf_link *link,
-				 struct bpf_link_primer *primer)
+				 struct bpf_link_primer *primer,
+				 const struct bpf_prog *related_prog,
+				 const struct bpf_map *related_map)
 {
 	return -EOPNOTSUPP;
 }

@@ -37,7 +37,11 @@ static void secmark_save(const struct sk_buff *skb)
 
 		ct = nf_ct_get(skb, &ctinfo);
 		if (ct && !ct->secmark) {
+#ifdef CONFIG_SECURITY_SELINUX_NS
+			nf_conn_secmark_save(ct, skb);
+#else
 			ct->secmark = skb->secmark;
+#endif
 			nf_conntrack_event_cache(IPCT_SECMARK, ct);
 		}
 	}
@@ -50,12 +54,17 @@ static void secmark_save(const struct sk_buff *skb)
 static void secmark_restore(struct sk_buff *skb)
 {
 	if (!skb->secmark) {
-		const struct nf_conn *ct;
+		struct nf_conn *ct;
 		enum ip_conntrack_info ctinfo;
 
 		ct = nf_ct_get(skb, &ctinfo);
-		if (ct && ct->secmark)
+		if (ct && ct->secmark) {
+#ifdef CONFIG_SECURITY_SELINUX_NS
+			nf_conn_secmark_restore(skb, ct);
+#else
 			skb->secmark = ct->secmark;
+#endif
+		}
 	}
 }
 

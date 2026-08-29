@@ -6,3 +6,13 @@
 config KERNFS
 	bool
 	default n
+
+config KERNFS_KUNIT_TEST
+	bool "KUnit tests for kernfs security root lifecycle" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && KERNFS && SECURITY
+	default KUNIT_ALL_TESTS
+	help
+	  Build tests for immutable kernfs root security blob allocation,
+	  propagation to node hooks, and final-reference teardown.
+
+	  If unsure, say N.

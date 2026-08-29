@@ -1641,7 +1641,11 @@ void ip_send_unicast_reply(struct sock *sk, const struct sock *orig_sk,
 			   tcp_hdr(skb)->source, tcp_hdr(skb)->dest,
 			   arg->uid);
 	security_skb_classify_flow(skb, flowi4_to_flowi_common(&fl4));
-	rt = ip_route_output_flow(net, &fl4, sk);
+	{
+		struct xfrm_flow_origin origin = xfrm_flow_origin_skb(skb);
+
+		rt = ip_route_output_flow_origin(net, &fl4, sk, &origin);
+	}
 	if (IS_ERR(rt))
 		return;
 

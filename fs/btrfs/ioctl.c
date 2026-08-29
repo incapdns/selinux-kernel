@@ -858,6 +858,7 @@ free_pending:
  */
 static noinline int btrfs_mksubvol(struct dentry *parent,
 				   struct mnt_idmap *idmap,
+				   const struct vfsmount *mnt,
 				   struct qstr *qname, struct btrfs_root *snap_src,
 				   bool readonly,
 				   struct btrfs_qgroup_inherit *inherit)
@@ -868,11 +869,11 @@ static noinline int btrfs_mksubvol(struct dentry *parent,
 	struct fscrypt_str name_str = FSTR_INIT((char *)qname->name, qname->len);
 	int ret;
 
-	dentry = start_creating_killable(idmap, parent, qname);
+	dentry = start_creating_killable_mnt(idmap, mnt, parent, qname);
 	if (IS_ERR(dentry))
 		return PTR_ERR(dentry);
 
-	ret = may_create_dentry(idmap, dir, dentry);
+	ret = may_create_dentry_mnt(idmap, mnt, dir, dentry);
 	if (ret)
 		goto out_dput;
 
@@ -905,6 +906,7 @@ out_dput:
 
 static noinline int btrfs_mksnapshot(struct dentry *parent,
 				   struct mnt_idmap *idmap,
+				   const struct vfsmount *mnt,
 				   struct qstr *qname,
 				   struct btrfs_root *root,
 				   bool readonly,
@@ -932,7 +934,7 @@ static noinline int btrfs_mksnapshot(struct dentry *parent,
 
 	btrfs_wait_ordered_extents(root, U64_MAX, NULL);
 
-	ret = btrfs_mksubvol(parent, idmap, qname, root, readonly, inherit);
+	ret = btrfs_mksubvol(parent, idmap, mnt, qname, root, readonly, inherit);
 
 	atomic_dec(&root->snapshot_force_cow);
 out:
@@ -1163,7 +1165,8 @@ static noinline int __btrfs_ioctl_snap_create(struct file *file,
 	}
 
 	if (subvol) {
-		ret = btrfs_mksubvol(file_dentry(file), idmap, &qname, NULL,
+		ret = btrfs_mksubvol(file_dentry(file), idmap,
+				     file->f_path.mnt, &qname, NULL,
 				     readonly, inherit);
 	} else {
 		CLASS(fd, src)(fd);
@@ -1194,7 +1197,8 @@ static noinline int __btrfs_ioctl_snap_create(struct file *file,
 			 */
 			ret = -EINVAL;
 		} else {
-			ret = btrfs_mksnapshot(file_dentry(file), idmap, &qname,
+			ret = btrfs_mksnapshot(file_dentry(file), idmap,
+					       file->f_path.mnt, &qname,
 					       BTRFS_I(src_inode)->root,
 					       readonly, inherit);
 		}
@@ -1737,7 +1741,7 @@ out:
 }
 
 static int btrfs_search_path_in_tree_user(struct mnt_idmap *idmap,
-				struct inode *inode,
+				const struct vfsmount *mnt, struct inode *inode,
 				struct btrfs_ioctl_ino_lookup_user_args *args)
 {
 	struct btrfs_fs_info *fs_info = BTRFS_I(inode)->root->fs_info;
@@ -1816,8 +1820,9 @@ static int btrfs_search_path_in_tree_user(struct mnt_idmap *idmap,
 				goto out_put;
 			}
 			/* Check the read+exec permission of this directory. */
-			ret = inode_permission(idmap, &temp_inode->vfs_inode,
-					       MAY_READ | MAY_EXEC);
+			ret = inode_permission_mnt(idmap, mnt,
+						   &temp_inode->vfs_inode,
+						   MAY_READ | MAY_EXEC);
 			iput(&temp_inode->vfs_inode);
 			if (ret)
 				goto out_put;
@@ -1945,7 +1950,8 @@ static int btrfs_ioctl_ino_lookup_user(struct file *file, void __user *argp)
 		return -EACCES;
 	}
 
-	ret = btrfs_search_path_in_tree_user(file_mnt_idmap(file), inode, args);
+	ret = btrfs_search_path_in_tree_user(file_mnt_idmap(file),
+					     file->f_path.mnt, inode, args);
 
 	if (ret == 0 && copy_to_user(argp, args, sizeof(*args)))
 		ret = -EFAULT;
@@ -2359,7 +2365,8 @@ static noinline int btrfs_ioctl_snap_destroy(struct file *file,
 		goto free_subvol_name;
 	}
 
-	dentry = start_removing_killable(idmap, parent, &QSTR(subvol_name));
+	dentry = start_removing_killable_mnt(idmap, file->f_path.mnt, parent,
+					     &QSTR(subvol_name));
 	if (IS_ERR(dentry)) {
 		ret = PTR_ERR(dentry);
 		goto out_end_removing;
@@ -2396,13 +2403,14 @@ static noinline int btrfs_ioctl_snap_destroy(struct file *file,
 		if (root == dest)
 			goto out_end_removing;
 
-		ret = inode_permission(idmap, inode, MAY_WRITE | MAY_EXEC);
+		ret = inode_permission_mnt(idmap, file->f_path.mnt, inode,
+					   MAY_WRITE | MAY_EXEC);
 		if (ret)
 			goto out_end_removing;
 	}
 
 	/* check if subvolume may be deleted by a user */
-	ret = may_delete_dentry(idmap, dir, dentry, true);
+	ret = may_delete_dentry_mnt(idmap, file->f_path.mnt, dir, dentry, true);
 	if (ret)
 		goto out_end_removing;
 
@@ -2460,7 +2468,8 @@ static int btrfs_ioctl_defrag(struct file *file, void __user *argp)
 		 * running and allows defrag on files open in read-only mode.
 		 */
 		if (!capable(CAP_SYS_ADMIN) &&
-		    inode_permission(&nop_mnt_idmap, inode, MAY_WRITE)) {
+		    inode_permission_mnt(&nop_mnt_idmap, file->f_path.mnt,
+					 inode, MAY_WRITE)) {
 			ret = -EPERM;
 			goto out;
 		}

@@ -52,7 +52,8 @@ static int calculate_f_flags(struct vfsmount *mnt)
 		flags_by_sb(mnt->mnt_sb->s_flags);
 }
 
-static int statfs_by_dentry(struct dentry *dentry, struct kstatfs *buf)
+static int statfs_by_dentry(struct dentry *dentry, const struct vfsmount *mnt,
+			    struct kstatfs *buf)
 {
 	int retval;
 
@@ -60,7 +61,7 @@ static int statfs_by_dentry(struct dentry *dentry, struct kstatfs *buf)
 		return -ENOSYS;
 
 	memset(buf, 0, sizeof(*buf));
-	retval = security_sb_statfs(dentry);
+	retval = security_sb_statfs(dentry, mnt);
 	if (retval)
 		return retval;
 	retval = dentry->d_sb->s_op->statfs(dentry, buf);
@@ -74,7 +75,7 @@ int vfs_get_fsid(struct dentry *dentry, __kernel_fsid_t *fsid)
 	struct kstatfs st;
 	int error;
 
-	error = statfs_by_dentry(dentry, &st);
+	error = statfs_by_dentry(dentry, NULL, &st);
 	if (error)
 		return error;
 
@@ -87,7 +88,7 @@ int vfs_statfs(const struct path *path, struct kstatfs *buf)
 {
 	int error;
 
-	error = statfs_by_dentry(path->dentry, buf);
+	error = statfs_by_dentry(path->dentry, path->mnt, buf);
 	if (!error)
 		buf->f_flags = calculate_f_flags(path->mnt);
 	return error;
@@ -239,7 +240,7 @@ static int vfs_ustat(dev_t dev, struct kstatfs *sbuf)
 	if (!s)
 		return -EINVAL;
 
-	err = statfs_by_dentry(s->s_root, sbuf);
+	err = statfs_by_dentry(s->s_root, NULL, sbuf);
 	drop_super(s);
 	return err;
 }

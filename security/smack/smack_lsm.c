@@ -53,6 +53,8 @@
 #define SMK_RECEIVING	1
 #define SMK_SENDING	2
 
+static int smack_to_secctx(struct smack_known *skp, struct lsm_context *cp);
+
 /*
  * Smack uses multiple xattrs.
  * SMACK64 - for access control,
@@ -611,13 +613,14 @@ out_opt_err:
 /**
  * smack_fs_context_submount - Initialise security data for a filesystem context
  * @fc: The filesystem context.
- * @reference: reference superblock
+ * @reference: reference path
  *
  * Returns 0 on success or -ENOMEM on error.
  */
 static int smack_fs_context_submount(struct fs_context *fc,
-				 struct super_block *reference)
+				 const struct path *reference)
 {
+	struct super_block *sb = reference->mnt->mnt_sb;
 	struct superblock_smack *sbsp;
 	struct smack_mnt_opts *ctx;
 	struct inode_smack *isp;
@@ -627,8 +630,8 @@ static int smack_fs_context_submount(struct fs_context *fc,
 		return -ENOMEM;
 	fc->security = ctx;
 
-	sbsp = smack_superblock(reference);
-	isp = smack_inode(reference->s_root->d_inode);
+	sbsp = smack_superblock(sb);
+	isp = smack_inode(sb->s_root->d_inode);
 
 	if (sbsp->smk_default) {
 		ctx->fsdefault = kstrdup(sbsp->smk_default->smk_known, GFP_KERNEL);
@@ -721,8 +724,9 @@ static int smack_fs_context_parse_param(struct fs_context *fc,
 	return rc;
 }
 
-static int smack_sb_eat_lsm_opts(char *options, void **mnt_opts)
+static int smack_sb_eat_lsm_opts(char *options, struct fs_context *fc)
 {
+	void **mnt_opts = &fc->security;
 	char *from = options, *to = options;
 	bool first = true;
 
@@ -870,11 +874,13 @@ static int smack_set_mnt_opts(struct super_block *sb,
 /**
  * smack_sb_statfs - Smack check on statfs
  * @dentry: identifies the file system in question
+ * @mnt: mount selected by the caller (unused by Smack)
  *
  * Returns 0 if current can read the floor of the filesystem,
  * and error code otherwise
  */
-static int smack_sb_statfs(struct dentry *dentry)
+static int smack_sb_statfs(struct dentry *dentry,
+			   const struct vfsmount *mnt)
 {
 	struct superblock_smack *sbp = smack_superblock(dentry->d_sb);
 	int rc;
@@ -1080,13 +1086,17 @@ instant_inode:
 
 /**
  * smack_inode_link - Smack check on link
+ * @old_mnt: mount of the existing object
  * @old_dentry: the existing object
+ * @new_mnt: mount of the new object
  * @dir: unused
  * @new_dentry: the new object
  *
  * Returns 0 if access is permitted, an error code otherwise
  */
-static int smack_inode_link(struct dentry *old_dentry, struct inode *dir,
+static int smack_inode_link(const struct vfsmount *old_mnt,
+			    struct dentry *old_dentry,
+			    const struct vfsmount *new_mnt, struct inode *dir,
 			    struct dentry *new_dentry)
 {
 	struct smack_known *isp;
@@ -1112,13 +1122,15 @@ static int smack_inode_link(struct dentry *old_dentry, struct inode *dir,
 
 /**
  * smack_inode_unlink - Smack check on inode deletion
+ * @mnt: mount containing the object
  * @dir: containing directory object
  * @dentry: file to unlink
  *
  * Returns 0 if current can write the containing directory
  * and the object, error code otherwise
  */
-static int smack_inode_unlink(struct inode *dir, struct dentry *dentry)
+static int smack_inode_unlink(const struct vfsmount *mnt, struct inode *dir,
+			      struct dentry *dentry)
 {
 	struct inode *ip = d_backing_inode(dentry);
 	struct smk_audit_info ad;
@@ -1146,13 +1158,15 @@ static int smack_inode_unlink(struct inode *dir, struct dentry *dentry)
 
 /**
  * smack_inode_rmdir - Smack check on directory deletion
+ * @mnt: mount containing the object
  * @dir: containing directory object
  * @dentry: directory to unlink
  *
  * Returns 0 if current can write the containing directory
  * and the directory, error code otherwise
  */
-static int smack_inode_rmdir(struct inode *dir, struct dentry *dentry)
+static int smack_inode_rmdir(const struct vfsmount *mnt, struct inode *dir,
+			     struct dentry *dentry)
 {
 	struct smk_audit_info ad;
 	int rc;
@@ -1180,8 +1194,10 @@ static int smack_inode_rmdir(struct inode *dir, struct dentry *dentry)
 
 /**
  * smack_inode_rename - Smack check on rename
+ * @old_mnt: mount containing the old object
  * @old_inode: unused
  * @old_dentry: the old object
+ * @new_mnt: mount containing the new object
  * @new_inode: unused
  * @new_dentry: the new object
  *
@@ -1190,8 +1206,10 @@ static int smack_inode_rmdir(struct inode *dir, struct dentry *dentry)
  *
  * Returns 0 if access is permitted, an error code otherwise
  */
-static int smack_inode_rename(struct inode *old_inode,
+static int smack_inode_rename(const struct vfsmount *old_mnt,
+			      struct inode *old_inode,
 			      struct dentry *old_dentry,
+			      const struct vfsmount *new_mnt,
 			      struct inode *new_inode,
 			      struct dentry *new_dentry)
 {
@@ -1217,6 +1235,7 @@ static int smack_inode_rename(struct inode *old_inode,
 
 /**
  * smack_inode_permission - Smack version of permission()
+ * @mnt: the mount through which the inode is accessed
  * @inode: the inode in question
  * @mask: the access requested
  *
@@ -1224,7 +1243,8 @@ static int smack_inode_rename(struct inode *old_inode,
  *
  * Returns 0 if access is permitted, an error code otherwise
  */
-static int smack_inode_permission(struct inode *inode, int mask)
+static int smack_inode_permission(const struct vfsmount *mnt,
+				  struct inode *inode, int mask)
 {
 	struct superblock_smack *sbsp = smack_superblock(inode->i_sb);
 	struct smk_audit_info ad;
@@ -1256,13 +1276,15 @@ static int smack_inode_permission(struct inode *inode, int mask)
 /**
  * smack_inode_setattr - Smack check for setting attributes
  * @idmap: idmap of the mount
+ * @mnt: mount containing the object
  * @dentry: the object
  * @iattr: for the force flag
  *
  * Returns 0 if access is permitted, an error code otherwise
  */
-static int smack_inode_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
-			       struct iattr *iattr)
+static int smack_inode_setattr(struct mnt_idmap *idmap,
+			       const struct vfsmount *mnt,
+			       struct dentry *dentry, struct iattr *iattr)
 {
 	struct smk_audit_info ad;
 	int rc;
@@ -1329,6 +1351,7 @@ static int smack_inode_xattr_skipcap(const char *name)
 /**
  * smack_inode_setxattr - Smack check for setting xattrs
  * @idmap: idmap of the mount
+ * @mnt: mount containing the object
  * @dentry: the object
  * @name: name of the attribute
  * @value: value of the attribute
@@ -1340,6 +1363,7 @@ static int smack_inode_xattr_skipcap(const char *name)
  * Returns 0 if access is permitted, an error code otherwise
  */
 static int smack_inode_setxattr(struct mnt_idmap *idmap,
+				const struct vfsmount *mnt,
 				struct dentry *dentry, const char *name,
 				const void *value, size_t size, int flags)
 {
@@ -1445,12 +1469,14 @@ static void smack_inode_post_setxattr(struct dentry *dentry, const char *name,
 
 /**
  * smack_inode_getxattr - Smack check on getxattr
+ * @mnt: mount containing the object
  * @dentry: the object
  * @name: unused
  *
  * Returns 0 if access is permitted, an error code otherwise
  */
-static int smack_inode_getxattr(struct dentry *dentry, const char *name)
+static int smack_inode_getxattr(const struct vfsmount *mnt,
+				struct dentry *dentry, const char *name)
 {
 	struct smk_audit_info ad;
 	int rc;
@@ -1466,6 +1492,7 @@ static int smack_inode_getxattr(struct dentry *dentry, const char *name)
 /**
  * smack_inode_removexattr - Smack check on removexattr
  * @idmap: idmap of the mount
+ * @mnt: mount containing the object
  * @dentry: the object
  * @name: name of the attribute
  *
@@ -1474,6 +1501,7 @@ static int smack_inode_getxattr(struct dentry *dentry, const char *name)
  * Returns 0 if access is permitted, an error code otherwise
  */
 static int smack_inode_removexattr(struct mnt_idmap *idmap,
+				   const struct vfsmount *mnt,
 				   struct dentry *dentry, const char *name)
 {
 	struct inode_smack *isp;
@@ -1528,6 +1556,7 @@ static int smack_inode_removexattr(struct mnt_idmap *idmap,
 /**
  * smack_inode_set_acl - Smack check for setting posix acls
  * @idmap: idmap of the mnt this request came from
+ * @mnt: mount containing the object
  * @dentry: the object
  * @acl_name: name of the posix acl
  * @kacl: the posix acls
@@ -1535,6 +1564,7 @@ static int smack_inode_removexattr(struct mnt_idmap *idmap,
  * Returns 0 if access is permitted, an error code otherwise
  */
 static int smack_inode_set_acl(struct mnt_idmap *idmap,
+			       const struct vfsmount *mnt,
 			       struct dentry *dentry, const char *acl_name,
 			       struct posix_acl *kacl)
 {
@@ -1552,12 +1582,14 @@ static int smack_inode_set_acl(struct mnt_idmap *idmap,
 /**
  * smack_inode_get_acl - Smack check for getting posix acls
  * @idmap: idmap of the mnt this request came from
+ * @mnt: mount containing the object
  * @dentry: the object
  * @acl_name: name of the posix acl
  *
  * Returns 0 if access is permitted, an error code otherwise
  */
 static int smack_inode_get_acl(struct mnt_idmap *idmap,
+			       const struct vfsmount *mnt,
 			       struct dentry *dentry, const char *acl_name)
 {
 	struct smk_audit_info ad;
@@ -1574,12 +1606,14 @@ static int smack_inode_get_acl(struct mnt_idmap *idmap,
 /**
  * smack_inode_remove_acl - Smack check for getting posix acls
  * @idmap: idmap of the mnt this request came from
+ * @mnt: mount containing the object
  * @dentry: the object
  * @acl_name: name of the posix acl
  *
  * Returns 0 if access is permitted, an error code otherwise
  */
 static int smack_inode_remove_acl(struct mnt_idmap *idmap,
+				  const struct vfsmount *mnt,
 				  struct dentry *dentry, const char *acl_name)
 {
 	struct smk_audit_info ad;
@@ -1596,6 +1630,7 @@ static int smack_inode_remove_acl(struct mnt_idmap *idmap,
 /**
  * smack_inode_getsecurity - get smack xattrs
  * @idmap: idmap of the mount
+ * @mnt: mount used for the lookup
  * @inode: the object
  * @name: attribute name
  * @buffer: where to put the result
@@ -1604,8 +1639,9 @@ static int smack_inode_remove_acl(struct mnt_idmap *idmap,
  * Returns the size of the attribute or an error code
  */
 static int smack_inode_getsecurity(struct mnt_idmap *idmap,
-				   struct inode *inode, const char *name,
-				   void **buffer, bool alloc)
+				   const struct vfsmount *mnt,
+				   struct inode *inode, const char *name, void **buffer,
+				   bool alloc)
 {
 	struct socket_smack *ssp;
 	struct socket *sock;
@@ -1615,6 +1651,9 @@ static int smack_inode_getsecurity(struct mnt_idmap *idmap,
 	struct inode_smack *ispp;
 	size_t label_len;
 	char *label = NULL;
+
+	/* Smack labels currently have no per-mount projection. */
+	(void)mnt;
 
 	if (strcmp(name, XATTR_SMACK_SUFFIX) == 0) {
 		isp = smk_of_inode(inode);
@@ -2298,6 +2337,102 @@ static void smack_task_getlsmprop_obj(struct task_struct *p,
 				      struct lsm_prop *prop)
 {
 	prop->smack.skp = smk_of_task_struct_obj(p);
+}
+
+static int smack_prop_ref_publish(struct lsm_prop_ref *ref,
+				  struct smack_known *skp, bool scalar_source)
+{
+	if (!skp || ref->prop.smack.skp)
+		return -EOPNOTSUPP;
+	ref->prop.smack.skp = skp;
+	if (scalar_source)
+		ref->source_secid = skp->smk_secid;
+	return 0;
+}
+
+static int smack_prop_ref_capture(struct lsm_prop_ref *ref,
+				  const struct lsm_prop_ref_source *source,
+				  gfp_t gfp)
+{
+	struct smack_known *skp;
+	char *label;
+	int len;
+
+	if (ref->prop.smack.skp)
+		return -EEXIST;
+
+	switch (source->kind) {
+	case LSM_PROP_REF_CRED_SUBJ:
+	case LSM_PROP_REF_CURRENT_SUBJ:
+		skp = READ_ONCE(smack_cred(source->cred)->smk_task);
+		break;
+	case LSM_PROP_REF_TASK_OBJ:
+		skp = smk_of_task_struct_obj(source->task);
+		break;
+	case LSM_PROP_REF_INODE_OBJ:
+		skp = READ_ONCE(smack_inode(source->inode)->smk_inode);
+		break;
+	case LSM_PROP_REF_IPC_OBJ:
+		skp = READ_ONCE(*smack_ipc(source->ipc));
+		break;
+	case LSM_PROP_REF_SECCTX:
+		if (source->secctx.len >= SMK_LONGLABEL)
+			return source->lsmid == LSM_ID_UNDEF ?
+				-EOPNOTSUPP : -EINVAL;
+		len = smk_parse_label_len(source->secctx.data,
+					  source->secctx.len);
+		if (len < 0 || len != source->secctx.len)
+			return source->lsmid == LSM_ID_UNDEF ?
+				-EOPNOTSUPP : -EINVAL;
+		label = kmemdup_nul(source->secctx.data, len, gfp);
+		if (!label)
+			return -ENOMEM;
+		skp = smk_find_entry(label);
+		kfree(label);
+		if (!skp)
+			return -EOPNOTSUPP;
+		break;
+	case LSM_PROP_REF_SECID:
+		skp = smack_from_secid(source->secid);
+		if (skp->smk_secid != source->secid)
+			return -EOPNOTSUPP;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return smack_prop_ref_publish(
+		ref, skp, source->kind == LSM_PROP_REF_SECCTX ||
+			  source->kind == LSM_PROP_REF_SECID);
+}
+
+static void smack_prop_ref_free(struct lsm_prop_ref *ref)
+{
+	/* smack_known entries are permanent; the carrier owns no extra ref. */
+	(void)ref;
+}
+
+static int smack_prop_ref_to_secctx(const struct lsm_prop_ref *ref,
+				    const struct cred *observer,
+				    struct lsm_context *cp)
+{
+	struct smack_known *skp = ref->prop.smack.skp;
+
+	(void)observer;
+	if (!skp)
+		return -EOPNOTSUPP;
+	return smack_to_secctx(skp, cp);
+}
+
+static int smack_kernel_act_as_ref(struct cred *new,
+				   const struct lsm_prop_ref *ref)
+{
+	struct smack_known *skp = ref->prop.smack.skp;
+
+	if (!skp)
+		return 0;
+	smack_cred(new)->smk_task = skp;
+	return 0;
 }
 
 /**
@@ -3151,14 +3286,17 @@ static struct smack_known *smack_of_ipc(struct kern_ipc_perm *isp)
 
 /**
  * smack_ipc_alloc_security - Set the security blob for ipc
+ * @ns: ipc namespace that will own the object
  * @isp: the object
  *
  * Returns 0
  */
-static int smack_ipc_alloc_security(struct kern_ipc_perm *isp)
+static int smack_ipc_alloc_security(struct ipc_namespace *ns,
+				    struct kern_ipc_perm *isp)
 {
 	struct smack_known **blob = smack_ipc(isp);
 
+	(void)ns;
 	*blob = smk_of_current();
 	return 0;
 }
@@ -4814,6 +4952,7 @@ static int smack_audit_rule_known(struct audit_krule *krule)
 
 /**
  * smack_audit_rule_match - Audit given object ?
+ * @ref: immutable carrier owning @prop
  * @prop: security id for identifying the object to test
  * @field: audit rule flags given from user-space
  * @op: required testing operator
@@ -4822,11 +4961,15 @@ static int smack_audit_rule_known(struct audit_krule *krule)
  * The core Audit hook. It's used to take the decision of
  * whether to audit or not to audit a given object.
  */
-static int smack_audit_rule_match(struct lsm_prop *prop, u32 field, u32 op,
+static int smack_audit_rule_match(const struct lsm_prop_ref *ref,
+				  const struct lsm_prop *prop, u32 field,
+				  u32 op,
 				  void *vrule)
 {
 	struct smack_known *skp = prop->smack.skp;
 	char *rule = vrule;
+
+	(void)ref;
 
 	if (unlikely(!rule)) {
 		WARN_ONCE(1, "Smack: missing rule\n");
@@ -4903,7 +5046,7 @@ static int smack_secid_to_secctx(u32 secid, struct lsm_context *cp)
  *
  * Exists for audit code.
  */
-static int smack_lsmprop_to_secctx(struct lsm_prop *prop,
+static int smack_lsmprop_to_secctx(const struct lsm_prop *prop,
 				   struct lsm_context *cp)
 {
 	return smack_to_secctx(prop->smack.skp, cp);
@@ -4961,7 +5104,9 @@ static int smack_inode_getsecctx(struct inode *inode, struct lsm_context *cp)
 	return 0;
 }
 
-static int smack_inode_copy_up(struct dentry *dentry, struct cred **new)
+static int smack_inode_copy_up(const struct path *src,
+			       const struct vfsmount *dst_mnt,
+			       struct cred **new)
 {
 
 	struct task_smack *tsp;
@@ -4980,7 +5125,7 @@ static int smack_inode_copy_up(struct dentry *dentry, struct cred **new)
 	/*
 	 * Get label from overlay inode and set it in create_sid
 	 */
-	isp = smack_inode(d_inode(dentry));
+	isp = smack_inode(d_inode(src->dentry));
 	skp = isp->smk_inode;
 	tsp->smk_task = skp;
 	*new = new_creds;
@@ -5269,6 +5414,10 @@ static struct security_hook_list smack_hooks[] __ro_after_init = {
 	LSM_HOOK_INIT(secid_to_secctx, smack_secid_to_secctx),
 	LSM_HOOK_INIT(lsmprop_to_secctx, smack_lsmprop_to_secctx),
 	LSM_HOOK_INIT(secctx_to_secid, smack_secctx_to_secid),
+	LSM_HOOK_INIT(prop_ref_capture, smack_prop_ref_capture),
+	LSM_HOOK_INIT(prop_ref_free, smack_prop_ref_free),
+	LSM_HOOK_INIT(prop_ref_to_secctx, smack_prop_ref_to_secctx),
+	LSM_HOOK_INIT(kernel_act_as_ref, smack_kernel_act_as_ref),
 	LSM_HOOK_INIT(inode_notifysecctx, smack_inode_notifysecctx),
 	LSM_HOOK_INIT(inode_setsecctx, smack_inode_setsecctx),
 	LSM_HOOK_INIT(inode_getsecctx, smack_inode_getsecctx),

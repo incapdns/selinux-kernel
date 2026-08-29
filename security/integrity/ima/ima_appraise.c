@@ -757,7 +757,8 @@ static int validate_hash_algo(struct dentry *dentry,
 	return -EACCES;
 }
 
-static int ima_inode_setxattr(struct mnt_idmap *idmap, struct dentry *dentry,
+static int ima_inode_setxattr(struct mnt_idmap *idmap,
+			      const struct vfsmount *mnt, struct dentry *dentry,
 			      const char *xattr_name, const void *xattr_value,
 			      size_t xattr_value_len, int flags)
 {
@@ -790,7 +791,8 @@ static int ima_inode_setxattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	return result;
 }
 
-static int ima_inode_set_acl(struct mnt_idmap *idmap, struct dentry *dentry,
+static int ima_inode_set_acl(struct mnt_idmap *idmap,
+			     const struct vfsmount *mnt, struct dentry *dentry,
 			     const char *acl_name, struct posix_acl *kacl)
 {
 	if (evm_revalidate_status(acl_name))
@@ -799,7 +801,9 @@ static int ima_inode_set_acl(struct mnt_idmap *idmap, struct dentry *dentry,
 	return 0;
 }
 
-static int ima_inode_removexattr(struct mnt_idmap *idmap, struct dentry *dentry,
+static int ima_inode_removexattr(struct mnt_idmap *idmap,
+				 const struct vfsmount *mnt,
+				 struct dentry *dentry,
 				 const char *xattr_name)
 {
 	int result, digsig = -1;
@@ -815,10 +819,11 @@ static int ima_inode_removexattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	return result;
 }
 
-static int ima_inode_remove_acl(struct mnt_idmap *idmap, struct dentry *dentry,
-				const char *acl_name)
+static int ima_inode_remove_acl(struct mnt_idmap *idmap,
+				const struct vfsmount *mnt,
+				struct dentry *dentry, const char *acl_name)
 {
-	return ima_inode_set_acl(idmap, dentry, acl_name, NULL);
+	return ima_inode_set_acl(idmap, mnt, dentry, acl_name, NULL);
 }
 
 static struct security_hook_list ima_appraise_hooks[] __ro_after_init = {

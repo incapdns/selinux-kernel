@@ -7,7 +7,6 @@
 #include <linux/btf_ids.h>
 #include <linux/dcache.h>
 #include <linux/fs.h>
-#include <linux/fsnotify.h>
 #include <linux/file.h>
 #include <linux/kernfs.h>
 #include <linux/mm.h>
@@ -98,7 +97,10 @@ static bool match_security_bpf_prefix(const char *name__str)
 	return !strncmp(name__str, XATTR_NAME_BPF_LSM, XATTR_NAME_BPF_LSM_LEN);
 }
 
-static int bpf_xattr_read_permission(const char *name, struct inode *inode)
+static int bpf_xattr_read_permission(const char *name,
+				     struct mnt_idmap *idmap,
+				     const struct vfsmount *mnt,
+				     struct inode *inode)
 {
 	if (!inode)
 		return -EINVAL;
@@ -108,7 +110,28 @@ static int bpf_xattr_read_permission(const char *name, struct inode *inode)
 	    !match_security_bpf_prefix(name))
 		return -EPERM;
 
-	return inode_permission(&nop_mnt_idmap, inode, MAY_READ);
+	return inode_permission_mnt(idmap, mnt, inode, MAY_READ);
+}
+
+static int bpf_get_xattr_mnt(struct mnt_idmap *idmap,
+			     const struct vfsmount *mnt, struct dentry *dentry,
+			     const char *name, struct bpf_dynptr *value_p)
+{
+	struct bpf_dynptr_kern *value_ptr = (struct bpf_dynptr_kern *)value_p;
+	struct inode *inode = d_inode(dentry);
+	u32 value_len;
+	void *value;
+	int ret;
+
+	value_len = __bpf_dynptr_size(value_ptr);
+	value = __bpf_dynptr_data_rw(value_ptr, value_len);
+	if (!value)
+		return -EINVAL;
+
+	ret = bpf_xattr_read_permission(name, idmap, mnt, inode);
+	if (ret)
+		return ret;
+	return __vfs_getxattr(dentry, inode, name, value, value_len);
 }
 
 /**
@@ -122,26 +145,16 @@ static int bpf_xattr_read_permission(const char *name, struct inode *inode)
  * For security reasons, only *name__str* with prefixes "user." or
  * "security.bpf." are allowed.
  *
+ * A dentry does not identify a unique mount or label view.  This legacy BTF
+ * interface is retained but returns -EOPNOTSUPP; use bpf_get_file_xattr().
+ *
  * Return: length of the xattr value on success, a negative value on error.
  */
 __bpf_kfunc int bpf_get_dentry_xattr(struct dentry *dentry, const char *name__str,
 				     struct bpf_dynptr *value_p)
 {
-	struct bpf_dynptr_kern *value_ptr = (struct bpf_dynptr_kern *)value_p;
-	struct inode *inode = d_inode(dentry);
-	u32 value_len;
-	void *value;
-	int ret;
-
-	value_len = __bpf_dynptr_size(value_ptr);
-	value = __bpf_dynptr_data_rw(value_ptr, value_len);
-	if (!value)
-		return -EINVAL;
-
-	ret = bpf_xattr_read_permission(name__str, inode);
-	if (ret)
-		return ret;
-	return __vfs_getxattr(dentry, inode, name__str, value, value_len);
+	/* A dentry has no unique mount and therefore no unique label view. */
+	return -EOPNOTSUPP;
 }
 
 /**
@@ -163,22 +176,11 @@ __bpf_kfunc int bpf_get_file_xattr(struct file *file, const char *name__str,
 	struct dentry *dentry;
 
 	dentry = file_dentry(file);
-	return bpf_get_dentry_xattr(dentry, name__str, value_p);
+	return bpf_get_xattr_mnt(file_mnt_idmap(file), file->f_path.mnt, dentry,
+				 name__str, value_p);
 }
 
 __bpf_kfunc_end_defs();
-
-static int bpf_xattr_write_permission(const char *name, struct inode *inode)
-{
-	if (!inode)
-		return -EINVAL;
-
-	/* Only allow setting and removing security.bpf. xattrs */
-	if (!match_security_bpf_prefix(name))
-		return -EPERM;
-
-	return inode_permission(&nop_mnt_idmap, inode, MAY_WRITE);
-}
 
 /**
  * bpf_set_dentry_xattr_locked - set a xattr of a dentry
@@ -194,40 +196,16 @@ static int bpf_xattr_write_permission(const char *name, struct inode *inode)
  *
  * The caller already locked dentry->d_inode.
  *
+ * A dentry does not identify a unique mount or label view.  This legacy
+ * interface is retained but fails closed with -EOPNOTSUPP.
+ *
  * Return: 0 on success, a negative value on error.
  */
 int bpf_set_dentry_xattr_locked(struct dentry *dentry, const char *name__str,
 				const struct bpf_dynptr *value_p, int flags)
 {
-
-	const struct bpf_dynptr_kern *value_ptr = (struct bpf_dynptr_kern *)value_p;
-	struct inode *inode = d_inode(dentry);
-	const void *value;
-	u32 value_len;
-	int ret;
-
-	value_len = __bpf_dynptr_size(value_ptr);
-	value = __bpf_dynptr_data(value_ptr, value_len);
-	if (!value)
-		return -EINVAL;
-
-	ret = bpf_xattr_write_permission(name__str, inode);
-	if (ret)
-		return ret;
-
-	ret = __vfs_setxattr(&nop_mnt_idmap, dentry, inode, name__str,
-			     value, value_len, flags);
-	if (!ret) {
-		fsnotify_xattr(dentry);
-
-		/* This xattr is set by BPF LSM, so we do not call
-		 * security_inode_post_setxattr. Otherwise, we would
-		 * risk deadlocks by calling back to the same kfunc.
-		 *
-		 * This is the same as security_inode_setsecurity().
-		 */
-	}
-	return ret;
+	/* A dentry has no unique mount and therefore no unique label view. */
+	return -EOPNOTSUPP;
 }
 
 /**
@@ -242,27 +220,15 @@ int bpf_set_dentry_xattr_locked(struct dentry *dentry, const char *name__str,
  *
  * The caller already locked dentry->d_inode.
  *
+ * A dentry does not identify a unique mount or label view.  This legacy
+ * interface is retained but fails closed with -EOPNOTSUPP.
+ *
  * Return: 0 on success, a negative value on error.
  */
 int bpf_remove_dentry_xattr_locked(struct dentry *dentry, const char *name__str)
 {
-	struct inode *inode = d_inode(dentry);
-	int ret;
-
-	ret = bpf_xattr_write_permission(name__str, inode);
-	if (ret)
-		return ret;
-
-	ret = __vfs_removexattr(&nop_mnt_idmap, dentry, name__str);
-	if (!ret) {
-		fsnotify_xattr(dentry);
-
-		/* This xattr is removed by BPF LSM, so we do not call
-		 * security_inode_post_removexattr. Otherwise, we would
-		 * risk deadlocks by calling back to the same kfunc.
-		 */
-	}
-	return ret;
+	/* A dentry has no unique mount and therefore no unique label view. */
+	return -EOPNOTSUPP;
 }
 
 __bpf_kfunc_start_defs();

@@ -16,12 +16,14 @@
 #include <linux/dcache.h>
 #include <linux/export.h>
 #include <linux/init.h>
+#include <linux/ipc_namespace.h>
 #include <linux/kernel.h>
 #include <linux/kernel_read_file.h>
 #include <linux/lsm_hooks.h>
 #include <linux/mman.h>
 #include <linux/mount.h>
 #include <linux/personality.h>
+#include <linux/nsproxy.h>
 #include <linux/backing-dev.h>
 #include <linux/string.h>
 #include <linux/xattr.h>
@@ -29,7 +31,10 @@
 #include <linux/overflow.h>
 #include <linux/perf_event.h>
 #include <linux/fs.h>
+#include <kunit/static_stub.h>
 #include <net/flow.h>
+#include <net/request_sock.h>
+#include <net/sctp/structs.h>
 #include <net/sock.h>
 
 #include "lsm.h"
@@ -283,6 +288,14 @@ static int lsm_ipc_alloc(struct kern_ipc_perm *kip)
 	return lsm_blob_alloc(&kip->security, blob_sizes.lbs_ipc, GFP_KERNEL);
 }
 
+static atomic64_t ipc_namespace_security_token = ATOMIC64_INIT(0);
+
+static int lsm_ipc_namespace_alloc(struct ipc_namespace *ns)
+{
+	return lsm_blob_alloc(&ns->security, blob_sizes.lbs_ipc_namespace,
+			      GFP_KERNEL_ACCOUNT);
+}
+
 #ifdef CONFIG_KEYS
 /**
  * lsm_key_alloc - allocate a composite key blob
@@ -351,6 +364,39 @@ static int lsm_bpf_map_alloc(struct bpf_map *map)
 static int lsm_bpf_prog_alloc(struct bpf_prog *prog)
 {
 	return lsm_blob_alloc(&prog->aux->security, blob_sizes.lbs_bpf_prog, GFP_KERNEL);
+}
+
+/**
+ * lsm_bpf_btf_alloc - allocate a composite BTF blob
+ * @btf: the BTF object that needs a blob
+ *
+ * Allocate the BTF blob for all the modules.
+ *
+ * Returns 0, or -ENOMEM if memory can't be allocated.
+ */
+static int lsm_bpf_btf_alloc(struct btf *btf)
+{
+	void *security;
+	int rc;
+
+	rc = lsm_blob_alloc(&security, blob_sizes.lbs_bpf_btf, GFP_KERNEL);
+	if (!rc)
+		btf_set_security(btf, security);
+	return rc;
+}
+
+/**
+ * lsm_bpf_link_alloc - allocate a composite bpf_link blob
+ * @link: the bpf_link that needs a blob
+ *
+ * Allocate the bpf_link blob for all the modules.
+ *
+ * Returns 0, or -ENOMEM if memory can't be allocated.
+ */
+static int lsm_bpf_link_alloc(struct bpf_link *link)
+{
+	return lsm_blob_alloc(&link->security, blob_sizes.lbs_bpf_link,
+			      GFP_KERNEL);
 }
 
 /**
@@ -677,16 +723,22 @@ int security_quotactl(int cmds, int type, int id, const struct super_block *sb)
 }
 
 /**
- * security_quota_on() - Check if QUOTAON is allowed for a dentry
+ * security_quota_on_mnt() - Check if QUOTAON is allowed for a dentry
+ * @mnt: mount through which the quota file is accessed
  * @dentry: dentry
  *
  * Check whether QUOTAON is allowed for @dentry.
  *
  * Return: Returns 0 if permission is granted.
  */
+int security_quota_on_mnt(const struct vfsmount *mnt, struct dentry *dentry)
+{
+	return call_int_hook(quota_on, mnt, dentry);
+}
+
 int security_quota_on(struct dentry *dentry)
 {
-	return call_int_hook(quota_on, dentry);
+	return security_quota_on_mnt(NULL, dentry);
 }
 
 /**
@@ -856,13 +908,14 @@ void security_bprm_committed_creds(const struct linux_binprm *bprm)
 /**
  * security_fs_context_submount() - Initialise fc->security
  * @fc: new filesystem context
- * @reference: dentry reference for submount/remount
+ * @reference: path reference for submount/remount
  *
  * Fill out the ->security field for a new fs_context.
  *
  * Return: Returns 0 on success or negative error code on failure.
  */
-int security_fs_context_submount(struct fs_context *fc, struct super_block *reference)
+int security_fs_context_submount(struct fs_context *fc,
+				 const struct path *reference)
 {
 	return call_int_hook(fs_context_submount, fc, reference);
 }
@@ -913,6 +966,91 @@ int security_fs_context_parse_param(struct fs_context *fc,
 }
 
 /**
+ * security_mnt_alloc() - Allocate and initialize a mount LSM blob
+ * @mnt: new mount
+ * @src_mnt: source mount when cloning, or NULL for a new filesystem mount
+ * @fc: filesystem context for a new mount, or NULL when cloning
+ *
+ * Allocate a composite blob whose lifetime follows @mnt.  LSMs can use the
+ * source mount to retain immutable per-mount security state across bind and
+ * clone operations, or the filesystem context to initialize a new view.
+ *
+ * Return: 0 on success, or a negative error code.
+ */
+int security_mnt_alloc(struct vfsmount *mnt, const struct vfsmount *src_mnt,
+		       struct fs_context *fc)
+{
+	int rc;
+
+	rc = lsm_blob_alloc(&mnt->mnt_security, blob_sizes.lbs_mnt,
+			    GFP_KERNEL_ACCOUNT);
+	if (rc)
+		return rc;
+
+	mnt->mnt_security_initialized = true;
+	rc = call_int_hook(mnt_alloc_security, mnt, src_mnt, fc);
+	if (unlikely(rc))
+		security_mnt_free(mnt);
+
+	return rc;
+}
+
+/**
+ * security_mnt_free() - Release a mount LSM blob
+ * @mnt: mount being destroyed
+ */
+void security_mnt_free(struct vfsmount *mnt)
+{
+	if (!mnt->mnt_security_initialized)
+		return;
+
+	call_void_hook(mnt_free_security, mnt);
+	kfree(mnt->mnt_security);
+	mnt->mnt_security = NULL;
+	mnt->mnt_security_initialized = false;
+}
+
+struct security_mnt_topology *security_mnt_topology_alloc(void)
+{
+	struct security_mnt_topology *topology;
+	int rc;
+
+	topology = kzalloc_obj(*topology, GFP_KERNEL_ACCOUNT);
+	if (!topology)
+		return ERR_PTR(-ENOMEM);
+	rc = lsm_blob_alloc(&topology->security, blob_sizes.lbs_mnt_topology,
+			    GFP_KERNEL_ACCOUNT);
+	if (rc) {
+		kfree(topology);
+		return ERR_PTR(rc);
+	}
+	return topology;
+}
+
+int security_mnt_topology_add(struct security_mnt_topology *topology,
+			      const struct vfsmount *source,
+			      const struct vfsmount *target)
+{
+	return call_int_hook(mnt_topology_add, topology, source, target);
+}
+
+int security_mnt_topology_apply(struct security_mnt_topology *topology,
+				struct vfsmount *mnt,
+				const struct vfsmount *target)
+{
+	return call_int_hook(mnt_topology_apply, topology, mnt, target);
+}
+
+void security_mnt_topology_free(struct security_mnt_topology *topology)
+{
+	if (IS_ERR_OR_NULL(topology))
+		return;
+	call_void_hook(mnt_topology_free, topology);
+	kfree(topology->security);
+	kfree(topology);
+}
+
+/**
  * security_sb_alloc() - Allocate a super_block LSM blob
  * @sb: filesystem superblock
  *
@@ -932,6 +1070,29 @@ int security_sb_alloc(struct super_block *sb)
 	if (unlikely(rc))
 		security_sb_free(sb);
 	return rc;
+}
+
+/**
+ * security_sb_pre_fill() - Initialize or validate pre-fill superblock state
+ * @sb: new or reused superblock, locked exclusively by the caller
+ * @fc: filesystem context selecting @sb
+ * @security_carrier: optional intrinsic, caller-owned security provenance
+ * @is_new: true for an unpublished superblock that has not been filled
+ *
+ * Initialize security state from explicit object provenance before a new
+ * superblock can be published or any filesystem fill callback can create its
+ * root or inodes.  For a reused superblock, hooks must only validate that its
+ * existing immutable state is compatible with @security_carrier.
+ *
+ * The carrier is borrowed for the duration of this call.  Hooks that retain
+ * information derived from it must acquire their own references.
+ *
+ * Return: 0 on success, or a negative error code.
+ */
+int security_sb_pre_fill(struct super_block *sb, struct fs_context *fc,
+			 const void *security_carrier, bool is_new)
+{
+	return call_int_hook(sb_pre_fill, sb, fc, security_carrier, is_new);
 }
 
 /**
@@ -978,15 +1139,15 @@ EXPORT_SYMBOL(security_free_mnt_opts);
 /**
  * security_sb_eat_lsm_opts() - Consume LSM mount options
  * @options: mount options
- * @mnt_opts: LSM processed mount options
+ * @fc: filesystem context receiving the processed LSM mount options
  *
- * Eat (scan @options) and save them in @mnt_opts.
+ * Eat (scan @options) and save them in @fc.
  *
  * Return: Returns 0 on success, negative values on failure.
  */
-int security_sb_eat_lsm_opts(char *options, void **mnt_opts)
+int security_sb_eat_lsm_opts(char *options, struct fs_context *fc)
 {
-	return call_int_hook(sb_eat_lsm_opts, options, mnt_opts);
+	return call_int_hook(sb_eat_lsm_opts, options, fc);
 }
 EXPORT_SYMBOL(security_sb_eat_lsm_opts);
 
@@ -1027,14 +1188,16 @@ EXPORT_SYMBOL(security_sb_remount);
 /**
  * security_sb_kern_mount() - Check if a kernel mount is allowed
  * @sb: filesystem superblock
+ * @fc: filesystem context retaining the creating credentials
  *
  * Mount this @sb if allowed by permissions.
  *
  * Return: Returns 0 if permission is granted.
  */
-int security_sb_kern_mount(const struct super_block *sb)
+int security_sb_kern_mount(const struct super_block *sb,
+			   struct fs_context *fc)
 {
-	return call_int_hook(sb_kern_mount, sb);
+	return call_int_hook(sb_kern_mount, sb, fc);
 }
 
 /**
@@ -1054,15 +1217,16 @@ int security_sb_show_options(struct seq_file *m, struct super_block *sb)
 /**
  * security_sb_statfs() - Check if accessing fs stats is allowed
  * @dentry: superblock handle
+ * @mnt: mount whose label view selected the superblock, or NULL
  *
  * Check permission before obtaining filesystem statistics for the @mnt
  * mountpoint.  @dentry is a handle on the superblock for the filesystem.
  *
  * Return: Returns 0 if permission is granted.
  */
-int security_sb_statfs(struct dentry *dentry)
+int security_sb_statfs(struct dentry *dentry, const struct vfsmount *mnt)
 {
-	return call_int_hook(sb_statfs, dentry);
+	return call_int_hook(sb_statfs, dentry, mnt);
 }
 
 /**
@@ -1301,6 +1465,239 @@ int security_dentry_create_files_as(struct dentry *dentry, int mode,
 }
 EXPORT_SYMBOL(security_dentry_create_files_as);
 
+static int security_plan_merge_finish_result(int first, int result, int rc)
+{
+	if (rc && rc != result && first == result)
+		return rc;
+	return first;
+}
+
+static int security_inode_create_plan_call_finish(
+	struct security_inode_create_plan *plan, int result,
+	struct inode *created_inode)
+{
+	struct lsm_static_call *scall;
+	int first = result;
+
+	lsm_for_each_hook(scall, inode_create_plan_finish) {
+		int rc;
+
+		if (!test_bit(scall->hl->lsm_slot, plan->prepared_lsms))
+			continue;
+		rc = scall->hl->hook.inode_create_plan_finish(plan, result,
+							      created_inode);
+
+		/*
+		 * A finish hook may return @result merely to propagate the
+		 * operation failure.  A different error is a cleanup/protocol
+		 * failure and must not be hidden by that earlier result.
+		 */
+		first = security_plan_merge_finish_result(first, result, rc);
+	}
+	return first;
+}
+
+static int security_inode_create_plan_call_prepare(
+	struct security_inode_create_plan *plan, const struct vfsmount *mnt,
+	struct inode *dir, struct dentry *dentry, umode_t mode)
+{
+	struct lsm_static_call *scall;
+
+	lsm_for_each_hook(scall, inode_create_plan_prepare) {
+		int rc;
+
+		/* Include a failing prepare: it may have partial state to unwind. */
+		__set_bit(scall->hl->lsm_slot, plan->prepared_lsms);
+		rc = scall->hl->hook.inode_create_plan_prepare(plan, mnt, dir,
+							       dentry, mode);
+		if (rc)
+			return rc;
+	}
+	return 0;
+}
+
+struct security_inode_create_plan *
+security_inode_create_plan_prepare(const struct vfsmount *mnt,
+				   struct inode *dir, struct dentry *dentry,
+				   umode_t mode,
+				   enum security_inode_create_kind kind,
+				   u32 supported_ops)
+{
+	struct security_inode_create_plan *plan;
+	int rc;
+
+	if (!static_key_enabled(
+		    &static_calls_table.inode_create_plan_prepare[0].active->key))
+		return NULL;
+	plan = kzalloc_obj(*plan, GFP_KERNEL_ACCOUNT);
+	if (!plan)
+		return ERR_PTR(-ENOMEM);
+	rc = lsm_blob_alloc(&plan->security, blob_sizes.lbs_inode_create_plan,
+			    GFP_KERNEL_ACCOUNT);
+	if (rc)
+		goto out_plan;
+	if (WARN_ON_ONCE(kind >= SECURITY_INODE_CREATE_KIND_MAX)) {
+		rc = -EINVAL;
+		goto out_hooks;
+	}
+	plan->kind = kind;
+	rc = security_inode_create_plan_call_prepare(plan, mnt, dir, dentry,
+						     mode);
+	if (rc)
+		goto out_hooks;
+	if (plan->requirements &
+	    ~(SECURITY_INODE_CREATE_REQUIRE_COMMIT |
+	      SECURITY_INODE_CREATE_REQUIRE_XATTR)) {
+		rc = -EPROTO;
+		goto out_hooks;
+	}
+	if ((plan->requirements & SECURITY_INODE_CREATE_REQUIRE_XATTR) &&
+	    !(plan->requirements & SECURITY_INODE_CREATE_REQUIRE_COMMIT)) {
+		rc = -EPROTO;
+		goto out_hooks;
+	}
+	if ((plan->requirements & SECURITY_INODE_CREATE_REQUIRE_COMMIT) &&
+	    !(supported_ops & SECURITY_INODE_CREATE_OP(kind))) {
+		rc = -EOPNOTSUPP;
+		goto out_hooks;
+	}
+	return plan;
+
+out_hooks:
+	rc = security_inode_create_plan_call_finish(plan, rc, NULL);
+	kfree(plan->security);
+out_plan:
+	kfree(plan);
+	return ERR_PTR(rc);
+}
+EXPORT_SYMBOL_GPL(security_inode_create_plan_prepare);
+
+/**
+ * security_inode_create_plan_attempt_abort() - Abandon one unpublished inode
+ * @inode: inode initialized by the failed filesystem creation attempt
+ *
+ * A filesystem with internal allocation retries must call this after proving
+ * that @inode was never published (or was atomically made unreachable) and
+ * before dropping it.  This rearms only the current creation attempt; the
+ * outer authorization plan remains active for the next filesystem attempt.
+ *
+ * Return: 0 on success, or a negative error that must prevent the retry.
+ */
+int security_inode_create_plan_attempt_abort(struct inode *inode)
+{
+	if (!inode)
+		return -EINVAL;
+	return call_int_hook(inode_create_plan_attempt_abort, inode);
+}
+EXPORT_SYMBOL_GPL(security_inode_create_plan_attempt_abort);
+
+int security_inode_create_plan_finish(struct security_inode_create_plan *plan,
+				      int result,
+				      struct inode *created_inode)
+{
+	int rc;
+
+	if (IS_ERR(plan))
+		return result ? result : PTR_ERR(plan);
+	if (!plan)
+		return result;
+	rc = security_inode_create_plan_call_finish(plan, result, created_inode);
+	kfree(plan->security);
+	kfree(plan);
+	return rc;
+}
+EXPORT_SYMBOL_GPL(security_inode_create_plan_finish);
+
+static int security_inode_setxattr_plan_call_finish(
+	struct security_inode_setxattr_plan *plan, int result)
+{
+	struct lsm_static_call *scall;
+	int first = result;
+
+	lsm_for_each_hook(scall, inode_setxattr_plan_finish) {
+		int rc;
+
+		if (!test_bit(scall->hl->lsm_slot, plan->prepared_lsms))
+			continue;
+		rc = scall->hl->hook.inode_setxattr_plan_finish(plan, result);
+
+		/* See security_inode_create_plan_call_finish(). */
+		first = security_plan_merge_finish_result(first, result, rc);
+	}
+	return first;
+}
+
+static int security_inode_setxattr_plan_call_prepare(
+	struct security_inode_setxattr_plan *plan, struct mnt_idmap *idmap,
+	const struct vfsmount *mnt, struct dentry *dentry, const char *name,
+	const void **value, size_t *size, int flags)
+{
+	struct lsm_static_call *scall;
+
+	lsm_for_each_hook(scall, inode_setxattr_plan_prepare) {
+		int rc;
+
+		/* Include a failing prepare: it may have partial state to unwind. */
+		__set_bit(scall->hl->lsm_slot, plan->prepared_lsms);
+		rc = scall->hl->hook.inode_setxattr_plan_prepare(plan, idmap, mnt,
+							 dentry, name, value,
+							 size, flags);
+		if (rc)
+			return rc;
+	}
+	return 0;
+}
+
+struct security_inode_setxattr_plan *security_inode_setxattr_plan_prepare(
+	struct mnt_idmap *idmap, const struct vfsmount *mnt,
+	struct dentry *dentry, const char *name, const void **value,
+	size_t *size, int flags)
+{
+	struct security_inode_setxattr_plan *plan;
+	int rc;
+
+	if (!static_key_enabled(
+		    &static_calls_table.inode_setxattr_plan_prepare[0].active->key))
+		return NULL;
+	plan = kzalloc_obj(*plan, GFP_KERNEL_ACCOUNT);
+	if (!plan)
+		return ERR_PTR(-ENOMEM);
+	rc = lsm_blob_alloc(&plan->security,
+			    blob_sizes.lbs_inode_setxattr_plan,
+			    GFP_KERNEL_ACCOUNT);
+	if (rc)
+		goto out_plan;
+	rc = security_inode_setxattr_plan_call_prepare(plan, idmap, mnt, dentry,
+						       name, value, size, flags);
+	if (rc)
+		goto out_hooks;
+	return plan;
+
+out_hooks:
+	rc = security_inode_setxattr_plan_call_finish(plan, rc);
+	kfree(plan->security);
+out_plan:
+	kfree(plan);
+	return ERR_PTR(rc);
+}
+EXPORT_SYMBOL_GPL(security_inode_setxattr_plan_prepare);
+
+int security_inode_setxattr_plan_finish(
+	struct security_inode_setxattr_plan *plan, int result)
+{
+	int rc;
+
+	if (IS_ERR(plan))
+		return result ? result : PTR_ERR(plan);
+	if (!plan)
+		return result;
+	rc = security_inode_setxattr_plan_call_finish(plan, result);
+	kfree(plan->security);
+	kfree(plan);
+	return rc;
+}
+EXPORT_SYMBOL_GPL(security_inode_setxattr_plan_finish);
+
 /**
  * security_inode_init_security() - Initialize an inode's LSM context
  * @inode: the inode
@@ -1334,7 +1731,7 @@ int security_inode_init_security(struct inode *inode, struct inode *dir,
 {
 	struct lsm_static_call *scall;
 	struct xattr *new_xattrs = NULL;
-	int ret = -EOPNOTSUPP, xattr_count = 0;
+	int commit_ret, hook_ret, ret = -EOPNOTSUPP, xattr_count = 0;
 
 	if (unlikely(IS_PRIVATE(inode)))
 		return 0;
@@ -1350,11 +1747,25 @@ int security_inode_init_security(struct inode *inode, struct inode *dir,
 			return -ENOMEM;
 	}
 
+	ret = call_int_hook(inode_init_security_plan, inode, dir, qstr,
+			    new_xattrs, &xattr_count);
+	if (ret)
+		goto commit;
+	/*
+	 * A successful plan hook is authoritative even when it deliberately
+	 * prepares no xattr (for example, a genfs-labelled inode).  Do not let
+	 * the ordinary hook's -EOPNOTSUPP sentinel overwrite that success: a
+	 * required-plan rejection is reported by the plan hook itself.
+	 */
+	ret = 0;
+
 	lsm_for_each_hook(scall, inode_init_security) {
-		ret = scall->hl->hook.inode_init_security(inode, dir, qstr, new_xattrs,
-						  &xattr_count);
-		if (ret && ret != -EOPNOTSUPP)
+		hook_ret = scall->hl->hook.inode_init_security(inode, dir, qstr,
+						       new_xattrs, &xattr_count);
+		if (hook_ret && hook_ret != -EOPNOTSUPP) {
+			ret = hook_ret;
 			goto out;
+		}
 		/*
 		 * As documented in lsm_hooks.h, -EOPNOTSUPP in this context
 		 * means that the LSM is not willing to provide an xattr, not
@@ -1365,14 +1776,20 @@ int security_inode_init_security(struct inode *inode, struct inode *dir,
 
 	/* If initxattrs() is NULL, xattr_count is zero, skip the call. */
 	if (!xattr_count)
-		goto out;
+		goto commit;
 
 	ret = initxattrs(inode, new_xattrs, fs_data);
+commit:
+	commit_ret = call_int_hook(inode_init_security_commit, inode, ret);
+	if (ret == -EOPNOTSUPP)
+		ret = 0;
+	if (!ret)
+		ret = commit_ret;
 out:
 	for (; xattr_count > 0; xattr_count--)
 		kfree(new_xattrs[xattr_count - 1].value);
 	kfree(new_xattrs);
-	return (ret == -EOPNOTSUPP) ? 0 : ret;
+	return ret;
 }
 EXPORT_SYMBOL(security_inode_init_security);
 
@@ -1613,7 +2030,8 @@ int security_path_chroot(const struct path *path)
 #endif /* CONFIG_SECURITY_PATH */
 
 /**
- * security_inode_create() - Check if creating a file is allowed
+ * security_inode_create_mnt() - Check if creating a file is allowed
+ * @mnt: mount selecting the LSM label view
  * @dir: the parent directory
  * @dentry: the file being created
  * @mode: requested file mode
@@ -1622,12 +2040,19 @@ int security_path_chroot(const struct path *path)
  *
  * Return: Returns 0 if permission is granted.
  */
-int security_inode_create(struct inode *dir, struct dentry *dentry,
-			  umode_t mode)
+int security_inode_create_mnt(const struct vfsmount *mnt, struct inode *dir,
+			      struct dentry *dentry, umode_t mode)
 {
 	if (unlikely(IS_PRIVATE(dir)))
 		return 0;
-	return call_int_hook(inode_create, dir, dentry, mode);
+	return call_int_hook(inode_create, mnt, dir, dentry, mode);
+}
+EXPORT_SYMBOL_GPL(security_inode_create_mnt);
+
+int security_inode_create(struct inode *dir, struct dentry *dentry,
+			  umode_t mode)
+{
+	return security_inode_create_mnt(NULL, dir, dentry, mode);
 }
 EXPORT_SYMBOL_GPL(security_inode_create);
 
@@ -1647,8 +2072,10 @@ void security_inode_post_create_tmpfile(struct mnt_idmap *idmap,
 }
 
 /**
- * security_inode_link() - Check if creating a hard link is allowed
+ * security_inode_link_mnt() - Check if creating a hard link is allowed
+ * @old_mnt: mount through which the existing file is accessed
  * @old_dentry: existing file
+ * @new_mnt: mount through which the new parent is accessed
  * @dir: new parent directory
  * @new_dentry: new link
  *
@@ -1656,16 +2083,26 @@ void security_inode_post_create_tmpfile(struct mnt_idmap *idmap,
  *
  * Return: Returns 0 if permission is granted.
  */
-int security_inode_link(struct dentry *old_dentry, struct inode *dir,
-			struct dentry *new_dentry)
+int security_inode_link_mnt(const struct vfsmount *old_mnt,
+			    struct dentry *old_dentry,
+			    const struct vfsmount *new_mnt, struct inode *dir,
+			    struct dentry *new_dentry)
 {
 	if (unlikely(IS_PRIVATE(d_backing_inode(old_dentry))))
 		return 0;
-	return call_int_hook(inode_link, old_dentry, dir, new_dentry);
+	return call_int_hook(inode_link, old_mnt, old_dentry, new_mnt, dir,
+			     new_dentry);
+}
+
+int security_inode_link(struct dentry *old_dentry, struct inode *dir,
+			struct dentry *new_dentry)
+{
+	return security_inode_link_mnt(NULL, old_dentry, NULL, dir, new_dentry);
 }
 
 /**
- * security_inode_unlink() - Check if removing a hard link is allowed
+ * security_inode_unlink_mnt() - Check if removing a hard link is allowed
+ * @mnt: mount containing the file
  * @dir: parent directory
  * @dentry: file
  *
@@ -1673,15 +2110,22 @@ int security_inode_link(struct dentry *old_dentry, struct inode *dir,
  *
  * Return: Returns 0 if permission is granted.
  */
-int security_inode_unlink(struct inode *dir, struct dentry *dentry)
+int security_inode_unlink_mnt(const struct vfsmount *mnt, struct inode *dir,
+			      struct dentry *dentry)
 {
 	if (unlikely(IS_PRIVATE(d_backing_inode(dentry))))
 		return 0;
-	return call_int_hook(inode_unlink, dir, dentry);
+	return call_int_hook(inode_unlink, mnt, dir, dentry);
+}
+
+int security_inode_unlink(struct inode *dir, struct dentry *dentry)
+{
+	return security_inode_unlink_mnt(NULL, dir, dentry);
 }
 
 /**
- * security_inode_symlink() - Check if creating a symbolic link is allowed
+ * security_inode_symlink_mnt() - Check if creating a symbolic link is allowed
+ * @mnt: mount containing the parent directory
  * @dir: parent directory
  * @dentry: symbolic link
  * @old_name: existing filename
@@ -1690,16 +2134,23 @@ int security_inode_unlink(struct inode *dir, struct dentry *dentry)
  *
  * Return: Returns 0 if permission is granted.
  */
-int security_inode_symlink(struct inode *dir, struct dentry *dentry,
-			   const char *old_name)
+int security_inode_symlink_mnt(const struct vfsmount *mnt, struct inode *dir,
+			       struct dentry *dentry, const char *old_name)
 {
 	if (unlikely(IS_PRIVATE(dir)))
 		return 0;
-	return call_int_hook(inode_symlink, dir, dentry, old_name);
+	return call_int_hook(inode_symlink, mnt, dir, dentry, old_name);
+}
+
+int security_inode_symlink(struct inode *dir, struct dentry *dentry,
+			   const char *old_name)
+{
+	return security_inode_symlink_mnt(NULL, dir, dentry, old_name);
 }
 
 /**
- * security_inode_mkdir() - Check if creating a new directory is allowed
+ * security_inode_mkdir_mnt() - Check if creating a new directory is allowed
+ * @mnt: mount containing the parent directory
  * @dir: parent directory
  * @dentry: new directory
  * @mode: new directory mode
@@ -1709,16 +2160,24 @@ int security_inode_symlink(struct inode *dir, struct dentry *dentry,
  *
  * Return: Returns 0 if permission is granted.
  */
-int security_inode_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)
+int security_inode_mkdir_mnt(const struct vfsmount *mnt, struct inode *dir,
+			     struct dentry *dentry, umode_t mode)
 {
 	if (unlikely(IS_PRIVATE(dir)))
 		return 0;
-	return call_int_hook(inode_mkdir, dir, dentry, mode);
+	return call_int_hook(inode_mkdir, mnt, dir, dentry, mode);
+}
+EXPORT_SYMBOL_GPL(security_inode_mkdir_mnt);
+
+int security_inode_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)
+{
+	return security_inode_mkdir_mnt(NULL, dir, dentry, mode);
 }
 EXPORT_SYMBOL_GPL(security_inode_mkdir);
 
 /**
- * security_inode_rmdir() - Check if removing a directory is allowed
+ * security_inode_rmdir_mnt() - Check if removing a directory is allowed
+ * @mnt: mount containing the directory
  * @dir: parent directory
  * @dentry: directory to be removed
  *
@@ -1726,15 +2185,22 @@ EXPORT_SYMBOL_GPL(security_inode_mkdir);
  *
  * Return: Returns 0 if permission is granted.
  */
-int security_inode_rmdir(struct inode *dir, struct dentry *dentry)
+int security_inode_rmdir_mnt(const struct vfsmount *mnt, struct inode *dir,
+			     struct dentry *dentry)
 {
 	if (unlikely(IS_PRIVATE(d_backing_inode(dentry))))
 		return 0;
-	return call_int_hook(inode_rmdir, dir, dentry);
+	return call_int_hook(inode_rmdir, mnt, dir, dentry);
+}
+
+int security_inode_rmdir(struct inode *dir, struct dentry *dentry)
+{
+	return security_inode_rmdir_mnt(NULL, dir, dentry);
 }
 
 /**
- * security_inode_mknod() - Check if creating a special file is allowed
+ * security_inode_mknod_mnt() - Check if creating a special file is allowed
+ * @mnt: mount containing the parent directory
  * @dir: parent directory
  * @dentry: new file
  * @mode: new file mode
@@ -1747,18 +2213,26 @@ int security_inode_rmdir(struct inode *dir, struct dentry *dentry)
  *
  * Return: Returns 0 if permission is granted.
  */
-int security_inode_mknod(struct inode *dir, struct dentry *dentry,
-			 umode_t mode, dev_t dev)
+int security_inode_mknod_mnt(const struct vfsmount *mnt, struct inode *dir,
+			     struct dentry *dentry, umode_t mode, dev_t dev)
 {
 	if (unlikely(IS_PRIVATE(dir)))
 		return 0;
-	return call_int_hook(inode_mknod, dir, dentry, mode, dev);
+	return call_int_hook(inode_mknod, mnt, dir, dentry, mode, dev);
+}
+
+int security_inode_mknod(struct inode *dir, struct dentry *dentry,
+			 umode_t mode, dev_t dev)
+{
+	return security_inode_mknod_mnt(NULL, dir, dentry, mode, dev);
 }
 
 /**
- * security_inode_rename() - Check if renaming a file is allowed
+ * security_inode_rename_mnt() - Check if renaming a file is allowed
+ * @old_mnt: mount through which the old name is accessed
  * @old_dir: parent directory of the old file
  * @old_dentry: the old file
+ * @new_mnt: mount through which the new name is accessed
  * @new_dir: parent directory of the new file
  * @new_dentry: the new file
  * @flags: flags
@@ -1767,9 +2241,11 @@ int security_inode_mknod(struct inode *dir, struct dentry *dentry,
  *
  * Return: Returns 0 if permission is granted.
  */
-int security_inode_rename(struct inode *old_dir, struct dentry *old_dentry,
-			  struct inode *new_dir, struct dentry *new_dentry,
-			  unsigned int flags)
+int security_inode_rename_mnt(const struct vfsmount *old_mnt,
+			      struct inode *old_dir, struct dentry *old_dentry,
+			      const struct vfsmount *new_mnt,
+			      struct inode *new_dir, struct dentry *new_dentry,
+			      unsigned int flags)
 {
 	if (unlikely(IS_PRIVATE(d_backing_inode(old_dentry)) ||
 		     (d_is_positive(new_dentry) &&
@@ -1777,33 +2253,49 @@ int security_inode_rename(struct inode *old_dir, struct dentry *old_dentry,
 		return 0;
 
 	if (flags & RENAME_EXCHANGE) {
-		int err = call_int_hook(inode_rename, new_dir, new_dentry,
-					old_dir, old_dentry);
+		int err = call_int_hook(inode_rename, new_mnt, new_dir,
+				    new_dentry, old_mnt, old_dir, old_dentry);
 		if (err)
 			return err;
 	}
 
-	return call_int_hook(inode_rename, old_dir, old_dentry,
-			     new_dir, new_dentry);
+	return call_int_hook(inode_rename, old_mnt, old_dir, old_dentry,
+			     new_mnt, new_dir, new_dentry);
+}
+
+int security_inode_rename(struct inode *old_dir, struct dentry *old_dentry,
+			  struct inode *new_dir, struct dentry *new_dentry,
+			  unsigned int flags)
+{
+	return security_inode_rename_mnt(NULL, old_dir, old_dentry, NULL, new_dir,
+					 new_dentry, flags);
 }
 
 /**
- * security_inode_readlink() - Check if reading a symbolic link is allowed
+ * security_inode_readlink_mnt() - Check if reading a symbolic link is allowed
+ * @mnt: mount through which the link is accessed
  * @dentry: link
  *
  * Check the permission to read the symbolic link.
  *
  * Return: Returns 0 if permission is granted.
  */
-int security_inode_readlink(struct dentry *dentry)
+int security_inode_readlink_mnt(const struct vfsmount *mnt,
+				struct dentry *dentry)
 {
 	if (unlikely(IS_PRIVATE(d_backing_inode(dentry))))
 		return 0;
-	return call_int_hook(inode_readlink, dentry);
+	return call_int_hook(inode_readlink, mnt, dentry);
+}
+
+int security_inode_readlink(struct dentry *dentry)
+{
+	return security_inode_readlink_mnt(NULL, dentry);
 }
 
 /**
- * security_inode_follow_link() - Check if following a symbolic link is allowed
+ * security_inode_follow_link_mnt() - Check whether following a link is allowed
+ * @mnt: mount through which @dentry is reached, or NULL when unavailable
  * @dentry: link dentry
  * @inode: link inode
  * @rcu: true if in RCU-walk mode
@@ -1813,16 +2305,24 @@ int security_inode_readlink(struct dentry *dentry)
  *
  * Return: Returns 0 if permission is granted.
  */
-int security_inode_follow_link(struct dentry *dentry, struct inode *inode,
-			       bool rcu)
+int security_inode_follow_link_mnt(const struct vfsmount *mnt,
+				   struct dentry *dentry,
+				   struct inode *inode, bool rcu)
 {
 	if (unlikely(IS_PRIVATE(inode)))
 		return 0;
-	return call_int_hook(inode_follow_link, dentry, inode, rcu);
+	return call_int_hook(inode_follow_link, mnt, dentry, inode, rcu);
+}
+
+int security_inode_follow_link(struct dentry *dentry, struct inode *inode,
+			       bool rcu)
+{
+	return security_inode_follow_link_mnt(NULL, dentry, inode, rcu);
 }
 
 /**
  * security_inode_permission() - Check if accessing an inode is allowed
+ * @mnt: mount through which @inode is accessed, or NULL when unavailable
  * @inode: inode
  * @mask: access mask
  *
@@ -1835,16 +2335,18 @@ int security_inode_follow_link(struct dentry *dentry, struct inode *inode,
  *
  * Return: Returns 0 if permission is granted.
  */
-int security_inode_permission(struct inode *inode, int mask)
+int security_inode_permission(const struct vfsmount *mnt, struct inode *inode,
+			      int mask)
 {
 	if (unlikely(IS_PRIVATE(inode)))
 		return 0;
-	return call_int_hook(inode_permission, inode, mask);
+	return call_int_hook(inode_permission, mnt, inode, mask);
 }
 
 /**
- * security_inode_setattr() - Check if setting file attributes is allowed
+ * security_inode_setattr_mnt() - Check if setting file attributes is allowed
  * @idmap: idmap of the mount
+ * @mnt: mount selecting the LSM label view
  * @dentry: file
  * @attr: new attributes
  *
@@ -1855,12 +2357,20 @@ int security_inode_permission(struct inode *inode, int mask)
  *
  * Return: Returns 0 if permission is granted.
  */
-int security_inode_setattr(struct mnt_idmap *idmap,
-			   struct dentry *dentry, struct iattr *attr)
+int security_inode_setattr_mnt(struct mnt_idmap *idmap,
+			       const struct vfsmount *mnt,
+			       struct dentry *dentry, struct iattr *attr)
 {
 	if (unlikely(IS_PRIVATE(d_backing_inode(dentry))))
 		return 0;
-	return call_int_hook(inode_setattr, idmap, dentry, attr);
+	return call_int_hook(inode_setattr, idmap, mnt, dentry, attr);
+}
+EXPORT_SYMBOL_GPL(security_inode_setattr_mnt);
+
+int security_inode_setattr(struct mnt_idmap *idmap,
+			   struct dentry *dentry, struct iattr *attr)
+{
+	return security_inode_setattr_mnt(idmap, NULL, dentry, attr);
 }
 EXPORT_SYMBOL_GPL(security_inode_setattr);
 
@@ -1896,8 +2406,9 @@ int security_inode_getattr(const struct path *path)
 }
 
 /**
- * security_inode_setxattr() - Check if setting file xattrs is allowed
+ * security_inode_setxattr_mnt() - Check if setting file xattrs is allowed
  * @idmap: idmap of the mount
+ * @mnt: mount selecting the LSM label view
  * @dentry: file
  * @name: xattr name
  * @value: xattr value
@@ -1921,9 +2432,10 @@ int security_inode_getattr(const struct path *path)
  *
  * Return: Returns 0 if permission is granted.
  */
-int security_inode_setxattr(struct mnt_idmap *idmap,
-			    struct dentry *dentry, const char *name,
-			    const void *value, size_t size, int flags)
+int security_inode_setxattr_mnt(struct mnt_idmap *idmap,
+				const struct vfsmount *mnt,
+				struct dentry *dentry, const char *name,
+				const void *value, size_t size, int flags)
 {
 	int rc;
 
@@ -1937,13 +2449,22 @@ int security_inode_setxattr(struct mnt_idmap *idmap,
 			return rc;
 	}
 
-	return call_int_hook(inode_setxattr, idmap, dentry, name, value, size,
-			     flags);
+	return call_int_hook(inode_setxattr, idmap, mnt, dentry, name, value,
+			     size, flags);
+}
+
+int security_inode_setxattr(struct mnt_idmap *idmap,
+			    struct dentry *dentry, const char *name,
+			    const void *value, size_t size, int flags)
+{
+	return security_inode_setxattr_mnt(idmap, NULL, dentry, name, value,
+					 size, flags);
 }
 
 /**
- * security_inode_set_acl() - Check if setting posix acls is allowed
+ * security_inode_set_acl_mnt() - Check if setting posix acls is allowed
  * @idmap: idmap of the mount
+ * @mnt: mount selecting the LSM label view
  * @dentry: file
  * @acl_name: acl name
  * @kacl: acl struct
@@ -1953,13 +2474,21 @@ int security_inode_setxattr(struct mnt_idmap *idmap,
  *
  * Return: Returns 0 if permission is granted.
  */
+int security_inode_set_acl_mnt(struct mnt_idmap *idmap,
+			       const struct vfsmount *mnt,
+			       struct dentry *dentry, const char *acl_name,
+			       struct posix_acl *kacl)
+{
+	if (unlikely(IS_PRIVATE(d_backing_inode(dentry))))
+		return 0;
+	return call_int_hook(inode_set_acl, idmap, mnt, dentry, acl_name, kacl);
+}
+
 int security_inode_set_acl(struct mnt_idmap *idmap,
 			   struct dentry *dentry, const char *acl_name,
 			   struct posix_acl *kacl)
 {
-	if (unlikely(IS_PRIVATE(d_backing_inode(dentry))))
-		return 0;
-	return call_int_hook(inode_set_acl, idmap, dentry, acl_name, kacl);
+	return security_inode_set_acl_mnt(idmap, NULL, dentry, acl_name, kacl);
 }
 
 /**
@@ -1980,8 +2509,9 @@ void security_inode_post_set_acl(struct dentry *dentry, const char *acl_name,
 }
 
 /**
- * security_inode_get_acl() - Check if reading posix acls is allowed
+ * security_inode_get_acl_mnt() - Check if reading posix acls is allowed
  * @idmap: idmap of the mount
+ * @mnt: mount selecting the LSM label view
  * @dentry: file
  * @acl_name: acl name
  *
@@ -1990,17 +2520,25 @@ void security_inode_post_set_acl(struct dentry *dentry, const char *acl_name,
  *
  * Return: Returns 0 if permission is granted.
  */
-int security_inode_get_acl(struct mnt_idmap *idmap,
-			   struct dentry *dentry, const char *acl_name)
+int security_inode_get_acl_mnt(struct mnt_idmap *idmap,
+			       const struct vfsmount *mnt,
+			       struct dentry *dentry, const char *acl_name)
 {
 	if (unlikely(IS_PRIVATE(d_backing_inode(dentry))))
 		return 0;
-	return call_int_hook(inode_get_acl, idmap, dentry, acl_name);
+	return call_int_hook(inode_get_acl, idmap, mnt, dentry, acl_name);
+}
+
+int security_inode_get_acl(struct mnt_idmap *idmap,
+			   struct dentry *dentry, const char *acl_name)
+{
+	return security_inode_get_acl_mnt(idmap, NULL, dentry, acl_name);
 }
 
 /**
- * security_inode_remove_acl() - Check if removing a posix acl is allowed
+ * security_inode_remove_acl_mnt() - Check if removing a posix acl is allowed
  * @idmap: idmap of the mount
+ * @mnt: mount selecting the LSM label view
  * @dentry: file
  * @acl_name: acl name
  *
@@ -2009,12 +2547,20 @@ int security_inode_get_acl(struct mnt_idmap *idmap,
  *
  * Return: Returns 0 if permission is granted.
  */
-int security_inode_remove_acl(struct mnt_idmap *idmap,
-			      struct dentry *dentry, const char *acl_name)
+int security_inode_remove_acl_mnt(struct mnt_idmap *idmap,
+				  const struct vfsmount *mnt,
+				  struct dentry *dentry,
+				  const char *acl_name)
 {
 	if (unlikely(IS_PRIVATE(d_backing_inode(dentry))))
 		return 0;
-	return call_int_hook(inode_remove_acl, idmap, dentry, acl_name);
+	return call_int_hook(inode_remove_acl, idmap, mnt, dentry, acl_name);
+}
+
+int security_inode_remove_acl(struct mnt_idmap *idmap,
+			      struct dentry *dentry, const char *acl_name)
+{
+	return security_inode_remove_acl_mnt(idmap, NULL, dentry, acl_name);
 }
 
 /**
@@ -2053,7 +2599,8 @@ void security_inode_post_setxattr(struct dentry *dentry, const char *name,
 }
 
 /**
- * security_inode_getxattr() - Check if xattr access is allowed
+ * security_inode_getxattr_mnt() - Check if xattr access is allowed
+ * @mnt: mount selecting the LSM label view
  * @dentry: file
  * @name: xattr name
  *
@@ -2062,15 +2609,22 @@ void security_inode_post_setxattr(struct dentry *dentry, const char *name,
  *
  * Return: Returns 0 if permission is granted.
  */
-int security_inode_getxattr(struct dentry *dentry, const char *name)
+int security_inode_getxattr_mnt(const struct vfsmount *mnt,
+				struct dentry *dentry, const char *name)
 {
 	if (unlikely(IS_PRIVATE(d_backing_inode(dentry))))
 		return 0;
-	return call_int_hook(inode_getxattr, dentry, name);
+	return call_int_hook(inode_getxattr, mnt, dentry, name);
+}
+
+int security_inode_getxattr(struct dentry *dentry, const char *name)
+{
+	return security_inode_getxattr_mnt(NULL, dentry, name);
 }
 
 /**
- * security_inode_listxattr() - Check if listing xattrs is allowed
+ * security_inode_listxattr_mnt() - Check if listing xattrs is allowed
+ * @mnt: mount selecting the LSM label view
  * @dentry: file
  *
  * Check permission before obtaining the list of extended attribute names for
@@ -2078,16 +2632,23 @@ int security_inode_getxattr(struct dentry *dentry, const char *name)
  *
  * Return: Returns 0 if permission is granted.
  */
-int security_inode_listxattr(struct dentry *dentry)
+int security_inode_listxattr_mnt(const struct vfsmount *mnt,
+				 struct dentry *dentry)
 {
 	if (unlikely(IS_PRIVATE(d_backing_inode(dentry))))
 		return 0;
-	return call_int_hook(inode_listxattr, dentry);
+	return call_int_hook(inode_listxattr, mnt, dentry);
+}
+
+int security_inode_listxattr(struct dentry *dentry)
+{
+	return security_inode_listxattr_mnt(NULL, dentry);
 }
 
 /**
- * security_inode_removexattr() - Check if removing an xattr is allowed
+ * security_inode_removexattr_mnt() - Check if removing an xattr is allowed
  * @idmap: idmap of the mount
+ * @mnt: mount selecting the LSM label view
  * @dentry: file
  * @name: xattr name
  *
@@ -2108,8 +2669,9 @@ int security_inode_listxattr(struct dentry *dentry)
  *
  * Return: Returns 0 if permission is granted.
  */
-int security_inode_removexattr(struct mnt_idmap *idmap,
-			       struct dentry *dentry, const char *name)
+int security_inode_removexattr_mnt(struct mnt_idmap *idmap,
+				   const struct vfsmount *mnt,
+				   struct dentry *dentry, const char *name)
 {
 	int rc;
 
@@ -2123,7 +2685,13 @@ int security_inode_removexattr(struct mnt_idmap *idmap,
 			return rc;
 	}
 
-	return call_int_hook(inode_removexattr, idmap, dentry, name);
+	return call_int_hook(inode_removexattr, idmap, mnt, dentry, name);
+}
+
+int security_inode_removexattr(struct mnt_idmap *idmap,
+			       struct dentry *dentry, const char *name)
+{
+	return security_inode_removexattr_mnt(idmap, NULL, dentry, name);
 }
 
 /**
@@ -2141,7 +2709,8 @@ void security_inode_post_removexattr(struct dentry *dentry, const char *name)
 }
 
 /**
- * security_inode_file_setattr() - check if setting fsxattr is allowed
+ * security_inode_file_setattr_mnt() - check if setting fsxattr is allowed
+ * @mnt: mount selecting the LSM label view
  * @dentry: file to set filesystem extended attributes on
  * @fa: extended attributes to set on the inode
  *
@@ -2150,13 +2719,21 @@ void security_inode_post_removexattr(struct dentry *dentry, const char *name)
  *
  * Return: Returns 0 if permission is granted.
  */
+int security_inode_file_setattr_mnt(const struct vfsmount *mnt,
+				    struct dentry *dentry,
+				    struct file_kattr *fa)
+{
+	return call_int_hook(inode_file_setattr, mnt, dentry, fa);
+}
+
 int security_inode_file_setattr(struct dentry *dentry, struct file_kattr *fa)
 {
-	return call_int_hook(inode_file_setattr, dentry, fa);
+	return security_inode_file_setattr_mnt(NULL, dentry, fa);
 }
 
 /**
- * security_inode_file_getattr() - check if retrieving fsxattr is allowed
+ * security_inode_file_getattr_mnt() - check if retrieving fsxattr is allowed
+ * @mnt: mount selecting the LSM label view
  * @dentry: file to retrieve filesystem extended attributes from
  * @fa: extended attributes to get
  *
@@ -2165,9 +2742,16 @@ int security_inode_file_setattr(struct dentry *dentry, struct file_kattr *fa)
  *
  * Return: Returns 0 if permission is granted.
  */
+int security_inode_file_getattr_mnt(const struct vfsmount *mnt,
+				    struct dentry *dentry,
+				    struct file_kattr *fa)
+{
+	return call_int_hook(inode_file_getattr, mnt, dentry, fa);
+}
+
 int security_inode_file_getattr(struct dentry *dentry, struct file_kattr *fa)
 {
-	return call_int_hook(inode_file_getattr, dentry, fa);
+	return security_inode_file_getattr_mnt(NULL, dentry, fa);
 }
 
 /**
@@ -2206,6 +2790,8 @@ int security_inode_killpriv(struct mnt_idmap *idmap,
 /**
  * security_inode_getsecurity() - Get the xattr security label of an inode
  * @idmap: idmap of the mount
+ * @mnt: mount selecting the observer-relative label view, or NULL when the
+ *       caller has no path authority
  * @inode: inode
  * @name: xattr name
  * @buffer: security label buffer
@@ -2220,14 +2806,14 @@ int security_inode_killpriv(struct mnt_idmap *idmap,
  * Return: Returns size of buffer on success.
  */
 int security_inode_getsecurity(struct mnt_idmap *idmap,
-			       struct inode *inode, const char *name,
-			       void **buffer, bool alloc)
+			       const struct vfsmount *mnt, struct inode *inode,
+			       const char *name, void **buffer, bool alloc)
 {
 	if (unlikely(IS_PRIVATE(inode)))
 		return LSM_RET_DEFAULT(inode_getsecurity);
 
-	return call_int_hook(inode_getsecurity, idmap, inode, name, buffer,
-			     alloc);
+	return call_int_hook(inode_getsecurity, idmap, mnt, inode, name,
+			     buffer, alloc);
 }
 
 /**
@@ -2291,7 +2877,8 @@ void security_inode_getlsmprop(struct inode *inode, struct lsm_prop *prop)
 
 /**
  * security_inode_copy_up() - Create new creds for an overlayfs copy-up op
- * @src: union dentry of copy-up file
+ * @src: real lower path of copy-up file
+ * @dst_mnt: upper-layer mount receiving the new inode
  * @new: newly created creds
  *
  * A file is about to be copied up from lower layer to upper layer of overlay
@@ -2301,11 +2888,28 @@ void security_inode_getlsmprop(struct inode *inode, struct lsm_prop *prop)
  *
  * Return: Returns 0 on success or a negative error code on error.
  */
-int security_inode_copy_up(struct dentry *src, struct cred **new)
+int security_inode_copy_up(const struct path *src,
+			   const struct vfsmount *dst_mnt, struct cred **new)
 {
-	return call_int_hook(inode_copy_up, src, new);
+	return call_int_hook(inode_copy_up, src, dst_mnt, new);
 }
 EXPORT_SYMBOL(security_inode_copy_up);
+
+/**
+ * security_inode_copy_up_post() - Retain copy-up source provenance
+ * @src: real lower path of the copied inode
+ * @dst_mnt: upper-layer mount receiving the new inode
+ * @dst: newly created upper dentry, not yet published by overlayfs
+ *
+ * Return: Returns 0 on success or a negative error code on error.
+ */
+int security_inode_copy_up_post(const struct path *src,
+				const struct vfsmount *dst_mnt,
+				struct dentry *dst)
+{
+	return call_int_hook(inode_copy_up_post, src, dst_mnt, dst);
+}
+EXPORT_SYMBOL(security_inode_copy_up_post);
 
 /**
  * security_inode_copy_up_xattr() - Filter xattrs in an overlayfs copy-up op
@@ -2353,9 +2957,69 @@ int security_inode_setintegrity(const struct inode *inode,
 EXPORT_SYMBOL(security_inode_setintegrity);
 
 /**
+ * security_kernfs_root_alloc() - Allocate and initialize a kernfs root blob
+ * @root_security: storage for the composite LSM blob
+ *
+ * Allocate immutable security state whose lifetime follows a kernfs root.
+ * The caller must invoke security_kernfs_root_free() after a successful call.
+ *
+ * Return: 0 on success, or a negative error code.
+ */
+int security_kernfs_root_alloc(void **root_security)
+{
+	int rc;
+
+	KUNIT_STATIC_STUB_REDIRECT(security_kernfs_root_alloc, root_security);
+
+	rc = lsm_blob_alloc(root_security, blob_sizes.lbs_kernfs_root,
+			    GFP_KERNEL_ACCOUNT);
+	if (rc)
+		return rc;
+
+	rc = call_int_hook(kernfs_root_alloc_security, *root_security);
+	if (unlikely(rc))
+		security_kernfs_root_free(*root_security);
+	return rc;
+}
+
+/**
+ * security_kernfs_root_free() - Free a kernfs root LSM blob
+ * @root_security: composite blob returned by security_kernfs_root_alloc()
+ *
+ * This is called when the final kernfs node reference releases its root.
+ * Hooks must not sleep.
+ */
+void security_kernfs_root_free(void *root_security)
+{
+	KUNIT_STATIC_STUB_REDIRECT(security_kernfs_root_free, root_security);
+
+	call_void_hook(kernfs_root_free_security, root_security);
+	kfree(root_security);
+}
+
+/**
+ * security_kernfs_root_to_sb() - Transfer kernfs root provenance to an sb
+ * @sb: kernfs superblock being initialized
+ * @root_security: immutable root security blob
+ *
+ * This hook runs before the root inode is created so inode initialization can
+ * rely on the root's security provenance rather than ambient task state.
+ *
+ * Return: 0 on success, or a negative error code.
+ */
+int security_kernfs_root_to_sb(struct super_block *sb,
+			       const void *root_security)
+{
+	KUNIT_STATIC_STUB_REDIRECT(security_kernfs_root_to_sb, sb, root_security);
+
+	return call_int_hook(kernfs_root_to_sb, sb, root_security);
+}
+
+/**
  * security_kernfs_init_security() - Init LSM context for a kernfs node
  * @kn_dir: parent kernfs node
  * @kn: the kernfs node to initialize
+ * @root_security: immutable security blob of the containing kernfs root
  *
  * Initialize the security context of a newly created kernfs node based on its
  * own and its parent's attributes.
@@ -2363,9 +3027,13 @@ EXPORT_SYMBOL(security_inode_setintegrity);
  * Return: Returns 0 if permission is granted.
  */
 int security_kernfs_init_security(struct kernfs_node *kn_dir,
-				  struct kernfs_node *kn)
+				  struct kernfs_node *kn,
+				  const void *root_security)
 {
-	return call_int_hook(kernfs_init_security, kn_dir, kn);
+	KUNIT_STATIC_STUB_REDIRECT(security_kernfs_init_security, kn_dir, kn,
+				   root_security);
+
+	return call_int_hook(kernfs_init_security, kn_dir, kn, root_security);
 }
 
 /**
@@ -2412,6 +3080,38 @@ int security_file_alloc(struct file *file)
 		security_file_free(file);
 	return rc;
 }
+
+/**
+ * security_file_set_path() - Capture path-derived security state
+ * @file: file whose path, inode, and mapping have just been installed
+ *
+ * This hook runs before the O_PATH fast return and before file_open.  It lets
+ * an LSM retain immutable mount/path-derived state for later pathless checks
+ * without performing the open authorization twice.
+ *
+ * Return: 0 on success, or a negative error code.
+ */
+int security_file_set_path(struct file *file)
+{
+	return call_int_hook(file_set_path, file);
+}
+
+/**
+ * security_file_init_security_anon() - Finalize anonymous file security state
+ * @file: fully initialized anonymous file, before it is exposed to userspace
+ *
+ * Give LSMs a chance to bind security state initialized on a distinct
+ * anonymous inode to its file after both objects exist.  This hook is called
+ * exactly once for each such file and does not replace file_open or
+ * file_set_path.
+ *
+ * Return: 0 on success, or a negative error code.
+ */
+int security_file_init_security_anon(struct file *file)
+{
+	return call_int_hook(file_init_security_anon, file);
+}
+EXPORT_SYMBOL_GPL(security_file_init_security_anon);
 
 /**
  * security_file_release() - Perform actions before releasing the file ref
@@ -2916,6 +3616,299 @@ void security_cred_getlsmprop(const struct cred *c, struct lsm_prop *prop)
 }
 EXPORT_SYMBOL(security_cred_getlsmprop);
 
+static int security_lsm_prop_ref_capture(
+	const struct lsm_prop_ref_source *source, gfp_t gfp,
+	struct lsm_prop_ref **out)
+{
+	struct lsm_static_call *scall;
+	struct lsm_prop_ref *ref;
+	u32 source_secid = 0;
+	unsigned int providers = 0;
+	int source_lsmid = LSM_ID_UNDEF;
+	bool scalar_source;
+	int hook_rc;
+	int rc;
+
+	if (!out)
+		return -EINVAL;
+	*out = NULL;
+	if (!source)
+		return -EINVAL;
+	switch (source->kind) {
+	case LSM_PROP_REF_CRED_SUBJ:
+	case LSM_PROP_REF_CURRENT_SUBJ:
+		if (!source->cred)
+			return -EINVAL;
+		break;
+	case LSM_PROP_REF_TASK_OBJ:
+		if (!source->task)
+			return -EINVAL;
+		break;
+	case LSM_PROP_REF_INODE_OBJ:
+		if (!source->inode)
+			return -EINVAL;
+		break;
+	case LSM_PROP_REF_IPC_OBJ:
+		if (!source->ipc)
+			return -EINVAL;
+		break;
+	case LSM_PROP_REF_SECCTX:
+		if (!source->secctx.data || !source->secctx.len)
+			return -EINVAL;
+		break;
+	case LSM_PROP_REF_SECID:
+		break;
+	default:
+		return -EINVAL;
+	}
+	ref = kzalloc(struct_size(ref, security, blob_sizes.lbs_prop_ref), gfp);
+	if (!ref)
+		return -ENOMEM;
+	refcount_set(&ref->refs, 1);
+
+	ref->source_lsmid = LSM_ID_UNDEF;
+	scalar_source = source->kind == LSM_PROP_REF_SECCTX ||
+			source->kind == LSM_PROP_REF_SECID;
+	rc = 0;
+	lsm_for_each_hook(scall, prop_ref_capture) {
+		int hook_lsmid = scall->hl->lsmid->id;
+
+		if (scalar_source && source->lsmid != LSM_ID_UNDEF &&
+		    source->lsmid != scall->hl->lsmid->id)
+			continue;
+		if (scalar_source)
+			ref->source_secid = 0;
+		hook_rc = scall->hl->hook.prop_ref_capture(ref, source, gfp);
+		if (hook_rc == -EOPNOTSUPP) {
+			ref->source_secid = source_secid;
+			continue;
+		}
+		if (hook_rc) {
+			rc = hook_rc;
+			goto err_free;
+		}
+		if (scalar_source) {
+			if (!ref->source_secid ||
+			    (source->kind == LSM_PROP_REF_SECID &&
+			     ref->source_secid != source->secid)) {
+				rc = -EINVAL;
+				goto err_free;
+			}
+			if (providers) {
+				rc = -ENOTUNIQ;
+				goto err_free;
+			}
+			source_secid = ref->source_secid;
+		}
+		if (!providers)
+			source_lsmid = hook_lsmid;
+		providers++;
+	}
+	if (!providers) {
+		rc = -EOPNOTSUPP;
+		goto err_free;
+	}
+	if (!lsmprop_is_set(&ref->prop)) {
+		rc = -EINVAL;
+		goto err_free;
+	}
+
+	ref->source_lsmid = providers == 1 ? source_lsmid : LSM_ID_UNDEF;
+	ref->source_secid = scalar_source ? source_secid : 0;
+	ref->provider_count = providers;
+
+	*out = ref;
+	return 0;
+
+err_free:
+	call_void_hook(prop_ref_free, ref);
+	kfree(ref);
+	return rc;
+}
+
+struct lsm_prop_ref *
+security_lsm_prop_ref_get(struct lsm_prop_ref *ref)
+{
+	if (ref)
+		refcount_inc(&ref->refs);
+	return ref;
+}
+EXPORT_SYMBOL(security_lsm_prop_ref_get);
+
+void security_lsm_prop_ref_put(struct lsm_prop_ref *ref)
+{
+	if (!ref || !refcount_dec_and_test(&ref->refs))
+		return;
+	call_void_hook(prop_ref_free, ref);
+	kfree(ref);
+}
+EXPORT_SYMBOL(security_lsm_prop_ref_put);
+
+const struct lsm_prop *
+security_lsm_prop_ref_prop(const struct lsm_prop_ref *ref)
+{
+	return ref ? &ref->prop : NULL;
+}
+EXPORT_SYMBOL(security_lsm_prop_ref_prop);
+
+int security_lsm_prop_ref_lsmid(const struct lsm_prop_ref *ref)
+{
+	return ref ? ref->source_lsmid : LSM_ID_UNDEF;
+}
+EXPORT_SYMBOL(security_lsm_prop_ref_lsmid);
+
+unsigned int
+security_lsm_prop_ref_provider_count(const struct lsm_prop_ref *ref)
+{
+	return ref ? ref->provider_count : 0;
+}
+EXPORT_SYMBOL(security_lsm_prop_ref_provider_count);
+
+bool security_lsm_prop_ref_source_secid(const struct lsm_prop_ref *ref,
+					u32 *secid)
+{
+	if (!ref || !secid || ref->provider_count != 1 ||
+	    ref->source_lsmid == LSM_ID_UNDEF || !ref->source_secid)
+		return false;
+	*secid = ref->source_secid;
+	return true;
+}
+EXPORT_SYMBOL(security_lsm_prop_ref_source_secid);
+
+int security_cred_getlsmprop_ref(const struct cred *cred, gfp_t gfp,
+				 struct lsm_prop_ref **out)
+{
+	const struct lsm_prop_ref_source source = {
+		.kind = LSM_PROP_REF_CRED_SUBJ,
+		.lsmid = LSM_ID_UNDEF,
+		.cred = cred,
+	};
+
+	return security_lsm_prop_ref_capture(&source, gfp, out);
+}
+EXPORT_SYMBOL(security_cred_getlsmprop_ref);
+
+int security_current_getlsmprop_ref_subj(gfp_t gfp,
+					 struct lsm_prop_ref **out)
+{
+	const struct lsm_prop_ref_source source = {
+		.kind = LSM_PROP_REF_CURRENT_SUBJ,
+		.lsmid = LSM_ID_UNDEF,
+		.cred = current_cred(),
+	};
+
+	return security_lsm_prop_ref_capture(&source, gfp, out);
+}
+EXPORT_SYMBOL(security_current_getlsmprop_ref_subj);
+
+int security_task_getlsmprop_ref_obj(struct task_struct *task, gfp_t gfp,
+				     struct lsm_prop_ref **out)
+{
+	const struct lsm_prop_ref_source source = {
+		.kind = LSM_PROP_REF_TASK_OBJ,
+		.lsmid = LSM_ID_UNDEF,
+		.task = task,
+	};
+
+	return security_lsm_prop_ref_capture(&source, gfp, out);
+}
+EXPORT_SYMBOL(security_task_getlsmprop_ref_obj);
+
+int security_inode_getlsmprop_ref(struct inode *inode, gfp_t gfp,
+				  struct lsm_prop_ref **out)
+{
+	const struct lsm_prop_ref_source source = {
+		.kind = LSM_PROP_REF_INODE_OBJ,
+		.lsmid = LSM_ID_UNDEF,
+		.inode = inode,
+	};
+
+	return security_lsm_prop_ref_capture(&source, gfp, out);
+}
+EXPORT_SYMBOL(security_inode_getlsmprop_ref);
+
+int security_ipc_getlsmprop_ref(struct kern_ipc_perm *ipc, gfp_t gfp,
+				struct lsm_prop_ref **out)
+{
+	const struct lsm_prop_ref_source source = {
+		.kind = LSM_PROP_REF_IPC_OBJ,
+		.lsmid = LSM_ID_UNDEF,
+		.ipc = ipc,
+	};
+
+	return security_lsm_prop_ref_capture(&source, gfp, out);
+}
+EXPORT_SYMBOL(security_ipc_getlsmprop_ref);
+
+int security_secctx_to_lsmprop_ref(const char *secdata, u32 seclen,
+				   int lsmid, gfp_t gfp,
+				   struct lsm_prop_ref **out)
+{
+	const struct lsm_prop_ref_source source = {
+		.kind = LSM_PROP_REF_SECCTX,
+		.lsmid = lsmid,
+		.secctx = {
+			.data = secdata,
+			.len = seclen,
+		},
+	};
+
+	return security_lsm_prop_ref_capture(&source, gfp, out);
+}
+EXPORT_SYMBOL(security_secctx_to_lsmprop_ref);
+
+int security_secid_to_lsmprop_ref(u32 secid, int lsmid, gfp_t gfp,
+				  struct lsm_prop_ref **out)
+{
+	const struct lsm_prop_ref_source source = {
+		.kind = LSM_PROP_REF_SECID,
+		.lsmid = lsmid,
+		.secid = secid,
+	};
+
+	return security_lsm_prop_ref_capture(&source, gfp, out);
+}
+EXPORT_SYMBOL(security_secid_to_lsmprop_ref);
+
+int security_lsm_prop_ref_to_secctx(const struct lsm_prop_ref *ref,
+				    const struct cred *observer, int lsmid,
+				    struct lsm_context *cp)
+{
+	struct lsm_static_call *scall;
+	int rc;
+
+	if (!ref || !observer || !cp)
+		return -EINVAL;
+	memset(cp, 0, sizeof(*cp));
+	if (lsmid == LSM_ID_UNDEF) {
+		if (!ref->provider_count)
+			return -EOPNOTSUPP;
+		if (ref->provider_count != 1)
+			return -ENOTUNIQ;
+		if (ref->source_lsmid == LSM_ID_UNDEF)
+			return -EINVAL;
+		lsmid = ref->source_lsmid;
+	}
+	lsm_for_each_hook(scall, prop_ref_to_secctx) {
+		if (lsmid != scall->hl->lsmid->id)
+			continue;
+		rc = scall->hl->hook.prop_ref_to_secctx(ref, observer, cp);
+		if (rc != -EOPNOTSUPP)
+			return rc;
+	}
+	return -EOPNOTSUPP;
+}
+EXPORT_SYMBOL(security_lsm_prop_ref_to_secctx);
+
+int security_kernel_act_as_ref(struct cred *new,
+			       const struct lsm_prop_ref *ref)
+{
+	if (!new || !ref)
+		return -EINVAL;
+	return call_int_hook(kernel_act_as_ref, new, ref);
+}
+EXPORT_SYMBOL(security_kernel_act_as_ref);
+
 /**
  * security_kernel_act_as() - Set the kernel credentials to act as secid
  * @new: credentials
@@ -3359,6 +4352,133 @@ int security_create_user_ns(const struct cred *cred)
 }
 
 /**
+ * security_ipc_namespace_alloc() - Allocate and initialize IPC namespace LSM data
+ * @ns: new IPC namespace
+ * @old_ns: creator's IPC namespace, or NULL for the initial namespace
+ * @cred: creator credential
+ * @initial: true only for init_ipc_ns
+ *
+ * Return: 0 on success or a negative error code.  A namespace without a
+ * successfully initialized composite blob must never be published.
+ */
+int security_ipc_namespace_alloc(struct ipc_namespace *ns,
+				 const struct ipc_namespace *old_ns,
+				 const struct cred *cred, bool initial)
+{
+	int rc;
+
+	rc = lsm_ipc_namespace_alloc(ns);
+	if (rc)
+		return rc;
+	rc = call_int_hook(ipc_namespace_alloc_security, ns, old_ns, cred,
+			   initial);
+	if (rc) {
+		call_void_hook(ipc_namespace_free_security, ns);
+		kfree(ns->security);
+		ns->security = NULL;
+	}
+	return rc;
+}
+
+void security_ipc_namespace_free(struct ipc_namespace *ns)
+{
+	call_void_hook(ipc_namespace_free_security, ns);
+	kfree(ns->security);
+	ns->security = NULL;
+}
+
+int security_ipc_namespace_reanchor_prepare(
+	struct ipc_namespace_security_txn *txn, struct ipc_namespace *ns,
+	const struct cred *cred, struct cred *mutable_cred,
+	struct cred **replacement_cred)
+{
+	struct cred *replacement = NULL;
+	s64 old;
+	u64 token;
+	int rc;
+
+	if (replacement_cred)
+		*replacement_cred = NULL;
+	if (txn->prepared)
+		return -EBUSY;
+	old = atomic64_read(&ipc_namespace_security_token);
+	for (;;) {
+		if (unlikely(old == S64_MAX))
+			return -EOVERFLOW;
+		if (atomic64_try_cmpxchg(&ipc_namespace_security_token, &old,
+					 old + 1)) {
+			token = (u64)old + 1;
+			break;
+		}
+	}
+
+	rc = call_int_hook(ipc_namespace_reanchor_prepare, ns, cred, token,
+			   mutable_cred, &replacement);
+	if (rc) {
+		/* Prepare hooks must make abort idempotent for partial stacks. */
+		call_void_hook(ipc_namespace_reanchor_abort, ns, token);
+		if (replacement)
+			abort_creds(replacement);
+		return rc;
+	}
+	if (replacement && (mutable_cred || !replacement_cred)) {
+		call_void_hook(ipc_namespace_reanchor_abort, ns, token);
+		abort_creds(replacement);
+		return -EOPNOTSUPP;
+	}
+
+	txn->ns = get_ipc_ns(ns);
+	txn->token = token;
+	txn->prepared = true;
+	if (replacement_cred)
+		*replacement_cred = replacement;
+	return 0;
+}
+
+void security_ipc_namespace_reanchor_commit(
+	struct ipc_namespace_security_txn *txn)
+{
+	struct ipc_namespace *ns;
+	u64 token;
+
+	if (!txn->prepared)
+		return;
+	ns = txn->ns;
+	token = txn->token;
+	call_void_hook(ipc_namespace_reanchor_commit, ns, token);
+	memset(txn, 0, sizeof(*txn));
+	put_ipc_ns(ns);
+}
+
+void security_ipc_namespace_reanchor_abort(
+	struct ipc_namespace_security_txn *txn)
+{
+	struct ipc_namespace *ns;
+	u64 token;
+
+	if (!txn->prepared)
+		return;
+	ns = txn->ns;
+	token = txn->token;
+	call_void_hook(ipc_namespace_reanchor_abort, ns, token);
+	memset(txn, 0, sizeof(*txn));
+	put_ipc_ns(ns);
+}
+
+/* Called with an IPC ids writer lock or mq_lock held; hooks must not sleep. */
+int security_ipc_namespace_create_gate(struct ipc_namespace *ns,
+				       const struct cred *cred)
+{
+	return call_int_hook(ipc_namespace_create_gate, ns, cred);
+}
+
+/* Called at the publication point while the corresponding IPC lock is held. */
+void security_ipc_namespace_object_published(struct ipc_namespace *ns)
+{
+	call_void_hook(ipc_namespace_object_published, ns);
+}
+
+/**
  * security_ipc_permission() - Check if sysv ipc access is allowed
  * @ipcp: ipc permission structure
  * @flag: requested permissions
@@ -3422,6 +4542,7 @@ void security_msg_msg_free(struct msg_msg *msg)
 
 /**
  * security_msg_queue_alloc() - Allocate a sysv ipc msg queue LSM blob
+ * @ns: ipc namespace that will own the queue
  * @msq: sysv ipc permission structure
  *
  * Allocate and attach a security structure to @msg. The security field is
@@ -3429,13 +4550,17 @@ void security_msg_msg_free(struct msg_msg *msg)
  *
  * Return: Returns 0 if operation was successful and permission is granted.
  */
-int security_msg_queue_alloc(struct kern_ipc_perm *msq)
+int security_msg_queue_alloc(struct ipc_namespace *ns,
+			     struct kern_ipc_perm *msq)
 {
-	int rc = lsm_ipc_alloc(msq);
+	int rc = security_ipc_namespace_create_gate(ns, current_cred());
 
 	if (unlikely(rc))
 		return rc;
-	rc = call_int_hook(msg_queue_alloc_security, msq);
+	rc = lsm_ipc_alloc(msq);
+	if (unlikely(rc))
+		return rc;
+	rc = call_int_hook(msg_queue_alloc_security, ns, msq);
 	if (unlikely(rc))
 		security_msg_queue_free(msq);
 	return rc;
@@ -3525,6 +4650,7 @@ int security_msg_queue_msgrcv(struct kern_ipc_perm *msq, struct msg_msg *msg,
 
 /**
  * security_shm_alloc() - Allocate a sysv shm LSM blob
+ * @ns: ipc namespace that will own the shared-memory segment
  * @shp: sysv ipc permission structure
  *
  * Allocate and attach a security structure to the @shp security field.  The
@@ -3532,13 +4658,16 @@ int security_msg_queue_msgrcv(struct kern_ipc_perm *msq, struct msg_msg *msg,
  *
  * Return: Returns 0 if operation was successful and permission is granted.
  */
-int security_shm_alloc(struct kern_ipc_perm *shp)
+int security_shm_alloc(struct ipc_namespace *ns, struct kern_ipc_perm *shp)
 {
-	int rc = lsm_ipc_alloc(shp);
+	int rc = security_ipc_namespace_create_gate(ns, current_cred());
 
 	if (unlikely(rc))
 		return rc;
-	rc = call_int_hook(shm_alloc_security, shp);
+	rc = lsm_ipc_alloc(shp);
+	if (unlikely(rc))
+		return rc;
+	rc = call_int_hook(shm_alloc_security, ns, shp);
 	if (unlikely(rc))
 		security_shm_free(shp);
 	return rc;
@@ -3609,6 +4738,7 @@ int security_shm_shmat(struct kern_ipc_perm *shp,
 
 /**
  * security_sem_alloc() - Allocate a sysv semaphore LSM blob
+ * @ns: ipc namespace that will own the semaphore set
  * @sma: sysv ipc permission structure
  *
  * Allocate and attach a security structure to the @sma security field. The
@@ -3616,13 +4746,16 @@ int security_shm_shmat(struct kern_ipc_perm *shp,
  *
  * Return: Returns 0 if operation was successful and permission is granted.
  */
-int security_sem_alloc(struct kern_ipc_perm *sma)
+int security_sem_alloc(struct ipc_namespace *ns, struct kern_ipc_perm *sma)
 {
-	int rc = lsm_ipc_alloc(sma);
+	int rc = security_ipc_namespace_create_gate(ns, current_cred());
 
 	if (unlikely(rc))
 		return rc;
-	rc = call_int_hook(sem_alloc_security, sma);
+	rc = lsm_ipc_alloc(sma);
+	if (unlikely(rc))
+		return rc;
+	rc = call_int_hook(sem_alloc_security, ns, sma);
 	if (unlikely(rc))
 		security_sem_free(sma);
 	return rc;
@@ -3951,8 +5084,8 @@ EXPORT_SYMBOL(security_secid_to_secctx);
  *
  * Return: Return length of data on success, error on failure.
  */
-int security_lsmprop_to_secctx(struct lsm_prop *prop, struct lsm_context *cp,
-			       int lsmid)
+int security_lsmprop_to_secctx(const struct lsm_prop *prop,
+			       struct lsm_context *cp, int lsmid)
 {
 	struct lsm_static_call *scall;
 
@@ -4465,6 +5598,129 @@ int security_socket_getpeersec_dgram(struct socket *sock,
 EXPORT_SYMBOL(security_socket_getpeersec_dgram);
 
 /**
+ * security_socket_getpeersec_dgram_ctx() - Get a datagram peer context
+ * @observer: socket through which the packet is observed
+ * @skb: datagram packet
+ * @cp: remote peer security context
+ *
+ * Prefer a provenance-aware hook which renders the context directly for the
+ * observer.  LSMs which only implement the traditional secid hook retain the
+ * existing behavior through the compatibility conversion below.
+ *
+ * Return: Returns 0 on success, error on failure.
+ */
+int security_socket_getpeersec_dgram_ctx(struct sock *observer,
+					 struct sk_buff *skb,
+					 struct lsm_context *cp)
+{
+	struct lsm_static_call *scall;
+	u32 secid;
+	int rc;
+
+	if (!observer || !skb || !cp)
+		return -EINVAL;
+	memset(cp, 0, sizeof(*cp));
+	lsm_for_each_hook(scall, socket_getpeersec_dgram_ctx) {
+		rc = scall->hl->hook.socket_getpeersec_dgram_ctx(observer, skb,
+								  cp);
+		if (rc != LSM_RET_DEFAULT(socket_getpeersec_dgram_ctx))
+			return rc;
+	}
+
+	rc = security_socket_getpeersec_dgram(NULL, skb, &secid);
+	if (rc)
+		return rc;
+	rc = security_secid_to_secctx(secid, cp);
+	return rc < 0 ? rc : 0;
+}
+EXPORT_SYMBOL(security_socket_getpeersec_dgram_ctx);
+
+/**
+ * security_scm_alloc() - Capture immutable LSM state for an SCM message
+ * @sock: sending socket
+ * @gfp: allocation mode
+ * @scmp: resulting carrier
+ *
+ * Return: 0 on success or a negative error code.  A NULL carrier is a valid
+ * success result when no active LSM requested an SCM blob.
+ */
+int security_scm_alloc(struct socket *sock, gfp_t gfp,
+		       struct lsm_scm_security **scmp)
+{
+	struct lsm_scm_security *scm;
+	int rc;
+
+	if (!sock || !scmp)
+		return -EINVAL;
+	*scmp = NULL;
+	if (!blob_sizes.lbs_scm)
+		return 0;
+	scm = kzalloc(sizeof(*scm) + blob_sizes.lbs_scm, gfp);
+	if (!scm)
+		return -ENOMEM;
+	refcount_set(&scm->refs, 1);
+	rc = call_int_hook(scm_alloc_security, scm, sock, gfp);
+	if (rc) {
+		call_void_hook(scm_free_security, scm);
+		kfree(scm);
+		return rc;
+	}
+	*scmp = scm;
+	return 0;
+}
+EXPORT_SYMBOL(security_scm_alloc);
+
+struct lsm_scm_security *security_scm_get(struct lsm_scm_security *scm)
+{
+	if (scm)
+		refcount_inc(&scm->refs);
+	return scm;
+}
+EXPORT_SYMBOL(security_scm_get);
+
+void security_scm_put(struct lsm_scm_security *scm)
+{
+	if (!scm || !refcount_dec_and_test(&scm->refs))
+		return;
+	call_void_hook(scm_free_security, scm);
+	kfree(scm);
+}
+EXPORT_SYMBOL(security_scm_put);
+
+bool security_scm_secdata_eq(const struct lsm_scm_security *left,
+			     const struct lsm_scm_security *right)
+{
+	if (left == right)
+		return true;
+	if (!left || !right)
+		return false;
+	return call_int_hook(scm_secdata_eq, left, right) != 0;
+}
+EXPORT_SYMBOL(security_scm_secdata_eq);
+
+int security_scm_getsecctx(const struct lsm_scm_security *scm, u32 secid,
+			   const struct cred *observer_cred,
+			   struct sock *observer, struct lsm_context *cp)
+{
+	struct lsm_static_call *scall;
+	int rc;
+
+	if (!observer_cred || !observer || !cp)
+		return -EINVAL;
+	memset(cp, 0, sizeof(*cp));
+	lsm_for_each_hook(scall, scm_getsecctx) {
+		rc = scall->hl->hook.scm_getsecctx(scm, observer_cred, observer,
+						    cp);
+		if (rc != LSM_RET_DEFAULT(scm_getsecctx))
+			return rc;
+	}
+
+	rc = security_secid_to_secctx(secid, cp);
+	return rc < 0 ? rc : 0;
+}
+EXPORT_SYMBOL(security_scm_getsecctx);
+
+/**
  * lsm_sock_alloc - allocate a composite sock blob
  * @sock: the sock that needs a blob
  * @gfp: allocation mode
@@ -4526,6 +5782,105 @@ void security_sk_clone(const struct sock *sk, struct sock *newsk)
 	call_void_hook(sk_clone_security, sk, newsk);
 }
 EXPORT_SYMBOL(security_sk_clone);
+
+/**
+ * security_req_alloc() - Allocate and initialize a request socket LSM blob
+ * @req: request socket receiving the blob
+ * @listener: listener which created @req
+ * @gfp: allocation mode
+ *
+ * Return: 0 on success or a negative error code on failure.
+ */
+int security_req_alloc(struct request_sock *req, const struct sock *listener,
+		       gfp_t gfp)
+{
+	int rc;
+
+	rc = lsm_blob_alloc(&req->security, blob_sizes.lbs_req, gfp);
+	if (unlikely(rc))
+		return rc;
+
+	rc = call_int_hook(req_alloc_security, req, listener, gfp);
+	if (unlikely(rc))
+		security_req_free(req);
+	return rc;
+}
+
+/**
+ * security_req_free() - Release a request socket's LSM state
+ * @req: request socket being destroyed
+ */
+void security_req_free(struct request_sock *req)
+{
+	call_void_hook(req_free_security, req);
+	kfree(req->security);
+	req->security = NULL;
+}
+
+/**
+ * security_req_clone() - Clone durable request socket LSM state
+ * @req: source request socket
+ * @newreq: newly allocated destination request socket
+ * @gfp: allocation mode
+ *
+ * The destination must not share the source composite blob; individual LSMs
+ * explicitly retain or duplicate any state they own through this hook.
+ *
+ * Return: 0 on success or a negative error code on failure.
+ */
+int security_req_clone(const struct request_sock *req,
+		       struct request_sock *newreq, gfp_t gfp)
+{
+	int rc;
+
+	rc = lsm_blob_alloc(&newreq->security, blob_sizes.lbs_req, gfp);
+	if (unlikely(rc))
+		return rc;
+
+	rc = call_int_hook(req_clone_security, req, newreq, gfp);
+	if (unlikely(rc))
+		security_req_free(newreq);
+	return rc;
+}
+
+/**
+ * security_sctp_assoc_alloc() - Allocate an SCTP association LSM blob
+ * @asoc: association receiving the blob
+ * @gfp: allocation mode
+ *
+ * Return: 0 on success or a negative error code on failure.
+ */
+int security_sctp_assoc_alloc(struct sctp_association *asoc, gfp_t gfp)
+{
+	int rc;
+
+	rc = lsm_blob_alloc(&asoc->security, blob_sizes.lbs_sctp_assoc, gfp);
+	if (unlikely(rc))
+		return rc;
+
+	asoc->security_initialized = true;
+	rc = call_int_hook(sctp_assoc_alloc_security, asoc, gfp);
+	if (unlikely(rc))
+		security_sctp_assoc_free(asoc);
+	return rc;
+}
+EXPORT_SYMBOL(security_sctp_assoc_alloc);
+
+/**
+ * security_sctp_assoc_free() - Release an SCTP association's LSM state
+ * @asoc: association being destroyed
+ */
+void security_sctp_assoc_free(struct sctp_association *asoc)
+{
+	if (!asoc->security_initialized)
+		return;
+
+	call_void_hook(sctp_assoc_free_security, asoc);
+	kfree(asoc->security);
+	asoc->security = NULL;
+	asoc->security_initialized = false;
+}
+EXPORT_SYMBOL(security_sctp_assoc_free);
 
 /**
  * security_sk_classify_flow() - Set a flow's secid based on socket
@@ -4614,17 +5969,40 @@ EXPORT_SYMBOL(security_inet_conn_established);
 
 /**
  * security_secmark_relabel_packet() - Check if setting a secmark is allowed
+ * @net: network namespace in which the secmark will be installed
  * @secid: new secmark value
+ * @secmark: per-LSM immutable carrier returned on success
  *
  * Check if the process should be allowed to relabel packets to @secid.
  *
  * Return: Returns 0 if permission is granted.
  */
-int security_secmark_relabel_packet(u32 secid)
+int security_secmark_relabel_packet(const struct net *net, u32 secid,
+				    struct lsm_secmark *secmark)
 {
-	return call_int_hook(secmark_relabel_packet, secid);
+	int rc;
+
+	if (!secmark)
+		return -EINVAL;
+	memset(secmark, 0, sizeof(*secmark));
+	rc = call_int_hook(secmark_relabel_packet, net, secid, secmark);
+	if (rc)
+		call_void_hook(secmark_release, secmark);
+	return rc;
 }
 EXPORT_SYMBOL(security_secmark_relabel_packet);
+
+/**
+ * security_secmark_release() - Release an unconsumed secmark carrier
+ * @secmark: carrier returned by security_secmark_relabel_packet()
+ */
+void security_secmark_release(struct lsm_secmark *secmark)
+{
+	if (!secmark)
+		return;
+	call_void_hook(secmark_release, secmark);
+}
+EXPORT_SYMBOL(security_secmark_release);
 
 /**
  * security_secmark_refcount_inc() - Increment the secmark labeling rule count
@@ -4651,13 +6029,14 @@ EXPORT_SYMBOL(security_secmark_refcount_dec);
 /**
  * security_tun_dev_alloc_security() - Allocate a LSM blob for a TUN device
  * @security: pointer to the LSM blob
+ * @net: network namespace which owns the device
  *
  * This hook allows a module to allocate a security structure for a TUN	device,
  * returning the pointer in @security.
  *
  * Return: Returns a zero on success, negative values on failure.
  */
-int security_tun_dev_alloc_security(void **security)
+int security_tun_dev_alloc_security(void **security, const struct net *net)
 {
 	int rc;
 
@@ -4665,9 +6044,9 @@ int security_tun_dev_alloc_security(void **security)
 	if (rc)
 		return rc;
 
-	rc = call_int_hook(tun_dev_alloc_security, *security);
+	rc = call_int_hook(tun_dev_alloc_security, *security, net);
 	if (rc) {
-		kfree(*security);
+		security_tun_dev_free_security(*security);
 		*security = NULL;
 	}
 	return rc;
@@ -4682,6 +6061,9 @@ EXPORT_SYMBOL(security_tun_dev_alloc_security);
  */
 void security_tun_dev_free_security(void *security)
 {
+	if (!security)
+		return;
+	call_void_hook(tun_dev_free_security, security);
 	kfree(security);
 }
 EXPORT_SYMBOL(security_tun_dev_free_security);
@@ -4702,14 +6084,15 @@ EXPORT_SYMBOL(security_tun_dev_create);
 /**
  * security_tun_dev_attach_queue() - Check if attaching a TUN queue is allowed
  * @security: TUN device LSM blob
+ * @net: network namespace which currently owns the device
  *
  * Check permissions prior to attaching to a TUN device queue.
  *
  * Return: Returns 0 if permission is granted.
  */
-int security_tun_dev_attach_queue(void *security)
+int security_tun_dev_attach_queue(void *security, const struct net *net)
 {
-	return call_int_hook(tun_dev_attach_queue, security);
+	return call_int_hook(tun_dev_attach_queue, security, net);
 }
 EXPORT_SYMBOL(security_tun_dev_attach_queue);
 
@@ -4717,30 +6100,33 @@ EXPORT_SYMBOL(security_tun_dev_attach_queue);
  * security_tun_dev_attach() - Update TUN device LSM state on attach
  * @sk: associated sock
  * @security: TUN device LSM blob
+ * @net: network namespace which currently owns the device
  *
  * This hook can be used by the module to update any security state associated
  * with the TUN device's sock structure.
  *
  * Return: Returns 0 if permission is granted.
  */
-int security_tun_dev_attach(struct sock *sk, void *security)
+int security_tun_dev_attach(struct sock *sk, void *security,
+			    const struct net *net)
 {
-	return call_int_hook(tun_dev_attach, sk, security);
+	return call_int_hook(tun_dev_attach, sk, security, net);
 }
 EXPORT_SYMBOL(security_tun_dev_attach);
 
 /**
  * security_tun_dev_open() - Update TUN device LSM state on open
  * @security: TUN device LSM blob
+ * @net: network namespace which currently owns the device
  *
  * This hook can be used by the module to update any security state associated
  * with the TUN device's security structure.
  *
  * Return: Returns 0 if permission is granted.
  */
-int security_tun_dev_open(void *security)
+int security_tun_dev_open(void *security, const struct net *net)
 {
-	return call_int_hook(tun_dev_open, security);
+	return call_int_hook(tun_dev_open, security, net);
 }
 EXPORT_SYMBOL(security_tun_dev_open);
 
@@ -4921,6 +6307,7 @@ EXPORT_SYMBOL(security_ib_alloc_security);
  */
 void security_ib_free_security(void *sec)
 {
+	call_void_hook(ib_free_security, sec);
 	kfree(sec);
 }
 EXPORT_SYMBOL(security_ib_free_security);
@@ -5010,6 +6397,7 @@ EXPORT_SYMBOL(security_xfrm_state_alloc);
  * @x: xfrm state being added to the SAD
  * @polsec: associated policy's security context
  * @secid: secid from the flow
+ * @origin: typed borrowed object which owns the flow label
  *
  * Allocate a security structure to the x->security field; the security field
  * is initialized to NULL when the xfrm_state is allocated.  Set the context to
@@ -5018,9 +6406,10 @@ EXPORT_SYMBOL(security_xfrm_state_alloc);
  * Return: Returns 0 if operation was successful.
  */
 int security_xfrm_state_alloc_acquire(struct xfrm_state *x,
-				      struct xfrm_sec_ctx *polsec, u32 secid)
+				      struct xfrm_sec_ctx *polsec, u32 secid,
+				      const struct xfrm_flow_origin *origin)
 {
-	return call_int_hook(xfrm_state_alloc_acquire, x, polsec, secid);
+	return call_int_hook(xfrm_state_alloc_acquire, x, polsec, secid, origin);
 }
 
 /**
@@ -5052,6 +6441,7 @@ void security_xfrm_state_free(struct xfrm_state *x)
  * security_xfrm_policy_lookup() - Check if using a xfrm policy is allowed
  * @ctx: target xfrm security context
  * @fl_secid: flow secid used to authorize access
+ * @origin: typed borrowed object which owns @fl_secid
  *
  * Check permission when a flow selects a xfrm_policy for processing XFRMs on a
  * packet.  The hook is called when selecting either a per-socket policy or a
@@ -5060,9 +6450,10 @@ void security_xfrm_state_free(struct xfrm_state *x)
  * Return: Return 0 if permission is granted, -ESRCH otherwise, or -errno on
  *         other errors.
  */
-int security_xfrm_policy_lookup(struct xfrm_sec_ctx *ctx, u32 fl_secid)
+int security_xfrm_policy_lookup(struct xfrm_sec_ctx *ctx, u32 fl_secid,
+				const struct xfrm_flow_origin *origin)
 {
-	return call_int_hook(xfrm_policy_lookup, ctx, fl_secid);
+	return call_int_hook(xfrm_policy_lookup, ctx, fl_secid, origin);
 }
 
 /**
@@ -5070,6 +6461,7 @@ int security_xfrm_policy_lookup(struct xfrm_sec_ctx *ctx, u32 fl_secid)
  * @x: xfrm state to match
  * @xp: xfrm policy to check for a match
  * @flic: flow to check for a match.
+ * @origin: typed borrowed object which owns the flow label
  *
  * Check @xp and @flic for a match with @x.
  *
@@ -5077,7 +6469,8 @@ int security_xfrm_policy_lookup(struct xfrm_sec_ctx *ctx, u32 fl_secid)
  */
 int security_xfrm_state_pol_flow_match(struct xfrm_state *x,
 				       struct xfrm_policy *xp,
-				       const struct flowi_common *flic)
+				       const struct flowi_common *flic,
+				       const struct xfrm_flow_origin *origin)
 {
 	struct lsm_static_call *scall;
 	int rc = LSM_RET_DEFAULT(xfrm_state_pol_flow_match);
@@ -5092,7 +6485,8 @@ int security_xfrm_state_pol_flow_match(struct xfrm_state *x,
 	 * using the macro
 	 */
 	lsm_for_each_hook(scall, xfrm_state_pol_flow_match) {
-		rc = scall->hl->hook.xfrm_state_pol_flow_match(x, xp, flic);
+		rc = scall->hl->hook.xfrm_state_pol_flow_match(x, xp, flic,
+							       origin);
 		break;
 	}
 	return rc;
@@ -5155,6 +6549,7 @@ int security_key_alloc(struct key *key, const struct cred *cred,
  */
 void security_key_free(struct key *key)
 {
+	call_void_hook(key_free, key);
 	kfree(key->security);
 	key->security = NULL;
 }
@@ -5273,10 +6668,36 @@ void security_audit_rule_free(void *lsmrule)
  * Return: Returns 1 if secid matches the rule, 0 if it does not, -ERRNO on
  *         failure.
  */
-int security_audit_rule_match(struct lsm_prop *prop, u32 field, u32 op,
+int security_audit_rule_match(const struct lsm_prop *prop, u32 field, u32 op,
 			      void *lsmrule)
 {
-	return call_int_hook(audit_rule_match, prop, field, op, lsmrule);
+	return call_int_hook(audit_rule_match, NULL, prop, field, op, lsmrule);
+}
+
+/**
+ * security_audit_rule_match_ref() - Match an immutable label carrier
+ * @ref: complete LSM property carrier, or NULL when @status is an error
+ * @status: result of capturing @ref
+ * @field: LSM audit field
+ * @op: matching operator
+ * @lsmrule: audit rule
+ *
+ * A capture/projection error is returned unchanged.  Audit callers can
+ * therefore fail open for logging without allowing a negative errno to be
+ * confused with a successful match, in particular for AUDIT_NEVER rules.
+ *
+ * Return: 1 for a match, 0 for no match, or a negative errno on failure.
+ */
+int security_audit_rule_match_ref(const struct lsm_prop_ref *ref, int status,
+				  u32 field, u32 op, void *lsmrule)
+{
+	if (status)
+		return status < 0 ? status : -EINVAL;
+	if (!ref)
+		return -EINVAL;
+
+	return call_int_hook(audit_rule_match, ref, &ref->prop, field, op,
+			     lsmrule);
 }
 #endif /* CONFIG_AUDIT */
 
@@ -5315,6 +6736,21 @@ int security_bpf_map(struct bpf_map *map, fmode_t fmode)
 }
 
 /**
+ * security_bpf_map_relation() - Authorize an indirect BPF object relation
+ * @outer: map about to publish the relation
+ * @inner: inner map, or NULL
+ * @prog: program, or NULL
+ *
+ * Return: Returns 0 if the complete relation is allowed.
+ */
+int security_bpf_map_relation(struct bpf_map *outer,
+			      const struct bpf_map *inner,
+			      const struct bpf_prog *prog)
+{
+	return call_int_hook(bpf_map_relation, outer, inner, prog);
+}
+
+/**
  * security_bpf_prog() - Check if access to a bpf program is allowed
  * @prog: bpf program
  *
@@ -5326,6 +6762,30 @@ int security_bpf_map(struct bpf_map *map, fmode_t fmode)
 int security_bpf_prog(struct bpf_prog *prog)
 {
 	return call_int_hook(bpf_prog, prog);
+}
+
+/**
+ * security_bpf_prog_map_relation() - Authorize a retained program/map relation
+ * @prog: program about to retain the map
+ * @map: map retained by the program
+ *
+ * Return: Returns 0 if the complete relation is allowed.
+ */
+int security_bpf_prog_map_relation(struct bpf_prog *prog,
+				   const struct bpf_map *map)
+{
+	return call_int_hook(bpf_prog_map_relation, prog, map);
+}
+
+/**
+ * security_bpf_btf() - Check whether access to a BTF object is allowed
+ * @btf: BTF object
+ *
+ * Return: Returns 0 if permission is granted.
+ */
+int security_bpf_btf(const struct btf *btf)
+{
+	return call_int_hook(bpf_btf, btf);
 }
 
 /**
@@ -5380,6 +6840,43 @@ int security_bpf_prog_load(struct bpf_prog *prog, union bpf_attr *attr,
 	rc = call_int_hook(bpf_prog_load, prog, attr, token, kernel);
 	if (unlikely(rc))
 		security_bpf_prog_free(prog);
+	return rc;
+}
+
+/**
+ * security_bpf_prog_commit() - Revalidate completed BPF program relations
+ * @prog: verified program immediately before ID publication
+ *
+ * Return: Returns 0 on success, error on failure.
+ */
+int security_bpf_prog_commit(struct bpf_prog *prog)
+{
+	return call_int_hook(bpf_prog_commit, prog);
+}
+
+/**
+ * security_bpf_btf_load() - Initialize and authorize a BTF object
+ * @btf: BTF object
+ * @attr: BPF attributes for user or kernel loads, or NULL for built-in BTF
+ * @token: BPF token granting the load, or NULL
+ * @origin: source of the BTF object
+ *
+ * Allocate LSM state and authorize the object before its ID is published.
+ *
+ * Return: Returns 0 on success, error on failure.
+ */
+int security_bpf_btf_load(struct btf *btf, const union bpf_attr *attr,
+			  struct bpf_token *token, enum bpf_btf_origin origin)
+{
+	int rc;
+
+	rc = lsm_bpf_btf_alloc(btf);
+	if (unlikely(rc))
+		return rc;
+
+	rc = call_int_hook(bpf_btf_load, btf, attr, token, origin);
+	if (unlikely(rc))
+		security_bpf_btf_free(btf);
 	return rc;
 }
 
@@ -5465,6 +6962,105 @@ void security_bpf_prog_free(struct bpf_prog *prog)
 	call_void_hook(bpf_prog_free, prog);
 	kfree(prog->aux->security);
 	prog->aux->security = NULL;
+}
+
+/**
+ * security_bpf_btf_free() - Free a BTF object's LSM blob
+ * @btf: BTF object
+ *
+ * Release LSM state after the object is no longer externally reachable.
+ */
+void security_bpf_btf_free(struct btf *btf)
+{
+	void *security = btf_security(btf);
+
+	call_void_hook(bpf_btf_free, btf);
+	kfree(security);
+	btf_set_security(btf, NULL);
+}
+
+/**
+ * security_bpf_link_create() - Initialize security state for a BPF link
+ * @link: BPF link that is about to be published
+ * @related_prog: additional target program retained by the link, or NULL
+ * @related_map: map retained by the link, or NULL
+ *
+ * Allocate the composite LSM blob and authorize creation before the link is
+ * assigned an ID or otherwise made visible outside its creator.
+ *
+ * Return: Returns 0 on success, error on failure.
+ */
+int security_bpf_link_create(struct bpf_link *link,
+			     const struct bpf_prog *related_prog,
+			     const struct bpf_map *related_map)
+{
+	int rc;
+
+	if (WARN_ON_ONCE(link->security_initialized))
+		return -EALREADY;
+
+	rc = lsm_bpf_link_alloc(link);
+	if (unlikely(rc))
+		return rc;
+	link->security_initialized = true;
+
+	rc = call_int_hook(bpf_link_create, link, related_prog, related_map);
+	if (unlikely(rc))
+		security_bpf_link_free(link);
+	return rc;
+}
+
+/**
+ * security_bpf_link_free() - Free a BPF link's LSM blob
+ * @link: BPF link being destroyed
+ *
+ * Clean up the security information stored inside a BPF link.
+ */
+void security_bpf_link_free(struct bpf_link *link)
+{
+	if (!link->security_initialized)
+		return;
+
+	call_void_hook(bpf_link_free, link);
+	kfree(link->security);
+	link->security = NULL;
+	link->security_initialized = false;
+}
+
+/**
+ * security_bpf_link_access() - Check access to a BPF link
+ * @link: BPF link being accessed
+ * @cmd: BPF command describing the requested access
+ *
+ * Return: Returns 0 if access is allowed, error otherwise.
+ */
+int security_bpf_link_access(struct bpf_link *link, enum bpf_cmd cmd)
+{
+	if (unlikely(!link->security_initialized))
+		return -EACCES;
+	return call_int_hook(bpf_link_access, link, cmd);
+}
+
+/**
+ * security_bpf_link_update() - Check an update of a BPF link
+ * @link: BPF link being updated
+ * @new_prog: replacement program, or NULL for a map update
+ * @old_prog: expected old program, or NULL
+ * @new_map: replacement map, or NULL for a program update
+ * @old_map: expected old map, or NULL
+ *
+ * Return: Returns 0 if the update is allowed, error otherwise.
+ */
+int security_bpf_link_update(struct bpf_link *link,
+			     const struct bpf_prog *new_prog,
+			     const struct bpf_prog *old_prog,
+			     const struct bpf_map *new_map,
+			     const struct bpf_map *old_map)
+{
+	if (unlikely(!link->security_initialized))
+		return -EACCES;
+	return call_int_hook(bpf_link_update, link, new_prog, old_prog,
+			     new_map, old_map);
 }
 
 /**
@@ -5607,10 +7203,8 @@ int security_perf_event_alloc(struct perf_event *event)
 		return rc;
 
 	rc = call_int_hook(perf_event_alloc, event);
-	if (rc) {
-		kfree(event->security);
-		event->security = NULL;
-	}
+	if (rc)
+		security_perf_event_free(event);
 	return rc;
 }
 
@@ -5622,6 +7216,7 @@ int security_perf_event_alloc(struct perf_event *event)
  */
 void security_perf_event_free(struct perf_event *event)
 {
+	call_void_hook(perf_event_free, event);
 	kfree(event->security);
 	event->security = NULL;
 }
@@ -5650,6 +7245,19 @@ int security_perf_event_read(struct perf_event *event)
 int security_perf_event_write(struct perf_event *event)
 {
 	return call_int_hook(perf_event_write, event);
+}
+
+/**
+ * security_perf_event_relation() - Check publication of a retained relation
+ * @event: perf event which will remain reachable through another object
+ * @access: PERF_SECURITY_RELATION_* access retained by the relation
+ *
+ * Return: Returns 0 if publication is granted.
+ */
+int security_perf_event_relation(struct perf_event *event,
+				 unsigned int access)
+{
+	return call_int_hook(perf_event_relation, event, access);
 }
 #endif /* CONFIG_PERF_EVENTS */
 
@@ -5716,3 +7324,7 @@ void security_initramfs_populated(void)
 {
 	call_void_hook(initramfs_populated);
 }
+
+#ifdef CONFIG_SECURITY_PLAN_KUNIT_TEST
+#include "security_plan_test.c"
+#endif

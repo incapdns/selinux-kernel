@@ -436,9 +436,10 @@ static void scm_passec(struct sock *sk, struct msghdr *msg, struct scm_cookie *s
 	int err;
 
 	if (sk->sk_scm_security) {
-		err = security_secid_to_secctx(scm->secid, &ctx);
+		err = security_scm_getsecctx(scm->security, scm->secid,
+					     current_cred(), sk, &ctx);
 
-		if (err >= 0) {
+		if (!err) {
 			put_cmsg(msg, SOL_SOCKET, SCM_SECURITY, ctx.len,
 				 ctx.context);
 
@@ -522,6 +523,7 @@ static bool __scm_recv_common(struct sock *sk, struct msghdr *msg,
 	}
 
 	scm_passec(sk, msg, scm);
+	scm_destroy_secdata(scm);
 
 	if (scm->fp)
 		scm_detach_fds(msg, scm);

@@ -22,8 +22,10 @@
 #include <linux/rcupdate.h>
 #include <linux/list.h>
 #include <linux/spinlock.h>
+#include <linux/hash.h>
 
 #include "initcalls.h"
+#include "global_sidtab.h"
 #include "ibpkey.h"
 #include "objsec.h"
 
@@ -37,6 +39,9 @@ struct sel_ib_pkey_bkt {
 
 struct sel_ib_pkey {
 	struct pkey_security_struct psec;
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	struct selinux_global_sid_handle *sid_handle;
+#endif
 	struct list_head list;
 	struct rcu_head rcu;
 };
@@ -44,8 +49,20 @@ struct sel_ib_pkey {
 static DEFINE_SPINLOCK(sel_ib_pkey_lock);
 static struct sel_ib_pkey_bkt sel_ib_pkey_hash[SEL_PKEY_HASH_SIZE];
 
+static void sel_ib_pkey_free(struct rcu_head *rcu)
+{
+	struct sel_ib_pkey *pkey = container_of(rcu, struct sel_ib_pkey, rcu);
+
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	global_sid_handle_put(pkey->sid_handle);
+#endif
+	kfree(pkey);
+}
+
 /**
  * sel_ib_pkey_hashfn - Hashing function for the pkey table
+ * @domain_id: stable SELinux label-domain identity
+ * @subnet_prefix: subnet prefix
  * @pkey: pkey number
  *
  * Description:
@@ -53,13 +70,47 @@ static struct sel_ib_pkey_bkt sel_ib_pkey_hash[SEL_PKEY_HASH_SIZE];
  * number for the given pkey.
  *
  */
-static unsigned int sel_ib_pkey_hashfn(u16 pkey)
+static unsigned int sel_ib_pkey_hashfn(u64 domain_id, u64 subnet_prefix,
+				       u16 pkey)
 {
-	return (pkey & (SEL_PKEY_HASH_SIZE - 1));
+	return hash_64(domain_id ^ subnet_prefix ^ pkey, 8);
 }
+
+static bool sel_ib_pkey_match(const struct pkey_security_struct *psec,
+			      u64 domain_id,
+			      const struct selinux_policy_snapshot *snapshot,
+			      u64 subnet_prefix, u16 pkey_num)
+{
+	return psec->pkey == pkey_num &&
+	       psec->subnet_prefix == subnet_prefix &&
+	       selinux_policy_cache_key_matches(&psec->policy, domain_id,
+						snapshot);
+}
+
+#ifdef CONFIG_SECURITY_SELINUX_KUNIT_TEST
+bool selinux_kunit_ib_pkey_key_matches(
+	u64 stored_domain_id,
+	const struct selinux_policy_snapshot *stored_snapshot,
+	u64 stored_subnet_prefix, u16 stored_pkey, u64 query_domain_id,
+	const struct selinux_policy_snapshot *query_snapshot,
+	u64 query_subnet_prefix, u16 query_pkey)
+{
+	struct pkey_security_struct psec = {
+		.subnet_prefix = stored_subnet_prefix,
+		.pkey = stored_pkey,
+	};
+
+	selinux_policy_cache_key_init(&psec.policy, stored_domain_id,
+				      stored_snapshot);
+	return sel_ib_pkey_match(&psec, query_domain_id, query_snapshot,
+				 query_subnet_prefix, query_pkey);
+}
+#endif
 
 /**
  * sel_ib_pkey_find - Search for a pkey record
+ * @domain_id: stable SELinux label-domain identity
+ * @snapshot: immutable policy generation
  * @subnet_prefix: subnet_prefix
  * @pkey_num: pkey_num
  *
@@ -68,15 +119,23 @@ static unsigned int sel_ib_pkey_hashfn(u16 pkey)
  * can not be found in the table return NULL.
  *
  */
-static struct sel_ib_pkey *sel_ib_pkey_find(u64 subnet_prefix, u16 pkey_num)
+static struct sel_ib_pkey *sel_ib_pkey_find(
+	u64 domain_id,
+	const struct selinux_policy_snapshot *snapshot, u64 subnet_prefix,
+	u16 pkey_num)
 {
 	unsigned int idx;
 	struct sel_ib_pkey *pkey;
 
-	idx = sel_ib_pkey_hashfn(pkey_num);
+	idx = sel_ib_pkey_hashfn(domain_id, subnet_prefix, pkey_num);
 	list_for_each_entry_rcu(pkey, &sel_ib_pkey_hash[idx].list, list) {
-		if (pkey->psec.pkey == pkey_num &&
-		    pkey->psec.subnet_prefix == subnet_prefix)
+		if (sel_ib_pkey_match(&pkey->psec, domain_id, snapshot, subnet_prefix,
+				      pkey_num)
+#ifdef CONFIG_SECURITY_SELINUX_NS
+		    && pkey->sid_handle &&
+		    global_sid_handle_sid(pkey->sid_handle) == pkey->psec.sid
+#endif
+		   )
 			return pkey;
 	}
 
@@ -98,7 +157,9 @@ static void sel_ib_pkey_insert(struct sel_ib_pkey *pkey)
 	/* we need to impose a limit on the growth of the hash table so check
 	 * this bucket to make sure it is within the specified bounds
 	 */
-	idx = sel_ib_pkey_hashfn(pkey->psec.pkey);
+	idx = sel_ib_pkey_hashfn(pkey->psec.policy.domain_id,
+				 pkey->psec.subnet_prefix,
+				 pkey->psec.pkey);
 	list_add_rcu(&pkey->list, &sel_ib_pkey_hash[idx].list);
 	if (sel_ib_pkey_hash[idx].size == SEL_PKEY_HASH_BKT_LIMIT) {
 		struct sel_ib_pkey *tail;
@@ -109,7 +170,7 @@ static void sel_ib_pkey_insert(struct sel_ib_pkey *pkey)
 				lockdep_is_held(&sel_ib_pkey_lock)),
 			struct sel_ib_pkey, list);
 		list_del_rcu(&tail->list);
-		kfree_rcu(tail, rcu);
+		call_rcu(&tail->rcu, sel_ib_pkey_free);
 	} else {
 		sel_ib_pkey_hash[idx].size++;
 	}
@@ -117,9 +178,12 @@ static void sel_ib_pkey_insert(struct sel_ib_pkey *pkey)
 
 /**
  * sel_ib_pkey_sid_slow - Lookup the SID of a pkey using the policy
+ * @state: the SELinux state
+ * @snapshot: immutable policy generation
  * @subnet_prefix: subnet prefix
  * @pkey_num: pkey number
  * @sid: pkey SID
+ * @out_handle: strong handle paired with @sid
  *
  * Description:
  * This function determines the SID of a pkey by querying the security
@@ -127,25 +191,62 @@ static void sel_ib_pkey_insert(struct sel_ib_pkey *pkey)
  * queries.  Returns zero on success, negative values on failure.
  *
  */
-static int sel_ib_pkey_sid_slow(u64 subnet_prefix, u16 pkey_num, u32 *sid)
+static int sel_ib_pkey_sid_slow(
+	struct selinux_state *state,
+	const struct selinux_policy_snapshot *snapshot, u64 subnet_prefix,
+	u16 pkey_num, u32 *sid,
+	struct selinux_global_sid_handle **out_handle)
 {
-	int ret;
+	int ret = 0;
+	u64 domain_id = state->label_domain->id;
 	struct sel_ib_pkey *pkey;
 	struct sel_ib_pkey *new;
 	unsigned long flags;
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	struct selinux_global_sid_handle *sid_handle = NULL;
+	struct selinux_global_sid_handle *cache_handle;
+#endif
+
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	if (!out_handle)
+		return -EINVAL;
+	*out_handle = NULL;
+#else
+	(void)out_handle;
+#endif
 
 	spin_lock_irqsave(&sel_ib_pkey_lock, flags);
-	pkey = sel_ib_pkey_find(subnet_prefix, pkey_num);
+	pkey = sel_ib_pkey_find(domain_id, snapshot, subnet_prefix, pkey_num);
 	if (pkey) {
 		*sid = pkey->psec.sid;
-		spin_unlock_irqrestore(&sel_ib_pkey_lock, flags);
-		return 0;
+#ifdef CONFIG_SECURITY_SELINUX_NS
+		sid_handle = global_sid_handle_dup(pkey->sid_handle);
+		if (IS_ERR(sid_handle)) {
+			ret = PTR_ERR(sid_handle);
+			sid_handle = NULL;
+		}
+#endif
+		goto out;
 	}
 
-	ret = security_ib_pkey_sid(current_selinux_state, subnet_prefix, pkey_num,
-				   sid);
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	sid_handle = security_ib_pkey_sid_handle(state, subnet_prefix,
+						 pkey_num, sid);
+	if (IS_ERR(sid_handle)) {
+		ret = PTR_ERR(sid_handle);
+		sid_handle = NULL;
+	} else if (!*sid || global_sid_handle_sid(sid_handle) != *sid) {
+		ret = -ESTALE;
+	}
+#else
+	ret = security_ib_pkey_sid(state, subnet_prefix, pkey_num, sid);
+#endif
 	if (ret)
 		goto out;
+	if (!selinux_policy_snapshot_valid(state, snapshot)) {
+		ret = -ESTALE;
+		goto out;
+	}
 
 	new = kmalloc_obj(*new, GFP_ATOMIC);
 	if (!new) {
@@ -154,19 +255,44 @@ static int sel_ib_pkey_sid_slow(u64 subnet_prefix, u16 pkey_num, u32 *sid)
 		 */
 		goto out;
 	}
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	cache_handle = global_sid_handle_dup(sid_handle);
+	if (IS_ERR(cache_handle)) {
+		kfree(new);
+		goto out;
+	}
+#endif
 
 	new->psec.subnet_prefix = subnet_prefix;
 	new->psec.pkey = pkey_num;
 	new->psec.sid = *sid;
+	selinux_policy_cache_key_init(&new->psec.policy, domain_id, snapshot);
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	new->sid_handle = cache_handle;
+#endif
 	sel_ib_pkey_insert(new);
 
 out:
 	spin_unlock_irqrestore(&sel_ib_pkey_lock, flags);
+	if (!ret && !selinux_policy_snapshot_valid(state, snapshot))
+		ret = -ESTALE;
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	if (!ret && (!sid_handle || !*sid ||
+		     global_sid_handle_sid(sid_handle) != *sid))
+		ret = -ESTALE;
+	if (!ret) {
+		*out_handle = sid_handle;
+		sid_handle = NULL;
+	}
+	global_sid_handle_put(sid_handle);
+#endif
 	return ret;
 }
 
 /**
- * sel_ib_pkey_sid - Lookup the SID of a PKEY
+ * sel_ib_pkey_sid_snapshot_handle - Lookup the SID of a PKEY
+ * @state: the SELinux state
+ * @snapshot: immutable policy generation
  * @subnet_prefix: subnet_prefix
  * @pkey_num: pkey number
  * @sid: pkey SID
@@ -178,20 +304,134 @@ out:
  * future queries.  Returns zero on success, negative values on failure.
  *
  */
-int sel_ib_pkey_sid(u64 subnet_prefix, u16 pkey_num, u32 *sid)
+#ifdef CONFIG_SECURITY_SELINUX_NS
+struct selinux_global_sid_handle *
+sel_ib_pkey_sid_snapshot_handle(
+	struct selinux_state *state,
+	const struct selinux_policy_snapshot *snapshot, u64 subnet_prefix,
+	u16 pkey_num, u32 *sid)
 {
+	struct selinux_global_sid_handle *handle;
 	struct sel_ib_pkey *pkey;
+	bool valid;
+	int rc;
+
+	if (!state || !state->label_domain || !snapshot || !sid ||
+	    !snapshot->chain_epoch)
+		return ERR_PTR(-EINVAL);
 
 	rcu_read_lock();
-	pkey = sel_ib_pkey_find(subnet_prefix, pkey_num);
+	pkey = sel_ib_pkey_find(state->label_domain->id, snapshot, subnet_prefix,
+			       pkey_num);
 	if (likely(pkey)) {
 		*sid = pkey->psec.sid;
+		handle = global_sid_handle_dup(pkey->sid_handle);
+		valid = selinux_policy_snapshot_valid(state, snapshot);
 		rcu_read_unlock();
-		return 0;
+		if (IS_ERR(handle))
+			return handle;
+		if (!valid || !*sid || global_sid_handle_sid(handle) != *sid) {
+			global_sid_handle_put(handle);
+			return ERR_PTR(-ESTALE);
+		}
+		return handle;
 	}
 	rcu_read_unlock();
 
-	return sel_ib_pkey_sid_slow(subnet_prefix, pkey_num, sid);
+	rc = sel_ib_pkey_sid_slow(state, snapshot, subnet_prefix, pkey_num, sid,
+				  &handle);
+	return rc ? ERR_PTR(rc) : handle;
+}
+
+struct selinux_global_sid_handle *
+sel_ib_pkey_sid_handle(struct selinux_state *state, u64 subnet_prefix,
+		      u16 pkey_num, u32 *sid)
+{
+	struct selinux_global_sid_handle *handle;
+	struct selinux_policy_snapshot snapshot;
+	unsigned int retry;
+	int rc;
+
+	for (retry = 0; retry < 3; retry++) {
+		rc = selinux_policy_snapshot_read(state, &snapshot);
+		if (rc == -EAGAIN || rc == -ESTALE)
+			continue;
+		if (rc)
+			return ERR_PTR(rc);
+		handle = sel_ib_pkey_sid_snapshot_handle(
+			state, &snapshot, subnet_prefix, pkey_num, sid);
+		if (!IS_ERR(handle) || PTR_ERR(handle) != -ESTALE)
+			return handle;
+	}
+	return ERR_PTR(-ESTALE);
+}
+#endif
+
+int sel_ib_pkey_sid_snapshot(
+	struct selinux_state *state,
+	const struct selinux_policy_snapshot *snapshot, u64 subnet_prefix,
+	u16 pkey_num, u32 *sid)
+{
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	struct selinux_global_sid_handle *handle;
+
+	handle = sel_ib_pkey_sid_snapshot_handle(
+		state, snapshot, subnet_prefix, pkey_num, sid);
+	if (IS_ERR(handle))
+		return PTR_ERR(handle);
+	global_sid_handle_put(handle);
+	return 0;
+#else
+	struct sel_ib_pkey *pkey;
+	bool valid;
+
+	if (!state || !state->label_domain || !snapshot ||
+	    !snapshot->chain_epoch)
+		return -EINVAL;
+	rcu_read_lock();
+	pkey = sel_ib_pkey_find(state->label_domain->id, snapshot, subnet_prefix,
+				pkey_num);
+	if (likely(pkey)) {
+		*sid = pkey->psec.sid;
+		valid = selinux_policy_snapshot_valid(state, snapshot);
+		rcu_read_unlock();
+		return valid ? 0 : -ESTALE;
+	}
+	rcu_read_unlock();
+	return sel_ib_pkey_sid_slow(state, snapshot, subnet_prefix, pkey_num,
+				    sid, NULL);
+#endif
+}
+
+int sel_ib_pkey_sid(struct selinux_state *state, u64 subnet_prefix,
+		    u16 pkey_num, u32 *sid)
+{
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	struct selinux_global_sid_handle *handle;
+
+	handle = sel_ib_pkey_sid_handle(state, subnet_prefix, pkey_num, sid);
+	if (IS_ERR(handle))
+		return PTR_ERR(handle);
+	global_sid_handle_put(handle);
+	return 0;
+#else
+	struct selinux_policy_snapshot snapshot;
+	unsigned int retry;
+	int rc;
+
+	for (retry = 0; retry < 3; retry++) {
+		rc = selinux_policy_snapshot_read(state, &snapshot);
+		if (rc == -EAGAIN || rc == -ESTALE)
+			continue;
+		if (rc)
+			return rc;
+		rc = sel_ib_pkey_sid_snapshot(state, &snapshot, subnet_prefix,
+					      pkey_num, sid);
+		if (rc != -ESTALE)
+			return rc;
+	}
+	return -ESTALE;
+#endif
 }
 
 /**
@@ -212,7 +452,7 @@ void sel_ib_pkey_flush(void)
 		list_for_each_entry_safe(pkey, pkey_tmp,
 					 &sel_ib_pkey_hash[idx].list, list) {
 			list_del_rcu(&pkey->list);
-			kfree_rcu(pkey, rcu);
+			call_rcu(&pkey->rcu, sel_ib_pkey_free);
 		}
 		sel_ib_pkey_hash[idx].size = 0;
 	}

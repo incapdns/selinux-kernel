@@ -33,6 +33,7 @@
 #include <net/udp.h>
 #include <net/icmp.h>                   /* for icmp_send */
 #include <net/route.h>                  /* for ip_route_output */
+#include <net/xfrm.h>
 #include <net/ipv6.h>
 #include <net/ip6_route.h>
 #include <net/ip_tunnels.h>
@@ -449,6 +450,7 @@ static struct dst_entry *
 __ip_vs_route_output_v6(struct net *net, struct in6_addr *daddr,
 			struct in6_addr *ret_saddr, int do_xfrm, int rt_mode)
 {
+	struct xfrm_flow_origin origin = xfrm_flow_origin_none();
 	struct dst_entry *dst;
 	struct flowi6 fl6 = {
 		.daddr = *daddr,
@@ -467,7 +469,8 @@ __ip_vs_route_output_v6(struct net *net, struct in6_addr *daddr,
 			       &fl6.daddr, 0, &fl6.saddr) < 0)
 		goto out_err;
 	if (do_xfrm) {
-		dst = xfrm_lookup(net, dst, flowi6_to_flowi(&fl6), NULL, 0);
+		dst = xfrm_lookup_origin(net, dst, flowi6_to_flowi(&fl6), NULL,
+					 &origin, 0);
 		if (IS_ERR(dst)) {
 			dst = NULL;
 			goto out_err;

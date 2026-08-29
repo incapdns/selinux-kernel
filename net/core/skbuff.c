@@ -1187,6 +1187,10 @@ void skb_release_head_state(struct sk_buff *skb)
 	}
 	nf_reset_ct(skb);
 	skb_ext_reset(skb);
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	selinux_net_provenance_put(skb->secmark_provenance);
+	skb->secmark_provenance = NULL;
+#endif
 }
 
 /* Free everything but the sk_buff shell. */
@@ -1586,6 +1590,10 @@ static void __copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
 	CHECK_SKB_FIELD(mark);
 #ifdef CONFIG_NETWORK_SECMARK
 	CHECK_SKB_FIELD(secmark);
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	CHECK_SKB_FIELD(secmark_provenance);
+	selinux_net_provenance_get(new->secmark_provenance);
+#endif
 #endif
 #ifdef CONFIG_NET_RX_BUSY_POLL
 	CHECK_SKB_FIELD(napi_id);
@@ -6295,6 +6303,10 @@ void skb_scrub_packet(struct sk_buff *skb, bool xnet)
 		return;
 
 	skb->mark = 0;
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	/* Preserve the ABI mark, but never carry authority across netns. */
+	skb_set_secmark(skb, skb->secmark, NULL);
+#endif
 	skb_clear_tstamp(skb);
 }
 EXPORT_SYMBOL_GPL(skb_scrub_packet);

@@ -28,6 +28,13 @@ static __initdata const char *lsm_order_legacy;
 
 /* Ordered list of LSMs to initialize. */
 static __initdata struct lsm_info *lsm_order[MAX_LSM_COUNT + 1];
+static __initdata struct lsm_info *lsm_initializing;
+
+#define LSM_PLAN_CREATE_PREPARE	BIT(0)
+#define LSM_PLAN_CREATE_FINISH	BIT(1)
+#define LSM_PLAN_SETXATTR_PREPARE BIT(2)
+#define LSM_PLAN_SETXATTR_FINISH	BIT(3)
+#define LSM_PLAN_CREATE_ABORT	BIT(4)
 static __initdata struct lsm_info *lsm_exclusive;
 
 #define lsm_order_for_each(iter)					\
@@ -184,6 +191,7 @@ static void __init lsm_order_append(struct lsm_info *lsm, const char *src)
 	}
 
 	lsm_enabled_set(lsm, true);
+	lsm->slot = lsm_active_cnt;
 	lsm_order[lsm_active_cnt] = lsm;
 	lsm_idlist[lsm_active_cnt++] = lsm->id;
 
@@ -295,12 +303,26 @@ static void __init lsm_prepare(struct lsm_info *lsm)
 	lsm_blob_size_update(&blobs->lbs_file, &blob_sizes.lbs_file);
 	lsm_blob_size_update(&blobs->lbs_backing_file,
 			     &blob_sizes.lbs_backing_file);
+	lsm_blob_size_update(&blobs->lbs_mnt, &blob_sizes.lbs_mnt);
+	lsm_blob_size_update(&blobs->lbs_mnt_topology,
+			     &blob_sizes.lbs_mnt_topology);
+	lsm_blob_size_update(&blobs->lbs_inode_create_plan,
+			     &blob_sizes.lbs_inode_create_plan);
+	lsm_blob_size_update(&blobs->lbs_inode_setxattr_plan,
+			     &blob_sizes.lbs_inode_setxattr_plan);
 	lsm_blob_size_update(&blobs->lbs_ib, &blob_sizes.lbs_ib);
 	/* inode blob gets an rcu_head in addition to LSM blobs. */
 	if (blobs->lbs_inode && blob_sizes.lbs_inode == 0)
 		blob_sizes.lbs_inode = sizeof(struct rcu_head);
 	lsm_blob_size_update(&blobs->lbs_inode, &blob_sizes.lbs_inode);
+	lsm_blob_size_update(&blobs->lbs_prop_ref, &blob_sizes.lbs_prop_ref);
+	lsm_blob_size_update(&blobs->lbs_req, &blob_sizes.lbs_req);
+	lsm_blob_size_update(&blobs->lbs_scm, &blob_sizes.lbs_scm);
+	lsm_blob_size_update(&blobs->lbs_sctp_assoc,
+			     &blob_sizes.lbs_sctp_assoc);
 	lsm_blob_size_update(&blobs->lbs_ipc, &blob_sizes.lbs_ipc);
+	lsm_blob_size_update(&blobs->lbs_ipc_namespace,
+			     &blob_sizes.lbs_ipc_namespace);
 	lsm_blob_size_update(&blobs->lbs_key, &blob_sizes.lbs_key);
 	lsm_blob_size_update(&blobs->lbs_msg_msg, &blob_sizes.lbs_msg_msg);
 	lsm_blob_size_update(&blobs->lbs_perf_event,
@@ -308,6 +330,8 @@ static void __init lsm_prepare(struct lsm_info *lsm)
 	lsm_blob_size_update(&blobs->lbs_sock, &blob_sizes.lbs_sock);
 	lsm_blob_size_update(&blobs->lbs_superblock,
 			     &blob_sizes.lbs_superblock);
+	lsm_blob_size_update(&blobs->lbs_kernfs_root,
+			     &blob_sizes.lbs_kernfs_root);
 	lsm_blob_size_update(&blobs->lbs_task, &blob_sizes.lbs_task);
 	lsm_blob_size_update(&blobs->lbs_tun_dev, &blob_sizes.lbs_tun_dev);
 	lsm_blob_size_update(&blobs->lbs_xattr_count,
@@ -315,6 +339,8 @@ static void __init lsm_prepare(struct lsm_info *lsm)
 	lsm_blob_size_update(&blobs->lbs_bdev, &blob_sizes.lbs_bdev);
 	lsm_blob_size_update(&blobs->lbs_bpf_map, &blob_sizes.lbs_bpf_map);
 	lsm_blob_size_update(&blobs->lbs_bpf_prog, &blob_sizes.lbs_bpf_prog);
+	lsm_blob_size_update(&blobs->lbs_bpf_link, &blob_sizes.lbs_bpf_link);
+	lsm_blob_size_update(&blobs->lbs_bpf_btf, &blob_sizes.lbs_bpf_btf);
 	lsm_blob_size_update(&blobs->lbs_bpf_token, &blob_sizes.lbs_bpf_token);
 }
 
@@ -330,7 +356,17 @@ static void __init lsm_init_single(struct lsm_info *lsm)
 		return;
 
 	lsm_pr_dbg("initializing %s\n", lsm->id->name);
+	lsm_initializing = lsm;
 	ret = lsm->init();
+	lsm_initializing = NULL;
+	if (!!(lsm->plan_hooks & LSM_PLAN_CREATE_PREPARE) !=
+	    !!(lsm->plan_hooks & LSM_PLAN_CREATE_FINISH) ||
+	    !!(lsm->plan_hooks & LSM_PLAN_CREATE_PREPARE) !=
+	    !!(lsm->plan_hooks & LSM_PLAN_CREATE_ABORT) ||
+	    !!(lsm->plan_hooks & LSM_PLAN_SETXATTR_PREPARE) !=
+	    !!(lsm->plan_hooks & LSM_PLAN_SETXATTR_FINISH))
+		panic("unpaired plan hooks registered by LSM %s\n",
+		      lsm->id->name);
 	WARN(ret, "%s failed to initialize: %d\n", lsm->id->name, ret);
 }
 
@@ -371,8 +407,34 @@ void __init security_add_hooks(struct security_hook_list *hooks, int count,
 {
 	int i;
 
+	if (!lsm_initializing || lsm_initializing->id != lsmid)
+		panic("hooks registered outside LSM %s initialization\n",
+		      lsmid->name);
+
 	for (i = 0; i < count; i++) {
+		u8 plan_hook = 0;
+
+		if (hooks[i].scalls ==
+		    static_calls_table.inode_create_plan_prepare)
+			plan_hook = LSM_PLAN_CREATE_PREPARE;
+		else if (hooks[i].scalls ==
+			 static_calls_table.inode_create_plan_attempt_abort)
+			plan_hook = LSM_PLAN_CREATE_ABORT;
+		else if (hooks[i].scalls ==
+			 static_calls_table.inode_create_plan_finish)
+			plan_hook = LSM_PLAN_CREATE_FINISH;
+		else if (hooks[i].scalls ==
+			 static_calls_table.inode_setxattr_plan_prepare)
+			plan_hook = LSM_PLAN_SETXATTR_PREPARE;
+		else if (hooks[i].scalls ==
+			 static_calls_table.inode_setxattr_plan_finish)
+			plan_hook = LSM_PLAN_SETXATTR_FINISH;
+		if (plan_hook && (lsm_initializing->plan_hooks & plan_hook))
+			panic("duplicate plan hook registered by LSM %s\n",
+			      lsmid->name);
+		lsm_initializing->plan_hooks |= plan_hook;
 		hooks[i].lsmid = lsmid;
+		hooks[i].lsm_slot = lsm_initializing->slot;
 		if (lsm_static_call_init(&hooks[i]))
 			panic("exhausted LSM callback slots with LSM %s\n",
 			      lsmid->name);
@@ -445,13 +507,27 @@ int __init security_init(void)
 		lsm_pr("blob(file) size %d\n", blob_sizes.lbs_file);
 		lsm_pr("blob(backing_file) size %d\n",
 		       blob_sizes.lbs_backing_file);
+		lsm_pr("blob(mnt) size %d\n", blob_sizes.lbs_mnt);
+		lsm_pr("blob(mnt_topology) size %d\n",
+		       blob_sizes.lbs_mnt_topology);
+		lsm_pr("blob(inode_create_plan) size %d\n",
+		       blob_sizes.lbs_inode_create_plan);
+		lsm_pr("blob(inode_setxattr_plan) size %d\n",
+		       blob_sizes.lbs_inode_setxattr_plan);
 		lsm_pr("blob(ib) size %d\n", blob_sizes.lbs_ib);
 		lsm_pr("blob(inode) size %d\n", blob_sizes.lbs_inode);
+		lsm_pr("blob(prop_ref) size %d\n", blob_sizes.lbs_prop_ref);
 		lsm_pr("blob(ipc) size %d\n", blob_sizes.lbs_ipc);
 		lsm_pr("blob(key) size %d\n", blob_sizes.lbs_key);
 		lsm_pr("blob(msg_msg)_size %d\n", blob_sizes.lbs_msg_msg);
+		lsm_pr("blob(req) size %d\n", blob_sizes.lbs_req);
+		lsm_pr("blob(scm) size %d\n", blob_sizes.lbs_scm);
+		lsm_pr("blob(sctp_assoc) size %d\n",
+		       blob_sizes.lbs_sctp_assoc);
 		lsm_pr("blob(sock) size %d\n", blob_sizes.lbs_sock);
 		lsm_pr("blob(superblock) size %d\n", blob_sizes.lbs_superblock);
+		lsm_pr("blob(kernfs_root) size %d\n",
+		       blob_sizes.lbs_kernfs_root);
 		lsm_pr("blob(perf_event) size %d\n", blob_sizes.lbs_perf_event);
 		lsm_pr("blob(task) size %d\n", blob_sizes.lbs_task);
 		lsm_pr("blob(tun_dev) size %d\n", blob_sizes.lbs_tun_dev);
@@ -459,6 +535,8 @@ int __init security_init(void)
 		lsm_pr("blob(bdev) size %d\n", blob_sizes.lbs_bdev);
 		lsm_pr("blob(bpf_map) size %d\n", blob_sizes.lbs_bpf_map);
 		lsm_pr("blob(bpf_prog) size %d\n", blob_sizes.lbs_bpf_prog);
+		lsm_pr("blob(bpf_link) size %d\n", blob_sizes.lbs_bpf_link);
+		lsm_pr("blob(bpf_btf) size %d\n", blob_sizes.lbs_bpf_btf);
 		lsm_pr("blob(bpf_token) size %d\n", blob_sizes.lbs_bpf_token);
 	}
 

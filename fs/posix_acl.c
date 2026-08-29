@@ -1082,8 +1082,9 @@ static int vfs_set_acl_idmapped_mnt(struct mnt_idmap *idmap,
 }
 
 /**
- * vfs_set_acl - set posix acls
+ * vfs_set_acl_mnt - set posix acls
  * @idmap: idmap of the mount
+ * @mnt: mount selecting the LSM label view
  * @dentry: the dentry based on which to set the posix acls
  * @acl_name: the name of the posix acl
  * @kacl: the posix acls in the appropriate VFS format
@@ -1093,8 +1094,9 @@ static int vfs_set_acl_idmapped_mnt(struct mnt_idmap *idmap,
  *
  * Return: On success 0, on error negative errno.
  */
-int vfs_set_acl(struct mnt_idmap *idmap, struct dentry *dentry,
-		const char *acl_name, struct posix_acl *kacl)
+int vfs_set_acl_mnt(struct mnt_idmap *idmap, const struct vfsmount *mnt,
+		    struct dentry *dentry, const char *acl_name,
+		    struct posix_acl *kacl)
 {
 	int acl_type;
 	int error;
@@ -1129,7 +1131,7 @@ retry_deleg:
 	if (error)
 		goto out_inode_unlock;
 
-	error = security_inode_set_acl(idmap, dentry, acl_name, kacl);
+	error = security_inode_set_acl_mnt(idmap, mnt, dentry, acl_name, kacl);
 	if (error)
 		goto out_inode_unlock;
 
@@ -1157,11 +1159,19 @@ out_inode_unlock:
 
 	return error;
 }
+EXPORT_SYMBOL_GPL(vfs_set_acl_mnt);
+
+int vfs_set_acl(struct mnt_idmap *idmap, struct dentry *dentry,
+		const char *acl_name, struct posix_acl *kacl)
+{
+	return vfs_set_acl_mnt(idmap, NULL, dentry, acl_name, kacl);
+}
 EXPORT_SYMBOL_GPL(vfs_set_acl);
 
 /**
- * vfs_get_acl - get posix acls
+ * vfs_get_acl_mnt - get posix acls
  * @idmap: idmap of the mount
+ * @mnt: mount selecting the LSM label view
  * @dentry: the dentry based on which to retrieve the posix acls
  * @acl_name: the name of the posix acl
  *
@@ -1170,8 +1180,9 @@ EXPORT_SYMBOL_GPL(vfs_set_acl);
  *
  * Return: On success POSIX ACLs in VFS format, on error negative errno.
  */
-struct posix_acl *vfs_get_acl(struct mnt_idmap *idmap,
-			      struct dentry *dentry, const char *acl_name)
+struct posix_acl *vfs_get_acl_mnt(struct mnt_idmap *idmap,
+				  const struct vfsmount *mnt,
+				  struct dentry *dentry, const char *acl_name)
 {
 	struct inode *inode = d_inode(dentry);
 	struct posix_acl *acl;
@@ -1185,7 +1196,7 @@ struct posix_acl *vfs_get_acl(struct mnt_idmap *idmap,
 	 * The VFS has no restrictions on reading POSIX ACLs so calling
 	 * something like xattr_permission() isn't needed. Only LSMs get a say.
 	 */
-	error = security_inode_get_acl(idmap, dentry, acl_name);
+	error = security_inode_get_acl_mnt(idmap, mnt, dentry, acl_name);
 	if (error)
 		return ERR_PTR(error);
 
@@ -1202,11 +1213,19 @@ struct posix_acl *vfs_get_acl(struct mnt_idmap *idmap,
 
 	return acl;
 }
+EXPORT_SYMBOL_GPL(vfs_get_acl_mnt);
+
+struct posix_acl *vfs_get_acl(struct mnt_idmap *idmap,
+			      struct dentry *dentry, const char *acl_name)
+{
+	return vfs_get_acl_mnt(idmap, NULL, dentry, acl_name);
+}
 EXPORT_SYMBOL_GPL(vfs_get_acl);
 
 /**
- * vfs_remove_acl - remove posix acls
+ * vfs_remove_acl_mnt - remove posix acls
  * @idmap: idmap of the mount
+ * @mnt: mount selecting the LSM label view
  * @dentry: the dentry based on which to retrieve the posix acls
  * @acl_name: the name of the posix acl
  *
@@ -1214,8 +1233,8 @@ EXPORT_SYMBOL_GPL(vfs_get_acl);
  *
  * Return: On success 0, on error negative errno.
  */
-int vfs_remove_acl(struct mnt_idmap *idmap, struct dentry *dentry,
-		   const char *acl_name)
+int vfs_remove_acl_mnt(struct mnt_idmap *idmap, const struct vfsmount *mnt,
+		       struct dentry *dentry, const char *acl_name)
 {
 	int acl_type;
 	int error;
@@ -1237,7 +1256,7 @@ retry_deleg:
 	if (error)
 		goto out_inode_unlock;
 
-	error = security_inode_remove_acl(idmap, dentry, acl_name);
+	error = security_inode_remove_acl_mnt(idmap, mnt, dentry, acl_name);
 	if (error)
 		goto out_inode_unlock;
 
@@ -1265,10 +1284,18 @@ out_inode_unlock:
 
 	return error;
 }
+EXPORT_SYMBOL_GPL(vfs_remove_acl_mnt);
+
+int vfs_remove_acl(struct mnt_idmap *idmap, struct dentry *dentry,
+		   const char *acl_name)
+{
+	return vfs_remove_acl_mnt(idmap, NULL, dentry, acl_name);
+}
 EXPORT_SYMBOL_GPL(vfs_remove_acl);
 
-int do_set_acl(struct mnt_idmap *idmap, struct dentry *dentry,
-	       const char *acl_name, const void *kvalue, size_t size)
+int do_set_acl(struct mnt_idmap *idmap, const struct vfsmount *mnt,
+	       struct dentry *dentry, const char *acl_name,
+	       const void *kvalue, size_t size)
 {
 	int error;
 	struct posix_acl *acl = NULL;
@@ -1283,18 +1310,19 @@ int do_set_acl(struct mnt_idmap *idmap, struct dentry *dentry,
 			return PTR_ERR(acl);
 	}
 
-	error = vfs_set_acl(idmap, dentry, acl_name, acl);
+	error = vfs_set_acl_mnt(idmap, mnt, dentry, acl_name, acl);
 	posix_acl_release(acl);
 	return error;
 }
 
-ssize_t do_get_acl(struct mnt_idmap *idmap, struct dentry *dentry,
-		   const char *acl_name, void *kvalue, size_t size)
+ssize_t do_get_acl(struct mnt_idmap *idmap, const struct vfsmount *mnt,
+		   struct dentry *dentry, const char *acl_name, void *kvalue,
+		   size_t size)
 {
 	ssize_t error;
 	struct posix_acl *acl;
 
-	acl = vfs_get_acl(idmap, dentry, acl_name);
+	acl = vfs_get_acl_mnt(idmap, mnt, dentry, acl_name);
 	if (IS_ERR(acl))
 		return PTR_ERR(acl);
 

@@ -318,7 +318,8 @@ int ovl_permission(struct mnt_idmap *idmap,
 	}
 
 	with_ovl_creds(inode->i_sb)
-		return inode_permission(mnt_idmap(realpath.mnt), realinode, mask);
+		return inode_permission_mnt(mnt_idmap(realpath.mnt), realpath.mnt,
+					    realinode, mask);
 }
 
 static const char *ovl_get_link(struct dentry *dentry,
@@ -398,7 +399,8 @@ struct posix_acl *ovl_get_acl_path(const struct path *path,
 	if (noperm)
 		real_acl = get_inode_acl(realinode, posix_acl_type(acl_name));
 	else
-		real_acl = vfs_get_acl(idmap, path->dentry, acl_name);
+		real_acl = vfs_get_acl_mnt(idmap, path->mnt, path->dentry,
+				       acl_name);
 	if (IS_ERR_OR_NULL(real_acl))
 		return real_acl;
 
@@ -486,7 +488,9 @@ static int ovl_set_or_remove_acl(struct dentry *dentry, struct inode *inode,
 
 		ovl_path_lower(dentry, &realpath);
 		with_ovl_creds(dentry->d_sb)
-			real_acl = vfs_get_acl(mnt_idmap(realpath.mnt), realdentry, acl_name);
+			real_acl = vfs_get_acl_mnt(mnt_idmap(realpath.mnt),
+					       realpath.mnt, realdentry,
+					       acl_name);
 		if (IS_ERR(real_acl)) {
 			err = PTR_ERR(real_acl);
 			goto out;
@@ -631,7 +635,8 @@ int ovl_real_fileattr_set(const struct path *realpath, struct file_kattr *fa)
 	if (err)
 		return err;
 
-	return vfs_fileattr_set(mnt_idmap(realpath->mnt), realpath->dentry, fa);
+	return vfs_fileattr_set_mnt(mnt_idmap(realpath->mnt), realpath->mnt,
+				    realpath->dentry, fa);
 }
 
 int ovl_fileattr_set(struct mnt_idmap *idmap,
@@ -705,7 +710,7 @@ int ovl_real_fileattr_get(const struct path *realpath, struct file_kattr *fa)
 	if (err)
 		return err;
 
-	err = vfs_fileattr_get(realpath->dentry, fa);
+	err = vfs_fileattr_get_mnt(realpath->mnt, realpath->dentry, fa);
 	if (err == -ENOIOCTLCMD)
 		err = -ENOTTY;
 	return err;

@@ -68,11 +68,147 @@
 #include "audit.h"
 #include "policycap_names.h"
 #include "ima.h"
+#include "label.h"
+#include "resource.h"
 
 struct selinux_policy_convert_data {
 	struct convert_context_args args;
 	struct sidtab_convert_params sidtab_params;
 };
+
+#define SELINUX_POLICY_SNAPSHOT_READ_RETRIES 3
+
+static unsigned long security_policycaps_collect(const struct policydb *policydb)
+{
+	unsigned long policycaps = 0;
+	unsigned int i;
+
+	BUILD_BUG_ON(__POLICYDB_CAP_MAX > BITS_PER_LONG);
+	for (i = 0; i < __POLICYDB_CAP_MAX; i++)
+		if (ebitmap_get_bit(&policydb->policycaps, i))
+			policycaps |= 1UL << i;
+	return policycaps;
+}
+
+static void selinux_policy_effective_digest(struct selinux_policy *policy)
+{
+	static const char domain[] = "SELinux effective policy v1\0";
+	struct sha256_ctx ctx;
+	__le32 bool_count = cpu_to_le32(policy->policydb.p_bools.nprim);
+	u32 i;
+
+	sha256_init(&ctx);
+	sha256_update(&ctx, domain, sizeof(domain));
+	sha256_update(&ctx, policy->binary_digest,
+		      sizeof(policy->binary_digest));
+	sha256_update(&ctx, (u8 *)&bool_count, sizeof(bool_count));
+	for (i = 0; i < policy->policydb.p_bools.nprim; i++) {
+		u8 value = !!policy->policydb.bool_val_to_struct[i]->state;
+
+		sha256_update(&ctx, &value, sizeof(value));
+	}
+	sha256_final(&ctx, policy->effective_digest);
+}
+
+#ifdef CONFIG_SECURITY_SELINUX_KUNIT_TEST
+void selinux_kunit_policy_effective_digest(struct selinux_policy *policy)
+{
+	selinux_policy_effective_digest(policy);
+}
+#endif
+
+int selinux_policy_snapshot_read(struct selinux_state *state,
+				 struct selinux_policy_snapshot *snapshot)
+{
+	const struct selinux_policy *policy, *verify;
+	unsigned int retry;
+	bool active, initialized, verify_active, verify_initialized;
+	u64 epoch;
+
+	if (WARN_ON_ONCE(!state || !snapshot))
+		return -EINVAL;
+	memset(snapshot, 0, sizeof(*snapshot));
+
+	for (retry = 0; retry < SELINUX_POLICY_SNAPSHOT_READ_RETRIES; retry++) {
+		epoch = selinux_chain_epoch_read(state);
+		if (!epoch)
+			return -EOVERFLOW;
+
+		rcu_read_lock();
+		policy = rcu_dereference(state->policy);
+		initialized = selinux_initialized(state);
+		active = selinux_state_active(state);
+		snapshot->policy_cookie = policy;
+		snapshot->initialized = initialized;
+		snapshot->active = active;
+		if (policy) {
+			snapshot->policycaps = policy->policycaps;
+			snapshot->seqno = policy->latest_granting;
+			memcpy(snapshot->effective_digest, policy->effective_digest,
+			       sizeof(snapshot->effective_digest));
+		} else {
+			snapshot->policycaps = 0;
+			snapshot->seqno = 0;
+		}
+		verify = rcu_dereference(state->policy);
+		verify_initialized = selinux_initialized(state);
+		verify_active = selinux_state_active(state);
+		snapshot->chain_epoch = selinux_chain_epoch_read(state);
+		rcu_read_unlock();
+
+		if (policy == verify && initialized == verify_initialized &&
+		    active == verify_active &&
+		    epoch == snapshot->chain_epoch)
+			return 0;
+		cpu_relax();
+	}
+
+	return -EAGAIN;
+}
+
+bool selinux_policy_snapshot_valid(
+	struct selinux_state *state,
+	const struct selinux_policy_snapshot *snapshot)
+{
+	const struct selinux_policy *policy;
+	bool valid;
+
+	if (!state || !snapshot || !snapshot->chain_epoch)
+		return false;
+	if (snapshot->chain_epoch != selinux_chain_epoch_read(state))
+		return false;
+	if (snapshot->initialized != selinux_initialized(state))
+		return false;
+	if (snapshot->active != selinux_state_active(state))
+		return false;
+
+	rcu_read_lock();
+	policy = rcu_dereference(state->policy);
+	valid = policy == snapshot->policy_cookie;
+	if (valid && policy)
+		valid = policy->latest_granting == snapshot->seqno &&
+			policy->policycaps == snapshot->policycaps &&
+			!memcmp(policy->effective_digest,
+				snapshot->effective_digest,
+				SHA256_DIGEST_SIZE);
+	else if (valid)
+		valid = !snapshot->seqno && !snapshot->policycaps;
+	rcu_read_unlock();
+
+	return valid && snapshot->initialized == selinux_initialized(state) &&
+	       snapshot->active == selinux_state_active(state) &&
+	       snapshot->chain_epoch == selinux_chain_epoch_read(state);
+}
+
+bool selinux_policycap_enabled(struct selinux_state *state, unsigned int cap)
+{
+	struct selinux_policy_snapshot snapshot;
+
+	if (cap >= __POLICYDB_CAP_MAX ||
+	    selinux_policy_snapshot_read(state, &snapshot))
+		return false;
+	return selinux_policy_snapshot_has_cap(&snapshot, cap);
+}
 
 /* Forward declaration. */
 static int sidtab_entry_to_string(struct policydb *policydb,
@@ -828,6 +964,78 @@ int selinux_ss_validate_transition(struct selinux_state *state,
 {
 	return security_compute_validatetrans(state, oldsid, newsid, tasksid,
 					      orig_tclass, false);
+}
+
+int selinux_ss_validate_transition_snapshot_noaudit(
+	struct selinux_state *state,
+	const struct selinux_policy_snapshot *snapshot, u32 oldsid, u32 newsid,
+	u32 tasksid, u16 orig_tclass,
+	enum selinux_validatetrans_decision *decision)
+{
+	struct selinux_policy *policy;
+	struct policydb *policydb;
+	struct sidtab *sidtab;
+	struct sidtab_entry *oentry, *nentry, *tentry;
+	struct class_datum *tclass_datum;
+	struct constraint_node *constraint;
+	u16 tclass;
+	bool denied = false;
+	int rc = 0;
+
+	if (WARN_ON_ONCE(!state || !snapshot || !decision))
+		return -EINVAL;
+	*decision = SELINUX_VALIDATETRANS_ALLOWED;
+	if (!selinux_policy_snapshot_valid(state, snapshot))
+		return -ESTALE;
+	if (!snapshot->initialized)
+		return selinux_policy_snapshot_valid(state, snapshot) ? 0 : -ESTALE;
+
+	rcu_read_lock();
+	policy = rcu_dereference(state->policy);
+	if (policy != snapshot->policy_cookie) {
+		rc = -ESTALE;
+		goto out;
+	}
+	if (!policy) {
+		rc = -EINVAL;
+		goto out;
+	}
+	policydb = &policy->policydb;
+	sidtab = policy->sidtab;
+	tclass = unmap_class(&policy->map, orig_tclass);
+	if (!tclass || tclass > policydb->p_classes.nprim) {
+		rc = -EINVAL;
+		goto out;
+	}
+	tclass_datum = policydb->class_val_to_struct[tclass - 1];
+	oentry = sidtab_search_entry(sidtab, oldsid);
+	nentry = sidtab_search_entry(sidtab, newsid);
+	tentry = sidtab_search_entry(sidtab, tasksid);
+	if (!oentry || !nentry || !tentry) {
+		rc = -EINVAL;
+		goto out;
+	}
+
+	for (constraint = tclass_datum->validatetrans; constraint;
+	     constraint = constraint->next) {
+		if (!constraint_expr_eval(policydb, &oentry->context,
+					  &nentry->context, &tentry->context,
+					  constraint->expr)) {
+			denied = true;
+			break;
+		}
+	}
+	if (denied)
+		*decision = enforcing_enabled(state) ?
+			SELINUX_VALIDATETRANS_DENIED_ENFORCING :
+			SELINUX_VALIDATETRANS_DENIED_PERMISSIVE;
+out:
+	if (!selinux_policy_snapshot_valid(state, snapshot)) {
+		*decision = SELINUX_VALIDATETRANS_ALLOWED;
+		rc = -ESTALE;
+	}
+	rcu_read_unlock();
+	return rc;
 }
 
 /*
@@ -2037,7 +2245,7 @@ static inline int convert_context_handle_invalid_context(
 	if (enforcing_enabled(state))
 		return -EINVAL;
 
-	if (!context->str) {
+	if (context->str) {
 		pr_warn("SELinux:  Context %s would be invalid if enforcing\n",
 			context->str);
 	}
@@ -2089,23 +2297,18 @@ int services_convert_context(struct convert_context_args *args,
 	return 0;
 }
 
-static void security_load_policycaps(struct selinux_state *state,
-				struct selinux_policy *policy)
+static void security_log_policycaps(const struct selinux_policy *policy)
 {
-	struct policydb *p;
+	const struct policydb *p;
 	unsigned int i;
 	struct ebitmap_node *node;
 
 	p = &policy->policydb;
 
-	for (i = 0; i < ARRAY_SIZE(state->policycap); i++)
-		WRITE_ONCE(state->policycap[i],
-			ebitmap_get_bit(&p->policycaps, i));
-
 	for (i = 0; i < ARRAY_SIZE(selinux_policycap_names); i++)
 		pr_info("SELinux:  policy capability %s=%d\n",
 			selinux_policycap_names[i],
-			ebitmap_get_bit(&p->policycaps, i));
+			!!(policy->policycaps & (1UL << i)));
 
 	ebitmap_for_each_positive_bit(&p->policycaps, node, i) {
 		if (i >= ARRAY_SIZE(selinux_policycap_names))
@@ -2117,6 +2320,84 @@ static void security_load_policycaps(struct selinux_state *state,
 static int security_preserve_bools(struct selinux_policy *oldpolicy,
 				struct selinux_policy *newpolicy);
 
+/*
+ * Parsed-policy allocations are data-dependent and can be substantially
+ * larger than a small serialized input.  Charge a fixed admission slot equal
+ * to the largest accepted binary before parsing, rather than charging only
+ * the attacker-selected input length.  This gives a hard aggregate bound with
+ * O(1) reserve/release and also accounts for the old/new overlap during
+ * reload.
+ */
+static int selinux_policy_resource_reserve(struct selinux_state *state,
+					   struct selinux_policy *policy)
+{
+	struct selinux_resource_account *resources;
+	u64 bytes = CONFIG_SECURITY_SELINUX_POLICY_MAX_BYTES;
+	int rc;
+
+	if (WARN_ON_ONCE(!state || !state->label_domain || !policy))
+		return -EINVAL;
+	resources = selinux_resource_account_get(
+		state->label_domain->resources);
+	if (!resources)
+		return -EINVAL;
+	rc = selinux_resource_reserve(resources, SELINUX_RESOURCE_POLICY, 1,
+				      bytes);
+	if (rc) {
+		selinux_resource_account_put(resources);
+		return rc;
+	}
+	policy->resources = resources;
+	policy->resource_bytes = bytes;
+	return 0;
+}
+
+static void selinux_policy_resource_release(struct selinux_policy *policy)
+{
+	struct selinux_resource_account *resources;
+	u64 bytes;
+
+	if (!policy || !policy->resources)
+		return;
+	resources = policy->resources;
+	bytes = policy->resource_bytes;
+	policy->resources = NULL;
+	policy->resource_bytes = 0;
+	selinux_resource_release(resources, SELINUX_RESOURCE_POLICY, 1, bytes);
+	selinux_resource_account_put(resources);
+}
+
+static void selinux_policy_resource_transfer(struct selinux_policy *oldpolicy,
+					     struct selinux_policy *newpolicy)
+{
+	/* kmemdup() copied the token but did not acquire a second ownership. */
+	if (WARN_ON_ONCE(!oldpolicy || !newpolicy ||
+			 oldpolicy->resources != newpolicy->resources ||
+			 oldpolicy->resource_bytes != newpolicy->resource_bytes))
+		return;
+	oldpolicy->resources = NULL;
+	oldpolicy->resource_bytes = 0;
+}
+
+#ifdef CONFIG_SECURITY_SELINUX_KUNIT_TEST
+int selinux_kunit_policy_resource_reserve(struct selinux_state *state,
+					  struct selinux_policy *policy)
+{
+	return selinux_policy_resource_reserve(state, policy);
+}
+
+void selinux_kunit_policy_resource_release(struct selinux_policy *policy)
+{
+	selinux_policy_resource_release(policy);
+}
+
+void selinux_kunit_policy_resource_transfer(struct selinux_policy *oldpolicy,
+					    struct selinux_policy *newpolicy)
+{
+	selinux_policy_resource_transfer(oldpolicy, newpolicy);
+}
+#endif
+
 void selinux_policy_free(struct selinux_policy *policy)
 {
 	if (!policy)
@@ -2126,6 +2407,7 @@ void selinux_policy_free(struct selinux_policy *policy)
 	kfree(policy->map.mapping);
 	policydb_destroy(&policy->policydb);
 	kfree(policy->sidtab);
+	selinux_policy_resource_release(policy);
 	kfree(policy);
 }
 
@@ -2147,6 +2429,7 @@ void selinux_state_policy_free(struct selinux_state *state)
 static void selinux_policy_cond_free(struct selinux_policy *policy)
 {
 	cond_policydb_destroy_dup(&policy->policydb);
+	selinux_policy_resource_release(policy);
 	kfree(policy);
 }
 
@@ -2203,6 +2486,7 @@ void selinux_policy_commit(struct selinux_state *state,
 	seqno = newpolicy->latest_granting;
 
 	/* Install the new policy. */
+	selinux_chain_epoch_bump(state);
 	if (oldpolicy) {
 		sidtab_freeze_begin(oldpolicy->sidtab, &flags);
 		rcu_assign_pointer(state->policy, newpolicy);
@@ -2211,8 +2495,8 @@ void selinux_policy_commit(struct selinux_state *state,
 		rcu_assign_pointer(state->policy, newpolicy);
 	}
 
-	/* Load the policycaps from the new policy */
-	security_load_policycaps(state, newpolicy);
+	/* Report the capabilities from the policy object just published. */
+	security_log_policycaps(newpolicy);
 
 	if (!selinux_initialized(state)) {
 		/*
@@ -2221,7 +2505,14 @@ void selinux_policy_commit(struct selinux_state *state,
 		 * any objects created prior to policy load are then labeled.
 		 */
 		selinux_mark_initialized(state);
-		selinux_complete_init();
+		/*
+		 * A two-phase namespace is deliberately invisible to credentials and
+		 * mounts until its parent seals the boundary map.  Running the ambient
+		 * superblock completion callback while it is dormant would label objects
+		 * with the configuring parent's policy.
+		 */
+		if (selinux_state_active(state))
+			selinux_complete_init();
 	}
 
 	/* Free the old policy */
@@ -2256,6 +2547,9 @@ int security_load_policy(struct selinux_state *state, void *data, size_t len,
 	newpolicy = kzalloc_obj(*newpolicy);
 	if (!newpolicy)
 		return -ENOMEM;
+	rc = selinux_policy_resource_reserve(state, newpolicy);
+	if (rc)
+		goto err_policy;
 
 	newpolicy->sidtab = kzalloc_obj(*newpolicy->sidtab);
 	if (!newpolicy->sidtab) {
@@ -2266,6 +2560,9 @@ int security_load_policy(struct selinux_state *state, void *data, size_t len,
 	rc = policydb_read(&newpolicy->policydb, fp);
 	if (rc)
 		goto err_sidtab;
+	newpolicy->policycaps =
+		security_policycaps_collect(&newpolicy->policydb);
+	sha256(data, len, newpolicy->binary_digest);
 
 	newpolicy->policydb.len = len;
 	rc = selinux_set_mapping(&newpolicy->policydb, secclass_map,
@@ -2281,6 +2578,7 @@ int security_load_policy(struct selinux_state *state, void *data, size_t len,
 
 	if (!selinux_initialized(state)) {
 		/* First policy load, so no need to preserve state from old policy */
+		selinux_policy_effective_digest(newpolicy);
 		load_state->policy = newpolicy;
 		load_state->convert_data = NULL;
 		return 0;
@@ -2295,6 +2593,7 @@ int security_load_policy(struct selinux_state *state, void *data, size_t len,
 		pr_err("SELinux:  unable to preserve booleans\n");
 		goto err_free_isids;
 	}
+	selinux_policy_effective_digest(newpolicy);
 
 	/*
 	 * Convert the internal representations of contexts
@@ -2337,6 +2636,7 @@ err_policydb:
 err_sidtab:
 	kfree(newpolicy->sidtab);
 err_policy:
+	selinux_policy_resource_release(newpolicy);
 	kfree(newpolicy);
 
 	return rc;
@@ -2809,6 +3109,28 @@ int selinux_ss_policy_genfs_sid(struct selinux_policy *policy,
 	return __security_genfs_sid(policy, fstype, path, orig_sclass, sid);
 }
 
+int selinux_ss_policy_sid_to_context(struct selinux_policy *policy, u32 sid,
+				     const char **scontext,
+				     u32 *scontext_len)
+{
+	struct sidtab_entry *entry;
+
+	if (!policy || !scontext || !scontext_len)
+		return -EINVAL;
+
+	/*
+	 * The policy is staged and still private to the load transaction, so no
+	 * RCU read-side section is needed.  Require the exact entry: silently
+	 * substituting the unlabeled SID would lose the producer's provenance.
+	 */
+	entry = sidtab_search_entry_exact(policy->sidtab, sid);
+	if (!entry)
+		return -EINVAL;
+
+	return sidtab_entry_to_string(&policy->policydb, policy->sidtab, entry,
+				      scontext, scontext_len);
+}
+
 /**
  * selinux_ss_fs_use - Determine how to handle labeling for a filesystem.
  * @state: SELinux state
@@ -2977,13 +3299,16 @@ int security_set_bools(struct selinux_state *state, u32 len,
 
 	/* Re-evaluate the conditional rules in the copy */
 	evaluate_cond_nodes(&newpolicy->policydb);
+	selinux_policy_effective_digest(newpolicy);
 
 	/* Set latest granting seqno for new policy */
 	newpolicy->latest_granting = oldpolicy->latest_granting + 1;
 	seqno = newpolicy->latest_granting;
 
 	/* Install the new policy */
+	selinux_chain_epoch_bump(state);
 	rcu_assign_pointer(state->policy, newpolicy);
+	selinux_policy_resource_transfer(oldpolicy, newpolicy);
 
 	/*
 	 * Free the conditional portions of the old policydb
@@ -3404,28 +3729,35 @@ int security_get_allow_unknown(struct selinux_state *state)
 int security_policycap_supported(struct selinux_state *state,
 				 unsigned int req_cap)
 {
-	struct selinux_policy *policy;
-	int rc;
-
 	if (!selinux_initialized(state))
 		return 0;
-
-	rcu_read_lock();
-	policy = rcu_dereference(state->policy);
-	rc = ebitmap_get_bit(&policy->policydb.policycaps, req_cap);
-	rcu_read_unlock();
-
-	return rc;
+	return selinux_policycap_enabled(state, req_cap);
 }
 
 struct selinux_audit_rule {
-	u32 au_seqno;
+	struct selinux_state *state;
+	struct selinux_policy_snapshot snapshot;
 	struct context au_ctxt;
 };
 
-int selinux_audit_rule_avc_callback(u32 event)
+static bool selinux_audit_rule_state_is_owner(struct selinux_state *state)
 {
-	if (event == AVC_CALLBACK_RESET)
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	return state == init_selinux_state;
+#else
+	return true;
+#endif
+}
+
+static bool selinux_audit_rule_avc_is_owner(struct selinux_avc *avc)
+{
+	return init_selinux_state && avc == init_selinux_state->avc;
+}
+
+int selinux_audit_rule_avc_callback(struct selinux_avc *avc, u32 event)
+{
+	if (event == AVC_CALLBACK_RESET &&
+	    selinux_audit_rule_avc_is_owner(avc))
 		return audit_update_lsm_rules();
 	return 0;
 }
@@ -3436,8 +3768,16 @@ void selinux_audit_rule_free(void *vrule)
 
 	if (rule) {
 		context_destroy(&rule->au_ctxt);
+		put_selinux_state(rule->state);
 		kfree(rule);
 	}
+}
+
+struct selinux_state *selinux_audit_rule_state(void *vrule)
+{
+	struct selinux_audit_rule *rule = vrule;
+
+	return rule ? rule->state : NULL;
 }
 
 int selinux_audit_rule_init(u32 field, u32 op, char *rulestr, void **vrule,
@@ -3451,10 +3791,13 @@ int selinux_audit_rule_init(u32 field, u32 op, char *rulestr, void **vrule,
 	struct type_datum *typedatum;
 	struct user_datum *userdatum;
 	struct selinux_audit_rule **rule = (struct selinux_audit_rule **)vrule;
+	unsigned int retry;
 	int rc = 0;
 
 	*rule = NULL;
 
+	if (!selinux_audit_rule_state_is_owner(state))
+		return -EOPNOTSUPP;
 	if (!selinux_initialized(state))
 		return -EOPNOTSUPP;
 
@@ -3486,56 +3829,87 @@ int selinux_audit_rule_init(u32 field, u32 op, char *rulestr, void **vrule,
 	if (!tmprule)
 		return -ENOMEM;
 	context_init(&tmprule->au_ctxt);
+	tmprule->state = get_selinux_state(state);
 
-	rcu_read_lock();
-	policy = rcu_dereference(state->policy);
-	policydb = &policy->policydb;
-	tmprule->au_seqno = policy->latest_granting;
-	switch (field) {
-	case AUDIT_SUBJ_USER:
-	case AUDIT_OBJ_USER:
-		userdatum = symtab_search(&policydb->p_users, rulestr);
-		if (!userdatum) {
-			rc = -EINVAL;
-			goto err;
+	for (retry = 0; retry < SELINUX_POLICY_SNAPSHOT_READ_RETRIES; retry++) {
+		if (retry) {
+			context_destroy(&tmprule->au_ctxt);
+			context_init(&tmprule->au_ctxt);
 		}
-		tmprule->au_ctxt.user = userdatum->value;
-		break;
-	case AUDIT_SUBJ_ROLE:
-	case AUDIT_OBJ_ROLE:
-		roledatum = symtab_search(&policydb->p_roles, rulestr);
-		if (!roledatum) {
-			rc = -EINVAL;
-			goto err;
+		rc = selinux_policy_snapshot_read(state, &tmprule->snapshot);
+		if (rc) {
+			if (rc == -EAGAIN)
+				continue;
+			goto err_rule;
 		}
-		tmprule->au_ctxt.role = roledatum->value;
-		break;
-	case AUDIT_SUBJ_TYPE:
-	case AUDIT_OBJ_TYPE:
-		typedatum = symtab_search(&policydb->p_types, rulestr);
-		if (!typedatum) {
-			rc = -EINVAL;
-			goto err;
+
+		rcu_read_lock();
+		policy = rcu_dereference(state->policy);
+		if (policy != tmprule->snapshot.policy_cookie ||
+		    policy->latest_granting != tmprule->snapshot.seqno ||
+		    policy->policycaps != tmprule->snapshot.policycaps ||
+		    selinux_chain_epoch_read(state) !=
+			    tmprule->snapshot.chain_epoch)
+			goto retry_unlock;
+		policydb = &policy->policydb;
+		switch (field) {
+		case AUDIT_SUBJ_USER:
+		case AUDIT_OBJ_USER:
+			userdatum = symtab_search(&policydb->p_users, rulestr);
+			if (!userdatum) {
+				rc = -EINVAL;
+				goto err;
+			}
+			tmprule->au_ctxt.user = userdatum->value;
+			break;
+		case AUDIT_SUBJ_ROLE:
+		case AUDIT_OBJ_ROLE:
+			roledatum = symtab_search(&policydb->p_roles, rulestr);
+			if (!roledatum) {
+				rc = -EINVAL;
+				goto err;
+			}
+			tmprule->au_ctxt.role = roledatum->value;
+			break;
+		case AUDIT_SUBJ_TYPE:
+		case AUDIT_OBJ_TYPE:
+			typedatum = symtab_search(&policydb->p_types, rulestr);
+			if (!typedatum) {
+				rc = -EINVAL;
+				goto err;
+			}
+			tmprule->au_ctxt.type = typedatum->value;
+			break;
+		case AUDIT_SUBJ_SEN:
+		case AUDIT_SUBJ_CLR:
+		case AUDIT_OBJ_LEV_LOW:
+		case AUDIT_OBJ_LEV_HIGH:
+			rc = mls_from_string(policydb, rulestr,
+					     &tmprule->au_ctxt, GFP_ATOMIC);
+			if (rc)
+				goto err;
+			break;
 		}
-		tmprule->au_ctxt.type = typedatum->value;
-		break;
-	case AUDIT_SUBJ_SEN:
-	case AUDIT_SUBJ_CLR:
-	case AUDIT_OBJ_LEV_LOW:
-	case AUDIT_OBJ_LEV_HIGH:
-		rc = mls_from_string(policydb, rulestr, &tmprule->au_ctxt,
-				     GFP_ATOMIC);
-		if (rc)
-			goto err;
-		break;
+		if (policy != rcu_dereference(state->policy) ||
+		    policy->latest_granting != tmprule->snapshot.seqno ||
+		    policy->policycaps != tmprule->snapshot.policycaps ||
+		    selinux_chain_epoch_read(state) !=
+			    tmprule->snapshot.chain_epoch)
+			goto retry_unlock;
+		rcu_read_unlock();
+
+		*rule = tmprule;
+		return 0;
+
+retry_unlock:
+		rcu_read_unlock();
 	}
-	rcu_read_unlock();
-
-	*rule = tmprule;
-	return 0;
+	rc = -EAGAIN;
+	goto err_rule;
 
 err:
 	rcu_read_unlock();
+err_rule:
 	selinux_audit_rule_free(tmprule);
 	*rule = NULL;
 	return rc;
@@ -3566,9 +3940,11 @@ int selinux_audit_rule_known(struct audit_krule *rule)
 	return 0;
 }
 
-int selinux_ss_audit_rule_match(struct lsm_prop *prop, u32 field, u32 op, void *vrule)
+static int __selinux_ss_audit_rule_match(const struct lsm_prop *prop, u32 field,
+					 u32 op, void *vrule,
+					 bool require_global_owner)
 {
-	struct selinux_state *state = current_selinux_state;
+	struct selinux_state *state;
 	struct selinux_policy *policy;
 	struct context *ctxt;
 	struct mls_level *level;
@@ -3579,15 +3955,25 @@ int selinux_ss_audit_rule_match(struct lsm_prop *prop, u32 field, u32 op, void *
 		WARN_ONCE(1, "selinux_audit_rule_match: missing rule\n");
 		return -ENOENT;
 	}
+	state = rule->state;
+	if (unlikely(!state ||
+		     (require_global_owner &&
+		      !selinux_audit_rule_state_is_owner(state))))
+		return -ESTALE;
 
 	if (!selinux_initialized(state))
 		return 0;
+	if (!rule->snapshot.chain_epoch ||
+	    rule->snapshot.chain_epoch != selinux_chain_epoch_read(state))
+		return -ESTALE;
 
 	rcu_read_lock();
 
 	policy = rcu_dereference(state->policy);
 
-	if (rule->au_seqno < policy->latest_granting) {
+	if (policy != rule->snapshot.policy_cookie ||
+	    policy->latest_granting != rule->snapshot.seqno ||
+	    policy->policycaps != rule->snapshot.policycaps) {
 		match = -ESTALE;
 		goto out;
 	}
@@ -3676,21 +4062,71 @@ int selinux_ss_audit_rule_match(struct lsm_prop *prop, u32 field, u32 op, void *
 	}
 
 out:
+	if (match >= 0 &&
+	    (policy != rcu_dereference(state->policy) ||
+	     policy->latest_granting != rule->snapshot.seqno ||
+	     policy->policycaps != rule->snapshot.policycaps ||
+	     rule->snapshot.chain_epoch != selinux_chain_epoch_read(state)))
+		match = -ESTALE;
 	rcu_read_unlock();
 	return match;
 }
 
+int selinux_ss_audit_rule_match(const struct lsm_prop *prop, u32 field, u32 op,
+				void *vrule)
+{
+	return __selinux_ss_audit_rule_match(prop, field, op, vrule, true);
+}
+
+#ifdef CONFIG_SECURITY_SELINUX_KUNIT_TEST
+void *selinux_kunit_audit_rule_alloc(struct selinux_state *state,
+				     u32 user, u32 role, u32 type)
+{
+	struct selinux_audit_rule *rule;
+	int rc;
+
+	rule = kzalloc_obj(*rule, GFP_KERNEL);
+	if (!rule)
+		return ERR_PTR(-ENOMEM);
+	context_init(&rule->au_ctxt);
+	rule->state = get_selinux_state(state);
+	rc = selinux_policy_snapshot_read(state, &rule->snapshot);
+	if (rc) {
+		selinux_audit_rule_free(rule);
+		return ERR_PTR(rc);
+	}
+	rule->au_ctxt.user = user;
+	rule->au_ctxt.role = role;
+	rule->au_ctxt.type = type;
+	return rule;
+}
+
+bool selinux_kunit_audit_rule_state_is_owner(struct selinux_state *state)
+{
+	return selinux_audit_rule_state_is_owner(state);
+}
+
+bool selinux_kunit_audit_rule_avc_is_owner(struct selinux_avc *avc)
+{
+	return selinux_audit_rule_avc_is_owner(avc);
+}
+
+int selinux_kunit_audit_rule_match(const struct lsm_prop *prop, u32 field,
+				   u32 op, void *rule)
+{
+	return __selinux_ss_audit_rule_match(prop, field, op, rule, false);
+}
+#endif
+
 #ifdef CONFIG_NETLABEL
+#ifndef CONFIG_SECURITY_SELINUX_NS
 /**
  * security_netlbl_cache_add - Add an entry to the NetLabel cache
  * @secattr: the NetLabel packet security attributes
  * @sid: the SELinux SID
  *
- * Description:
- * Attempt to cache the context in @ctx, which was derived from the packet in
- * @skb, in the NetLabel subsystem cache.  This function assumes @secattr has
- * already been initialized.
- *
+ * Cache a SID when the security server has a single global policy.  Namespace
+ * builds publish a canonical global identity from global_sidtab.c instead.
  */
 static void security_netlbl_cache_add(struct netlbl_lsm_secattr *secattr,
 				      u32 sid)
@@ -3698,10 +4134,10 @@ static void security_netlbl_cache_add(struct netlbl_lsm_secattr *secattr,
 	u32 *sid_cache;
 
 	sid_cache = kmalloc_obj(*sid_cache, GFP_ATOMIC);
-	if (sid_cache == NULL)
+	if (!sid_cache)
 		return;
 	secattr->cache = netlbl_secattr_cache_alloc(GFP_ATOMIC);
-	if (secattr->cache == NULL) {
+	if (!secattr->cache) {
 		kfree(sid_cache);
 		return;
 	}
@@ -3711,6 +4147,7 @@ static void security_netlbl_cache_add(struct netlbl_lsm_secattr *secattr,
 	secattr->cache->data = sid_cache;
 	secattr->flags |= NETLBL_SECATTR_CACHE;
 }
+#endif
 
 /**
  * selinux_ss_netlbl_secattr_to_sid - Convert a NetLabel secattr to a SELinux SID
@@ -3721,11 +4158,10 @@ static void security_netlbl_cache_add(struct netlbl_lsm_secattr *secattr,
  * Description:
  * Convert the given NetLabel security attributes in @secattr into a
  * SELinux SID.  If the @secattr field does not contain a full SELinux
- * SID/context then use SECINITSID_NETMSG as the foundation.  If possible the
- * 'cache' field of @secattr is set and the CACHE flag is set; this is to
- * allow the @secattr to be used by NetLabel to cache the secattr to SID
- * conversion for future lookups.  Returns zero on success, negative values on
- * failure.
+ * SID/context then use SECINITSID_NETMSG as the foundation.  Namespace builds
+ * defer cache publication to the global SID wrapper so a policy-local SID is
+ * never exposed through NetLabel's global protocol cache.  Returns zero on
+ * success, negative values on failure.
  *
  */
 int selinux_ss_netlbl_secattr_to_sid(struct selinux_state *state,
@@ -3753,9 +4189,15 @@ retry:
 	policydb = &policy->policydb;
 	sidtab = policy->sidtab;
 
-	if (secattr->flags & NETLBL_SECATTR_CACHE)
+	/* Namespace cache payloads are consumed only by the global SID wrapper. */
+	if (secattr->flags & NETLBL_SECATTR_CACHE) {
+#ifdef CONFIG_SECURITY_SELINUX_NS
+		rc = -ESTALE;
+		goto out;
+#else
 		*sid = *(u32 *)secattr->cache->data;
-	else if (secattr->flags & NETLBL_SECATTR_MLS_LVL) {
+#endif
+	} else if (secattr->flags & NETLBL_SECATTR_MLS_LVL) {
 		rc = -EIDRM;
 		ctx = sidtab_search(sidtab, SECINITSID_NETMSG);
 		if (ctx == NULL)
@@ -3799,8 +4241,9 @@ retry:
 		}
 		if (rc)
 			goto out;
-
+#ifndef CONFIG_SECURITY_SELINUX_NS
 		security_netlbl_cache_add(secattr, *sid);
+#endif
 	} else
 		*sid = SECSID_NULL;
 
@@ -3880,14 +4323,37 @@ static int __security_read_policy(struct selinux_policy *policy,
 }
 
 /**
+ * security_policy_size - read the serialized policy size.
+ * @state: selinux_state
+ * @len: length of data in bytes
+ *
+ * This function must be called with policy_mutex held.
+ */
+int security_policy_size(struct selinux_state *state, size_t *len)
+{
+	struct selinux_policy *policy;
+
+	policy = rcu_dereference_protected(
+		state->policy, lockdep_is_held(&state->policy_mutex));
+	if (!policy)
+		return -EINVAL;
+	*len = policy->policydb.len;
+	return 0;
+}
+
+/**
  * security_read_policy - read the policy.
  * @state: selinux_state
  * @data: binary policy data
  * @len: length of data in bytes
+ * @max_len: maximum permitted allocation in bytes
  *
+ * This function must be called with policy_mutex held.  The allocation limit
+ * is checked before vmalloc so callers cannot enforce a policy snapshot quota
+ * only after the memory has already been committed.
  */
 int security_read_policy(struct selinux_state *state,
-			 void **data, size_t *len)
+			 void **data, size_t *len, size_t max_len)
 {
 	struct selinux_policy *policy;
 
@@ -3897,6 +4363,8 @@ int security_read_policy(struct selinux_state *state,
 		return -EINVAL;
 
 	*len = policy->policydb.len;
+	if (*len > max_len)
+		return -EFBIG;
 	*data = vmalloc_user(*len);
 	if (!*data)
 		return -ENOMEM;

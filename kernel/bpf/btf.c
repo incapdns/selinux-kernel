@@ -27,6 +27,7 @@
 #include <linux/kobject.h>
 #include <linux/string.h>
 #include <linux/sysfs.h>
+#include <linux/security.h>
 #include <linux/overflow.h>
 #include <linux/bitops.h>
 
@@ -265,12 +266,14 @@ struct btf {
 	u32 data_size;
 	refcount_t refcnt;
 	u32 id;
+	enum bpf_btf_origin origin;
 	struct rcu_head rcu;
 	struct btf_kfunc_set_tab *kfunc_set_tab;
 	struct btf_id_dtor_kfunc_tab *dtor_kfunc_tab;
 	struct btf_struct_metas *struct_meta_tab;
 	struct btf_struct_ops_tab *struct_ops_tab;
 	struct btf_layout *layout;
+	void *security;
 
 	/* split BTF support */
 	struct btf *base_btf;
@@ -1865,6 +1868,8 @@ static void btf_free_struct_ops_tab(struct btf *btf)
 
 static void btf_free(struct btf *btf)
 {
+	if (btf->origin != BPF_BTF_ORIGIN_UNINITIALIZED)
+		security_bpf_btf_free(btf);
 	btf_free_struct_meta_tab(btf);
 	btf_free_dtor_kfunc_tab(btf);
 	btf_free_kfunc_set_tab(btf);
@@ -1891,6 +1896,37 @@ static void btf_free_rcu(struct rcu_head *rcu)
 const char *btf_get_name(const struct btf *btf)
 {
 	return btf->name;
+}
+
+void *btf_security(const struct btf *btf)
+{
+	return btf->security;
+}
+
+void btf_set_security(struct btf *btf, void *security)
+{
+	btf->security = security;
+}
+
+enum bpf_btf_origin btf_get_origin(const struct btf *btf)
+{
+	return btf->origin;
+}
+
+static int btf_security_load(struct btf *btf, const union bpf_attr *attr,
+			     struct bpf_token *token,
+			     enum bpf_btf_origin origin)
+{
+	int err;
+
+	if (WARN_ON_ONCE(origin == BPF_BTF_ORIGIN_UNINITIALIZED ||
+			 btf->origin != BPF_BTF_ORIGIN_UNINITIALIZED))
+		return -EINVAL;
+	btf->origin = origin;
+	err = security_bpf_btf_load(btf, attr, token, origin);
+	if (err)
+		btf->origin = BPF_BTF_ORIGIN_UNINITIALIZED;
+	return err;
 }
 
 void btf_get(struct btf *btf)
@@ -6451,12 +6487,20 @@ struct btf *btf_parse_vmlinux(void)
 	if (IS_ERR(btf))
 		goto err_out;
 
-	/* btf_parse_vmlinux() runs under bpf_verifier_lock */
-	bpf_ctx_convert.t = btf_type_by_id(btf, bpf_ctx_convert_btf_id[0]);
+	err = btf_security_load(btf, NULL, NULL, BPF_BTF_ORIGIN_VMLINUX);
+	if (err) {
+		btf_free(btf);
+		btf = ERR_PTR(err);
+		goto err_out;
+	}
 	err = btf_alloc_id(btf);
 	if (err) {
 		btf_free(btf);
 		btf = ERR_PTR(err);
+	} else {
+		/* btf_parse_vmlinux() runs under bpf_verifier_lock. */
+		bpf_ctx_convert.t = btf_type_by_id(btf,
+						bpf_ctx_convert_btf_id[0]);
 	}
 err_out:
 	btf_verifier_env_free(env);
@@ -8297,6 +8341,9 @@ static void bpf_btf_show_fdinfo(struct seq_file *m, struct file *filp)
 {
 	const struct btf *btf = filp->private_data;
 
+	if (security_bpf_btf(btf))
+		return;
+
 	seq_printf(m, "btf_id:\t%u\n", READ_ONCE(btf->id));
 }
 #endif
@@ -8316,17 +8363,32 @@ const struct file_operations btf_fops = {
 
 static int __btf_new_fd(struct btf *btf)
 {
+	int err;
+
+	err = security_bpf_btf(btf);
+	if (err)
+		return err;
 	return anon_inode_getfd("btf", &btf_fops, btf, O_RDONLY | O_CLOEXEC);
 }
 
-int btf_new_fd(const union bpf_attr *attr, bpfptr_t uattr, struct bpf_log_attr *attr_log)
+int btf_new_fd(const union bpf_attr *attr, bpfptr_t uattr,
+	       struct bpf_log_attr *attr_log, struct bpf_token *token)
 {
 	struct btf *btf;
+	enum bpf_btf_origin origin;
 	int ret;
 
 	btf = btf_parse(attr, uattr, attr_log);
 	if (IS_ERR(btf))
 		return PTR_ERR(btf);
+
+	origin = uattr.is_kernel ? BPF_BTF_ORIGIN_KERNEL_LOAD :
+		 BPF_BTF_ORIGIN_USER;
+	ret = btf_security_load(btf, attr, token, origin);
+	if (ret) {
+		btf_free(btf);
+		return ret;
+	}
 
 	ret = btf_alloc_id(btf);
 	if (ret) {
@@ -8353,8 +8415,13 @@ struct btf *btf_get_by_fd(int fd)
 	CLASS(fd, f)(fd);
 
 	btf = __btf_get_by_fd(f);
-	if (!IS_ERR(btf))
+	if (!IS_ERR(btf)) {
+		int err = security_bpf_btf(btf);
+
+		if (err)
+			return ERR_PTR(err);
 		refcount_inc(&btf->refcnt);
+	}
 
 	return btf;
 }
@@ -8370,6 +8437,10 @@ int btf_get_info_by_fd(const struct btf *btf,
 	char __user *uname;
 	u32 uinfo_len, uname_len, name_len;
 	int ret = 0;
+
+	ret = security_bpf_btf(btf);
+	if (ret)
+		return ret;
 
 	uinfo = u64_to_user_ptr(attr->info.info);
 	uinfo_len = attr->info.info_len;
@@ -8504,6 +8575,12 @@ static int btf_module_notify(struct notifier_block *nb, unsigned long op,
 			} else {
 				pr_warn_once("Kernel module BTF mismatch detected, BTF debug info may be unavailable for some modules\n");
 			}
+			goto out;
+		}
+		err = btf_security_load(btf, NULL, NULL, BPF_BTF_ORIGIN_MODULE);
+		if (err) {
+			btf_free(btf);
+			kfree(btf_mod);
 			goto out;
 		}
 		err = btf_alloc_id(btf);

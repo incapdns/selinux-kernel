@@ -3,6 +3,7 @@
 #define _LINUX_NSPROXY_H
 
 #include <linux/refcount.h>
+#include <linux/errno.h>
 #include <linux/spinlock.h>
 #include <linux/sched.h>
 
@@ -12,6 +13,12 @@ struct ipc_namespace;
 struct pid_namespace;
 struct cgroup_namespace;
 struct fs_struct;
+
+struct ipc_namespace_security_txn {
+	struct ipc_namespace *ns;
+	u64 token;
+	bool prepared;
+};
 
 /*
  * A structure to contain pointers to all per-process
@@ -56,6 +63,10 @@ struct nsset {
 	struct nsproxy *nsproxy;
 	struct fs_struct *fs;
 	const struct cred *cred;
+	/* Optional prepared credential committed with the namespace set. */
+	struct cred *security_cred;
+	/* Optional transactional IPC namespace security reanchor. */
+	struct ipc_namespace_security_txn ipc_security_txn;
 };
 
 static inline struct cred *nsset_cred(struct nsset *set)
@@ -64,6 +75,16 @@ static inline struct cred *nsset_cred(struct nsset *set)
 		return (struct cred *)set->cred;
 
 	return NULL;
+}
+
+static inline int nsset_install_security_cred(struct nsset *set,
+					       struct cred *cred)
+{
+	/* A userns operation already owns the one final mutable credential. */
+	if (nsset_cred(set) || set->security_cred)
+		return -EBUSY;
+	set->security_cred = cred;
+	return 0;
 }
 
 /*

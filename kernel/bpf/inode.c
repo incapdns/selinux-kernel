@@ -109,6 +109,8 @@ static void *bpf_fd_probe_obj(u32 ufd, enum bpf_type *type)
 		*type = BPF_TYPE_LINK;
 		return raw;
 	}
+	if (PTR_ERR(raw) != -EBADF && PTR_ERR(raw) != -EINVAL)
+		return raw;
 
 	return ERR_PTR(-EINVAL);
 }
@@ -188,7 +190,7 @@ static struct dentry *bpf_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 
 	ret = security_inode_init_security(inode, dir, &dentry->d_name,
 					   bpf_fs_initxattrs, NULL);
-	if (ret && ret != -EOPNOTSUPP) {
+	if (ret) {
 		iput(inode);
 		return ERR_PTR(ret);
 	}
@@ -374,7 +376,7 @@ static int bpf_mkobj_ops(struct dentry *dentry, umode_t mode, void *raw,
 
 	ret = security_inode_init_security(inode, dir, &dentry->d_name,
 					   bpf_fs_initxattrs, NULL);
-	if (ret && ret != -EOPNOTSUPP) {
+	if (ret) {
 		iput(inode);
 		return ret;
 	}
@@ -411,6 +413,24 @@ static int bpf_mklink(struct dentry *dentry, umode_t mode, void *arg)
 			     &bpf_iter_fops : &bpffs_obj_fops);
 }
 
+static const struct vfs_mkobj_ops bpf_mkprog_ops = {
+	.create = bpf_mkprog,
+	.security_create_plan_ops =
+		SECURITY_INODE_CREATE_OP(SECURITY_INODE_MKOBJ),
+};
+
+static const struct vfs_mkobj_ops bpf_mkmap_ops = {
+	.create = bpf_mkmap,
+	.security_create_plan_ops =
+		SECURITY_INODE_CREATE_OP(SECURITY_INODE_MKOBJ),
+};
+
+static const struct vfs_mkobj_ops bpf_mklink_ops = {
+	.create = bpf_mklink,
+	.security_create_plan_ops =
+		SECURITY_INODE_CREATE_OP(SECURITY_INODE_MKOBJ),
+};
+
 static struct dentry *
 bpf_lookup(struct inode *dir, struct dentry *dentry, unsigned flags)
 {
@@ -446,7 +466,7 @@ static int bpf_symlink(struct mnt_idmap *idmap, struct inode *dir,
 
 	ret = security_inode_init_security(inode, dir, &dentry->d_name,
 					   bpf_fs_initxattrs, NULL);
-	if (ret && ret != -EOPNOTSUPP) {
+	if (ret) {
 		iput(inode);
 		return ret;
 	}
@@ -469,6 +489,9 @@ static const struct inode_operations bpf_dir_iops = {
 	.link		= simple_link,
 	.unlink		= simple_unlink,
 	.listxattr	= bpf_fs_listxattr,
+	.security_create_plan_ops =
+		SECURITY_INODE_CREATE_OP(SECURITY_INODE_MKDIR) |
+		SECURITY_INODE_CREATE_OP(SECURITY_INODE_SYMLINK),
 };
 
 /* pin iterator link into bpffs */
@@ -514,13 +537,16 @@ static int bpf_obj_do_pin(int path_fd, const char __user *pathname, void *raw,
 
 	switch (type) {
 	case BPF_TYPE_PROG:
-		ret = vfs_mkobj(dentry, mode, bpf_mkprog, raw);
+		ret = vfs_mkobj_mnt(path.mnt, dentry, mode, &bpf_mkprog_ops,
+				    raw);
 		break;
 	case BPF_TYPE_MAP:
-		ret = vfs_mkobj(dentry, mode, bpf_mkmap, raw);
+		ret = vfs_mkobj_mnt(path.mnt, dentry, mode, &bpf_mkmap_ops,
+				    raw);
 		break;
 	case BPF_TYPE_LINK:
-		ret = vfs_mkobj(dentry, mode, bpf_mklink, raw);
+		ret = vfs_mkobj_mnt(path.mnt, dentry, mode, &bpf_mklink_ops,
+				    raw);
 		break;
 	default:
 		ret = -EPERM;
@@ -539,6 +565,13 @@ int bpf_obj_pin_user(u32 ufd, int path_fd, const char __user *pathname)
 	raw = bpf_fd_probe_obj(ufd, &type);
 	if (IS_ERR(raw))
 		return PTR_ERR(raw);
+	if (type == BPF_TYPE_LINK) {
+		ret = security_bpf_link_access(raw, BPF_OBJ_PIN);
+		if (ret) {
+			bpf_any_put(raw, type);
+			return ret;
+		}
+	}
 
 	ret = bpf_obj_do_pin(path_fd, pathname, raw, type);
 	if (ret != 0)
@@ -608,10 +641,15 @@ int bpf_obj_get_user(int path_fd, const char __user *pathname, int flags)
 	return ret;
 }
 
-static struct bpf_prog *__get_prog_inode(struct inode *inode, enum bpf_prog_type type)
+static struct bpf_prog *__get_prog_inode(const struct path *path,
+					 enum bpf_prog_type type)
 {
 	struct bpf_prog *prog;
-	int ret = inode_permission(&nop_mnt_idmap, inode, MAY_READ);
+	struct inode *inode;
+	int ret;
+
+	inode = d_backing_inode(path->dentry);
+	ret = inode_permission_mnt(&nop_mnt_idmap, path->mnt, inode, MAY_READ);
 	if (ret)
 		return ERR_PTR(ret);
 
@@ -642,7 +680,7 @@ struct bpf_prog *bpf_prog_get_type_path(const char *name, enum bpf_prog_type typ
 	int ret = kern_path(name, LOOKUP_FOLLOW, &path);
 	if (ret)
 		return ERR_PTR(ret);
-	prog = __get_prog_inode(d_backing_inode(path.dentry), type);
+	prog = __get_prog_inode(&path, type);
 	if (!IS_ERR(prog))
 		touch_atime(&path);
 	path_put(&path);

@@ -156,7 +156,7 @@ static int newque(struct ipc_namespace *ns, struct ipc_params *params)
 	msq->q_perm.key = key;
 
 	msq->q_perm.security = NULL;
-	retval = security_msg_queue_alloc(&msq->q_perm);
+	retval = security_msg_queue_alloc(ns, &msq->q_perm);
 	if (retval) {
 		kfree(msq);
 		return retval;
@@ -177,6 +177,7 @@ static int newque(struct ipc_namespace *ns, struct ipc_params *params)
 		ipc_rcu_putref(&msq->q_perm, msg_rcu_free);
 		return retval;
 	}
+	security_ipc_namespace_object_published(ns);
 
 	ipc_unlock_object(&msq->q_perm);
 	rcu_read_unlock();

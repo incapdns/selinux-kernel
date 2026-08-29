@@ -611,6 +611,11 @@ static int __kvm_gmem_create(struct kvm *kvm, loff_t size, u64 flags)
 	f->kvm = kvm;
 	xa_init(&f->bindings);
 	list_add(&f->entry, &GMEM_I(inode)->gmem_file_list);
+	err = security_file_init_security_anon(file);
+	if (err) {
+		fput(file);
+		goto err_fd;
+	}
 
 	fd_install(fd, file);
 	return fd;

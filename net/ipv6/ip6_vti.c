@@ -442,6 +442,7 @@ static bool vti6_state_check(const struct xfrm_state *x,
 static int
 vti6_xmit(struct sk_buff *skb, struct net_device *dev, struct flowi *fl)
 {
+	struct xfrm_flow_origin origin = xfrm_flow_origin_skb(skb);
 	struct ip6_tnl *t = netdev_priv(dev);
 	struct dst_entry *dst = skb_dst(skb);
 	struct net_device *tdev;
@@ -481,7 +482,7 @@ vti6_xmit(struct sk_buff *skb, struct net_device *dev, struct flowi *fl)
 	}
 
 	dst_hold(dst);
-	dst = xfrm_lookup_route(t->net, dst, fl, NULL, 0);
+	dst = xfrm_lookup_route_origin(t->net, dst, fl, NULL, &origin, 0);
 	if (IS_ERR(dst)) {
 		err = PTR_ERR(dst);
 		dst = NULL;

@@ -23,6 +23,7 @@
 #include <linux/bitops.h>
 #include <linux/blkdev.h>
 #include <linux/cred.h>
+#include <linux/security.h>
 
 #include <asm/byteorder.h>
 
@@ -952,6 +953,7 @@ struct inode *__ext4_new_inode(struct mnt_idmap *idmap,
 	ext4_group_t flex_group;
 	struct ext4_group_info *grp = NULL;
 	bool encrypt = false;
+	bool security_attempt = false;
 
 	/* Cannot create files in a deleted directory */
 	if (!dir || !dir->i_nlink)
@@ -1330,8 +1332,13 @@ got:
 			goto fail_free_drop;
 
 		err = ext4_init_security(handle, inode, dir, qstr);
-		if (err)
+		if (err) {
+			ret2 = security_inode_create_plan_attempt_abort(inode);
+			if (ret2)
+				err = ret2;
 			goto fail_free_drop;
+		}
+		security_attempt = true;
 	}
 
 	if (ext4_has_feature_extents(sb)) {
@@ -1358,6 +1365,11 @@ got:
 	return ret;
 
 fail_free_drop:
+	if (security_attempt) {
+		ret2 = security_inode_create_plan_attempt_abort(inode);
+		if (ret2)
+			err = ret2;
+	}
 	dquot_free_inode(inode);
 fail_drop:
 	clear_nlink(inode);

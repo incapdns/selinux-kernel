@@ -16,11 +16,14 @@
  * selinux_ima_collect_state - Read selinux configuration settings
  *
  * @state: selinux_state
+ * @snapshot: immutable policy metadata measured with @state
  *
  * On success returns the configuration settings string.
  * On error, returns NULL.
  */
-static char *selinux_ima_collect_state(struct selinux_state *state)
+static char *selinux_ima_collect_state(
+	struct selinux_state *state,
+	const struct selinux_policy_snapshot *snapshot)
 {
 	const char *on = "=1;", *off = "=0;";
 	char *buf;
@@ -58,7 +61,9 @@ static char *selinux_ima_collect_state(struct selinux_state *state)
 		rc = strlcat(buf, selinux_policycap_names[i], buf_len);
 		WARN_ON(rc >= buf_len);
 
-		rc = strlcat(buf, state->policycap[i] ? on : off, buf_len);
+		rc = strlcat(buf,
+			selinux_policy_snapshot_has_cap(snapshot, i) ? on : off,
+			buf_len);
 		WARN_ON(rc >= buf_len);
 	}
 
@@ -73,13 +78,21 @@ static char *selinux_ima_collect_state(struct selinux_state *state)
 void selinux_ima_measure_state_locked(struct selinux_state *state)
 {
 	char *state_str = NULL;
+	struct selinux_policy_snapshot snapshot;
 	void *policy = NULL;
 	size_t policy_len;
 	int rc = 0;
 
 	lockdep_assert_held(&state->policy_mutex);
 
-	state_str = selinux_ima_collect_state(state);
+	rc = selinux_policy_snapshot_read(state, &snapshot);
+	if (rc) {
+		pr_err("SELinux: %s: failed to snapshot state %d.\n",
+		       __func__, rc);
+		return;
+	}
+
+	state_str = selinux_ima_collect_state(state, &snapshot);
 	if (!state_str) {
 		pr_err("SELinux: %s: failed to read state.\n", __func__);
 		return;

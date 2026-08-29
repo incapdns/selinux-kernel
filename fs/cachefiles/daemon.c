@@ -577,6 +577,8 @@ static int cachefiles_daemon_dir(struct cachefiles_cache *cache, char *args)
  */
 static int cachefiles_daemon_secctx(struct cachefiles_cache *cache, char *args)
 {
+	struct lsm_prop_ref *ref;
+	u32 source_secid;
 	int err;
 
 	_enter(",%s", args);
@@ -586,16 +588,30 @@ static int cachefiles_daemon_secctx(struct cachefiles_cache *cache, char *args)
 		return -EINVAL;
 	}
 
-	if (cache->have_secid) {
+	if (cache->secctx_ref) {
 		pr_err("Second security context specified\n");
 		return -EINVAL;
 	}
 
-	err = security_secctx_to_secid(args, strlen(args), &cache->secid);
+	/* Match the legacy no-security result instead of accepting the context. */
+	if (!IS_ENABLED(CONFIG_SECURITY))
+		return -EOPNOTSUPP;
+
+	err = security_secctx_to_lsmprop_ref(args, strlen(args), LSM_ID_UNDEF,
+					    GFP_KERNEL, &ref);
 	if (err)
 		return err;
 
-	cache->have_secid = true;
+	/*
+	 * Publish only after the core has resolved the context to one provider.
+	 * The immutable reference is the authority; secid is diagnostic only.
+	 */
+	if (!security_lsm_prop_ref_source_secid(ref, &source_secid)) {
+		security_lsm_prop_ref_put(ref);
+		return -ESTALE;
+	}
+	cache->secid = source_secid;
+	cache->secctx_ref = ref;
 	return 0;
 }
 
@@ -819,6 +835,8 @@ static void cachefiles_daemon_unbind(struct cachefiles_cache *cache)
 	cachefiles_put_directory(cache->store);
 	mntput(cache->mnt);
 	put_cred(cache->cache_cred);
+	security_lsm_prop_ref_put(cache->secctx_ref);
+	cache->secctx_ref = NULL;
 
 	kfree(cache->rootdirname);
 	kfree(cache->tag);

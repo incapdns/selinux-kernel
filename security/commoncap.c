@@ -418,8 +418,8 @@ static bool is_v3header(int size, const struct vfs_cap_data *cap)
  * so that's good.
  */
 int cap_inode_getsecurity(struct mnt_idmap *idmap,
-			  struct inode *inode, const char *name, void **buffer,
-			  bool alloc)
+			  const struct vfsmount *mnt, struct inode *inode,
+			  const char *name, void **buffer, bool alloc)
 {
 	int size;
 	kuid_t kroot;
@@ -431,6 +431,9 @@ int cap_inode_getsecurity(struct mnt_idmap *idmap,
 	struct vfs_ns_cap_data *nscap = NULL;
 	struct dentry *dentry;
 	struct user_namespace *fs_ns;
+
+	/* Capability xattr conversion is selected by @idmap, not an LSM view. */
+	(void)mnt;
 
 	if (strcmp(name, "capability") != 0)
 		return -EOPNOTSUPP;

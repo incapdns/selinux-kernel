@@ -166,7 +166,8 @@ static int nlmsg_perm(u16 nlmsg_type, u32 *perm, const struct nlmsg_perm *tab,
 	return err;
 }
 
-int selinux_nlmsg_lookup(u16 sclass, u16 nlmsg_type, u32 *perm)
+int selinux_nlmsg_lookup(const struct selinux_policy_snapshot *snapshot,
+			 u16 sclass, u16 nlmsg_type, u32 *perm)
 {
 	/* While it is possible to add a similar permission to other netlink
 	 * classes, note that the extended permission value is matched against
@@ -184,7 +185,7 @@ int selinux_nlmsg_lookup(u16 sclass, u16 nlmsg_type, u32 *perm)
 		 */
 		BUILD_BUG_ON(RTM_MAX != (RTM_NEWTUNNEL + 3));
 
-		if (selinux_policycap_netlink_xperm()) {
+		if (selinux_policycap_netlink_xperm(snapshot)) {
 			*perm = NETLINK_ROUTE_SOCKET__NLMSG;
 			return 0;
 		}
@@ -192,7 +193,7 @@ int selinux_nlmsg_lookup(u16 sclass, u16 nlmsg_type, u32 *perm)
 				  sizeof(nlmsg_route_perms));
 		break;
 	case SECCLASS_NETLINK_TCPDIAG_SOCKET:
-		if (selinux_policycap_netlink_xperm()) {
+		if (selinux_policycap_netlink_xperm(snapshot)) {
 			*perm = NETLINK_TCPDIAG_SOCKET__NLMSG;
 			return 0;
 		}
@@ -206,7 +207,7 @@ int selinux_nlmsg_lookup(u16 sclass, u16 nlmsg_type, u32 *perm)
 		 */
 		BUILD_BUG_ON(XFRM_MSG_MAX != XFRM_MSG_MIGRATE_STATE);
 
-		if (selinux_policycap_netlink_xperm()) {
+		if (selinux_policycap_netlink_xperm(snapshot)) {
 			*perm = NETLINK_XFRM_SOCKET__NLMSG;
 			return 0;
 		}
@@ -214,7 +215,7 @@ int selinux_nlmsg_lookup(u16 sclass, u16 nlmsg_type, u32 *perm)
 				  sizeof(nlmsg_xfrm_perms));
 		break;
 	case SECCLASS_NETLINK_AUDIT_SOCKET:
-		if (selinux_policycap_netlink_xperm()) {
+		if (selinux_policycap_netlink_xperm(snapshot)) {
 			*perm = NETLINK_AUDIT_SOCKET__NLMSG;
 			return 0;
 		} else if ((nlmsg_type >= AUDIT_FIRST_USER_MSG &&

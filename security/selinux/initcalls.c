@@ -6,6 +6,7 @@
 #include <linux/init.h>
 
 #include "initcalls.h"
+#include "netns.h"
 
 /**
  * selinux_initcall - Perform the SELinux initcalls
@@ -29,6 +30,10 @@ int __init selinux_initcall(void)
 		rc = rc_tmp;
 
 	rc_tmp = sel_netif_init();
+	if (!rc && rc_tmp)
+		rc = rc_tmp;
+
+	rc_tmp = selinux_netns_init();
 	if (!rc && rc_tmp)
 		rc = rc_tmp;
 

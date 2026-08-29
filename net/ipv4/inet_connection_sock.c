@@ -11,6 +11,7 @@
 
 #include <linux/module.h>
 #include <linux/jhash.h>
+#include <linux/security.h>
 
 #include <net/inet_connection_sock.h>
 #include <net/inet_hashtables.h>
@@ -774,7 +775,11 @@ struct dst_entry *inet_csk_route_req(const struct sock *sk,
 			   ireq->ir_loc_addr, ireq->ir_rmt_port,
 			   htons(ireq->ir_num), sk_uid(sk));
 	security_req_classify_flow(req, flowi4_to_flowi_common(fl4));
-	rt = ip_route_output_flow(net, fl4, sk);
+	{
+		struct xfrm_flow_origin origin = xfrm_flow_origin_request(req);
+
+		rt = ip_route_output_flow_origin(net, fl4, sk, &origin);
+	}
 	if (IS_ERR(rt))
 		goto no_route;
 	if (opt && opt->opt.is_strictroute && rt->rt_uses_gateway)
@@ -811,7 +816,11 @@ struct dst_entry *inet_csk_route_child_sock(const struct sock *sk,
 			   ireq->ir_loc_addr, ireq->ir_rmt_port,
 			   htons(ireq->ir_num), sk_uid(sk));
 	security_req_classify_flow(req, flowi4_to_flowi_common(fl4));
-	rt = ip_route_output_flow(net, fl4, sk);
+	{
+		struct xfrm_flow_origin origin = xfrm_flow_origin_request(req);
+
+		rt = ip_route_output_flow_origin(net, fl4, sk, &origin);
+	}
 	if (IS_ERR(rt))
 		goto no_route;
 	if (opt && opt->opt.is_strictroute && rt->rt_uses_gateway)
@@ -850,11 +859,15 @@ static struct request_sock *
 reqsk_alloc_noprof(const struct request_sock_ops *ops, struct sock *sk_listener,
 		   bool attach_listener)
 {
+	const gfp_t gfp = GFP_ATOMIC | __GFP_NOWARN;
 	struct request_sock *req;
 
-	req = kmem_cache_alloc_noprof(ops->slab, GFP_ATOMIC | __GFP_NOWARN);
+	req = kmem_cache_alloc_noprof(ops->slab, gfp);
 	if (!req)
 		return NULL;
+#ifdef CONFIG_SECURITY
+	req->security = NULL;
+#endif
 	req->rsk_listener = NULL;
 	if (attach_listener) {
 		if (unlikely(!refcount_inc_not_zero(&sk_listener->sk_refcnt))) {
@@ -873,6 +886,12 @@ reqsk_alloc_noprof(const struct request_sock_ops *ops, struct sock *sk_listener,
 	req->num_retrans = 0;
 	req->sk = NULL;
 	refcount_set(&req->rsk_refcnt, 0);
+	if (unlikely(security_req_alloc(req, sk_listener, gfp))) {
+		if (req->rsk_listener)
+			sock_put(req->rsk_listener);
+		kmem_cache_free(ops->slab, req);
+		return NULL;
+	}
 
 	return req;
 }
@@ -903,6 +922,7 @@ struct request_sock *inet_reqsk_alloc(const struct request_sock_ops *ops,
 
 void __reqsk_free(struct request_sock *req)
 {
+	security_req_free(req);
 	req->rsk_ops->destructor(req);
 	if (req->rsk_listener)
 		sock_put(req->rsk_listener);
@@ -933,6 +953,9 @@ static struct request_sock *inet_reqsk_clone(struct request_sock *req,
 	unsafe_memcpy(&nreq_sk->sk_dontcopy_end, &req_sk->sk_dontcopy_end,
 		      req->rsk_ops->obj_size - offsetof(struct sock, sk_dontcopy_end),
 		      /* alloc is larger than struct, see above */);
+#ifdef CONFIG_SECURITY
+	nreq->security = NULL;
+#endif
 
 	sk_node_init(&nreq_sk->sk_node);
 	nreq_sk->sk_tx_queue_mapping = req_sk->sk_tx_queue_mapping;
@@ -942,6 +965,13 @@ static struct request_sock *inet_reqsk_clone(struct request_sock *req,
 	nreq_sk->sk_incoming_cpu = req_sk->sk_incoming_cpu;
 
 	nreq->rsk_listener = sk;
+	if (unlikely(security_req_clone(req, nreq,
+					GFP_ATOMIC | __GFP_NOWARN))) {
+		kmem_cache_free(req->rsk_ops->slab, nreq);
+		__NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPMIGRATEREQFAILURE);
+		sock_put(sk);
+		return NULL;
+	}
 
 	if (sk->sk_protocol == IPPROTO_TCP && tcp_rsk(nreq)->tfo_listener) {
 		struct fastopen_queue *fastopenq;

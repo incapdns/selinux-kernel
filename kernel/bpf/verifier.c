@@ -24,6 +24,7 @@
 #include <linux/bpf_lsm.h>
 #include <linux/btf_ids.h>
 #include <linux/poison.h>
+#include <linux/security.h>
 #include <linux/module.h>
 #include <linux/cpumask.h>
 #include <linux/cnum.h>
@@ -17896,6 +17897,12 @@ static int add_used_map(struct bpf_verifier_env *env, int fd)
 		verbose(env, "fd %d is not pointing to valid bpf_map\n", fd);
 		return PTR_ERR(map);
 	}
+	{
+		int err = security_bpf_map(map, fd_file(f)->f_mode);
+
+		if (err)
+			return err;
+	}
 
 	return __add_used_map(env, map);
 }
@@ -19506,6 +19513,9 @@ static int add_fd_from_fd_array(struct bpf_verifier_env *env, int fd)
 
 	map = __bpf_map_get(f);
 	if (!IS_ERR(map)) {
+		err = security_bpf_map(map, fd_file(f)->f_mode);
+		if (err)
+			return err;
 		err = __add_used_map(env, map);
 		if (err < 0)
 			return err;
@@ -19514,6 +19524,9 @@ static int add_fd_from_fd_array(struct bpf_verifier_env *env, int fd)
 
 	btf = __btf_get_by_fd(f);
 	if (!IS_ERR(btf)) {
+		err = security_bpf_btf(btf);
+		if (err)
+			return err;
 		btf_get(btf);
 		return __add_used_btf(env, btf);
 	}

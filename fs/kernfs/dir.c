@@ -576,6 +576,18 @@ static void kernfs_free_rcu(struct rcu_head *rcu)
 	kmem_cache_free(kernfs_node_cache, kn);
 }
 
+static void kernfs_root_free_rcu(struct rcu_head *rcu)
+{
+	struct kernfs_root *root = container_of(rcu, struct kernfs_root, rcu);
+
+	security_kernfs_root_free(root->security);
+#ifdef CONFIG_KERNFS_KUNIT_TEST
+	if (root->security_free_done)
+		root->security_free_done(root->security_free_done_data);
+#endif
+	kfree(root);
+}
+
 /**
  * kernfs_put - put a reference count on a kernfs_node
  * @kn: the target kernfs_node
@@ -625,7 +637,7 @@ void kernfs_put(struct kernfs_node *kn)
 		/* just released the root kn, free @root too */
 		idr_destroy(&root->ino_idr);
 		simple_xattr_cache_cleanup(&root->xa_cache);
-		kfree_rcu(root, rcu);
+		call_rcu(&root->rcu, kernfs_root_free_rcu);
 	}
 }
 EXPORT_SYMBOL_GPL(kernfs_put);
@@ -704,7 +716,7 @@ static struct kernfs_node *__kernfs_new_node(struct kernfs_root *root,
 		kernfs_get(parent);
 		rcu_assign_pointer(kn->__parent, parent);
 
-		ret = security_kernfs_init_security(parent, kn);
+		ret = security_kernfs_init_security(parent, kn, root->security);
 		if (ret)
 			goto err_out4;
 	}
@@ -1019,6 +1031,7 @@ struct kernfs_root *kernfs_create_root(struct kernfs_syscall_ops *scops,
 {
 	struct kernfs_root *root;
 	struct kernfs_node *kn;
+	int ret;
 
 	root = kzalloc_obj(*root);
 	if (!root)
@@ -1031,6 +1044,13 @@ struct kernfs_root *kernfs_create_root(struct kernfs_syscall_ops *scops,
 	init_rwsem(&root->kernfs_supers_rwsem);
 	INIT_LIST_HEAD(&root->supers);
 	rwlock_init(&root->kernfs_rename_lock);
+
+	ret = security_kernfs_root_alloc(&root->security);
+	if (ret) {
+		idr_destroy(&root->ino_idr);
+		kfree(root);
+		return ERR_PTR(ret);
+	}
 
 	/*
 	 * On 64bit ino setups, id is ino.  On 32bit, low 32bits are ino.
@@ -1048,6 +1068,7 @@ struct kernfs_root *kernfs_create_root(struct kernfs_syscall_ops *scops,
 			       KERNFS_DIR);
 	if (!kn) {
 		idr_destroy(&root->ino_idr);
+		security_kernfs_root_free(root->security);
 		kfree(root);
 		return ERR_PTR(-ENOMEM);
 	}

@@ -1307,6 +1307,7 @@ static void xfrm_hash_grow_check(struct net *net, int have_hash_collision)
 
 static void xfrm_state_look_at(struct xfrm_policy *pol, struct xfrm_state *x,
 			       const struct flowi *fl, unsigned short family,
+			       const struct xfrm_flow_origin *origin,
 			       struct xfrm_state **best, int *acq_in_progress,
 			       int *error, unsigned int pcpu_id)
 {
@@ -1326,7 +1327,8 @@ static void xfrm_state_look_at(struct xfrm_policy *pol, struct xfrm_state *x,
 		     (x->sel.family != family ||
 		      !xfrm_selector_match(&x->sel, fl, family))) ||
 		    !security_xfrm_state_pol_flow_match(x, pol,
-							&fl->u.__fl_common))
+							&fl->u.__fl_common,
+							origin))
 			return;
 
 		if (x->pcpu_num != UINT_MAX && x->pcpu_num != pcpu_id)
@@ -1347,14 +1349,16 @@ static void xfrm_state_look_at(struct xfrm_policy *pol, struct xfrm_state *x,
 		     (x->sel.family == family &&
 		      xfrm_selector_match(&x->sel, fl, family))) &&
 		    security_xfrm_state_pol_flow_match(x, pol,
-						       &fl->u.__fl_common))
+						       &fl->u.__fl_common,
+						       origin))
 			*error = -ESRCH;
 	}
 }
 
 struct xfrm_state *
 xfrm_state_find(const xfrm_address_t *daddr, const xfrm_address_t *saddr,
-		const struct flowi *fl, struct xfrm_tmpl *tmpl,
+		const struct flowi *fl, const struct xfrm_flow_origin *origin,
+		struct xfrm_tmpl *tmpl,
 		struct xfrm_policy *pol, int *err,
 		unsigned short family, u32 if_id)
 {
@@ -1395,7 +1399,7 @@ xfrm_state_find(const xfrm_address_t *daddr, const xfrm_address_t *saddr,
 		    tmpl->mode == x->props.mode &&
 		    tmpl->id.proto == x->id.proto &&
 		    (tmpl->id.spi == x->id.spi || !tmpl->id.spi))
-			xfrm_state_look_at(pol, x, fl, encap_family,
+			xfrm_state_look_at(pol, x, fl, encap_family, origin,
 					   &best, &acquire_in_progress, &error, pcpu_id);
 	}
 
@@ -1412,7 +1416,7 @@ xfrm_state_find(const xfrm_address_t *daddr, const xfrm_address_t *saddr,
 		    tmpl->mode == x->props.mode &&
 		    tmpl->id.proto == x->id.proto &&
 		    (tmpl->id.spi == x->id.spi || !tmpl->id.spi))
-			xfrm_state_look_at(pol, x, fl, family,
+			xfrm_state_look_at(pol, x, fl, family, origin,
 					   &best, &acquire_in_progress, &error, pcpu_id);
 	}
 
@@ -1453,7 +1457,7 @@ cached:
 		    tmpl->mode == x->props.mode &&
 		    tmpl->id.proto == x->id.proto &&
 		    (tmpl->id.spi == x->id.spi || !tmpl->id.spi))
-			xfrm_state_look_at(pol, x, fl, family,
+			xfrm_state_look_at(pol, x, fl, family, origin,
 					   &best, &acquire_in_progress, &error, pcpu_id);
 	}
 	if (best || acquire_in_progress)
@@ -1488,7 +1492,7 @@ cached:
 		    tmpl->mode == x->props.mode &&
 		    tmpl->id.proto == x->id.proto &&
 		    (tmpl->id.spi == x->id.spi || !tmpl->id.spi))
-			xfrm_state_look_at(pol, x, fl, family,
+			xfrm_state_look_at(pol, x, fl, family, origin,
 					   &best, &acquire_in_progress, &error, pcpu_id);
 	}
 
@@ -1531,7 +1535,8 @@ found:
 		if ((pol->flags & XFRM_POLICY_CPU_ACQUIRE) && best)
 			x->pcpu_num = pcpu_id;
 
-		error = security_xfrm_state_alloc_acquire(x, pol->security, fl->flowi_secid);
+		error = security_xfrm_state_alloc_acquire(
+			x, pol->security, fl->flowi_secid, origin);
 		if (error) {
 			x->km.state = XFRM_STATE_DEAD;
 			to_put = x;

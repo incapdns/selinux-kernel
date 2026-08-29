@@ -674,7 +674,8 @@ struct file *ovl_path_open(const struct path *path, int flags)
 		BUG();
 	}
 
-	err = inode_permission(real_idmap, inode, acc_mode | MAY_OPEN);
+	err = inode_permission_mnt(real_idmap, path->mnt, inode,
+				   acc_mode | MAY_OPEN);
 	if (err)
 		return ERR_PTR(err);
 

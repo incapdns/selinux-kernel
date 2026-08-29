@@ -1902,7 +1902,7 @@ int sock_map_link_create(const union bpf_attr *attr, struct bpf_prog *prog)
 		      attach_type);
 	sockmap_link->map = map;
 
-	ret = bpf_link_prime(&sockmap_link->link, &link_primer);
+	ret = bpf_link_prime(&sockmap_link->link, &link_primer, NULL, NULL);
 	if (ret) {
 		kfree(sockmap_link);
 		goto out;

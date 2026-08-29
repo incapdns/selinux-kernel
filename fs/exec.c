@@ -1313,7 +1313,7 @@ void would_dump(struct linux_binprm *bprm, struct file *file)
 {
 	struct inode *inode = file_inode(file);
 	struct mnt_idmap *idmap = file_mnt_idmap(file);
-	if (inode_permission(idmap, inode, MAY_READ) < 0) {
+	if (inode_permission_mnt(idmap, file->f_path.mnt, inode, MAY_READ) < 0) {
 		struct user_namespace *old, *user_ns;
 		bprm->interp_flags |= BINPRM_FLAGS_ENFORCE_NONDUMP;
 
@@ -1584,7 +1584,7 @@ static void bprm_fill_uid(struct linux_binprm *bprm, struct file *file)
 	mode = inode->i_mode;
 	vfsuid = i_uid_into_vfsuid(idmap, inode);
 	vfsgid = i_gid_into_vfsgid(idmap, inode);
-	err = inode_permission(idmap, inode, MAY_EXEC);
+	err = inode_permission_mnt(idmap, file->f_path.mnt, inode, MAY_EXEC);
 	inode_unlock(inode);
 
 	/* Did the exec bit vanish out from under us? Give up. */

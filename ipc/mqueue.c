@@ -577,6 +577,9 @@ static int mqueue_create_attr(struct dentry *dentry, umode_t mode, void *arg)
 		error = -EACCES;
 		goto out_unlock;
 	}
+	error = security_ipc_namespace_create_gate(ipc_ns, current_cred());
+	if (error)
+		goto out_unlock;
 
 	if (ipc_ns->mq_queues_count >= ipc_ns->mq_queues_max &&
 	    !capable(CAP_SYS_RESOURCE)) {
@@ -593,6 +596,9 @@ static int mqueue_create_attr(struct dentry *dentry, umode_t mode, void *arg)
 		ipc_ns->mq_queues_count--;
 		goto out_unlock;
 	}
+	spin_lock(&mq_lock);
+	security_ipc_namespace_object_published(ipc_ns);
+	spin_unlock(&mq_lock);
 
 	put_ipc_ns(ipc_ns);
 	dir->i_size += DIRENT_SIZE;
@@ -606,6 +612,11 @@ out_unlock:
 		put_ipc_ns(ipc_ns);
 	return error;
 }
+
+static const struct vfs_mkobj_ops mqueue_mkobj_ops = {
+	.create = mqueue_create_attr,
+	.security_create_plan_ops = 0,
+};
 
 static int mqueue_create(struct mnt_idmap *idmap, struct inode *dir,
 			 struct dentry *dentry, umode_t mode, bool excl)
@@ -858,7 +869,8 @@ static void remove_notification(struct mqueue_inode_info *info)
 	info->notify_user_ns = NULL;
 }
 
-static int prepare_open(struct dentry *dentry, int oflag, int ro,
+static int prepare_open(struct vfsmount *mnt, struct dentry *dentry,
+			int oflag, int ro,
 			umode_t mode, struct filename *name,
 			struct mq_attr *attr)
 {
@@ -872,8 +884,8 @@ static int prepare_open(struct dentry *dentry, int oflag, int ro,
 		if (ro)
 			return ro;
 		audit_inode_parent_hidden(name, dentry->d_parent);
-		return vfs_mkobj(dentry, mode & ~current_umask(),
-				  mqueue_create_attr, attr);
+		return vfs_mkobj_mnt(mnt, dentry, mode & ~current_umask(),
+				      &mqueue_mkobj_ops, attr);
 	}
 	/* it already existed */
 	audit_inode(name, dentry, 0);
@@ -882,7 +894,7 @@ static int prepare_open(struct dentry *dentry, int oflag, int ro,
 	if ((oflag & O_ACCMODE) == (O_RDWR | O_WRONLY))
 		return -EINVAL;
 	acc = oflag2acc[oflag & O_ACCMODE];
-	return inode_permission(&nop_mnt_idmap, d_inode(dentry), acc);
+	return inode_permission_mnt(&nop_mnt_idmap, mnt, d_inode(dentry), acc);
 }
 
 static struct file *mqueue_file_open(struct filename *name,
@@ -897,7 +909,7 @@ static struct file *mqueue_file_open(struct filename *name,
 	if (IS_ERR(dentry))
 		return ERR_CAST(dentry);
 
-	ret = prepare_open(dentry, oflag, ro, mode, name, attr);
+	ret = prepare_open(mnt, dentry, oflag, ro, mode, name, attr);
 	file = ERR_PTR(ret);
 	if (!ret) {
 		const struct path path = { .mnt = mnt, .dentry = dentry };

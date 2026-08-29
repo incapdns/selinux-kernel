@@ -9,6 +9,22 @@
 
 bool bpf_lsm_initialized __ro_after_init;
 
+/*
+ * BPF LSM has no stable, provider-owned label identity to retain in a
+ * carrier.  A BPF program's hook return value is an authorization result,
+ * not a durable security identity, so scalar or object sources cannot be
+ * captured without inventing provenance.
+ */
+int bpf_lsm_prop_ref_capture(struct lsm_prop_ref *ref,
+			     const struct lsm_prop_ref_source *source,
+			     gfp_t gfp)
+{
+	(void)ref;
+	(void)source;
+	(void)gfp;
+	return -EOPNOTSUPP;
+}
+
 static struct security_hook_list bpf_lsm_hooks[] __ro_after_init = {
 	#define LSM_HOOK(RET, DEFAULT, NAME, ...) \
 	LSM_HOOK_INIT(NAME, bpf_lsm_##NAME),

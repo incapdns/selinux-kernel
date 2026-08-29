@@ -22,7 +22,23 @@
 void sel_netnode_flush(void);
 
 struct selinux_state;
+struct selinux_policy_snapshot;
+struct selinux_global_sid_handle;
 int sel_netnode_sid(struct selinux_state *state, const void *addr, u16 family,
 		    u32 *sid);
+int sel_netnode_sid_snapshot(
+	struct selinux_state *state,
+	const struct selinux_policy_snapshot *snapshot, const void *addr,
+	u16 family, u32 *sid);
+#ifdef CONFIG_SECURITY_SELINUX_NS
+struct selinux_global_sid_handle *
+sel_netnode_sid_handle(struct selinux_state *state, const void *addr,
+		      u16 family, u32 *sid);
+struct selinux_global_sid_handle *
+sel_netnode_sid_snapshot_handle(
+	struct selinux_state *state,
+	const struct selinux_policy_snapshot *snapshot, const void *addr,
+	u16 family, u32 *sid);
+#endif
 
 #endif

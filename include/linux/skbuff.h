@@ -19,6 +19,7 @@
 #include <linux/rbtree.h>
 #include <linux/socket.h>
 #include <linux/refcount.h>
+#include <linux/selinux_net.h>
 
 #include <linux/atomic.h>
 #include <asm/types.h>
@@ -1063,6 +1064,10 @@ struct sk_buff {
 #endif
 #ifdef CONFIG_NETWORK_SECMARK
 	__u32		secmark;
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	/* Strong immutable carrier; secmark remains the ABI projection. */
+	struct selinux_net_provenance *secmark_provenance;
+#endif
 #endif
 
 	union {
@@ -5179,16 +5184,42 @@ static inline void nf_copy(struct sk_buff *dst, const struct sk_buff *src)
 }
 
 #ifdef CONFIG_NETWORK_SECMARK
+static inline void skb_set_secmark(
+	struct sk_buff *skb, u32 secmark,
+	struct selinux_net_provenance *provenance)
+{
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	struct selinux_net_provenance *old = skb->secmark_provenance;
+
+	provenance = selinux_net_provenance_get(provenance);
+	skb->secmark = secmark;
+	skb->secmark_provenance = provenance;
+	selinux_net_provenance_put(old);
+#else
+	skb->secmark = secmark;
+#endif
+}
+
 static inline void skb_copy_secmark(struct sk_buff *to, const struct sk_buff *from)
 {
-	to->secmark = from->secmark;
+	skb_set_secmark(to, from->secmark,
+#ifdef CONFIG_SECURITY_SELINUX_NS
+			from->secmark_provenance
+#else
+			NULL
+#endif
+	);
 }
 
 static inline void skb_init_secmark(struct sk_buff *skb)
 {
-	skb->secmark = 0;
+	skb_set_secmark(skb, 0, NULL);
 }
 #else
+static inline void skb_set_secmark(struct sk_buff *skb, u32 secmark,
+				   struct selinux_net_provenance *provenance)
+{ }
+
 static inline void skb_copy_secmark(struct sk_buff *to, const struct sk_buff *from)
 { }
 

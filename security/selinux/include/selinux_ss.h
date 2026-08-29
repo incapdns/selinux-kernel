@@ -79,6 +79,12 @@ int selinux_ss_node_sid(struct selinux_state *state, u16 domain,
 int selinux_ss_validate_transition(struct selinux_state *state, u32 oldsid,
 				   u32 newsid, u32 tasksid, u16 tclass);
 
+int selinux_ss_validate_transition_snapshot_noaudit(
+	struct selinux_state *state,
+	const struct selinux_policy_snapshot *snapshot, u32 oldsid, u32 newsid,
+	u32 tasksid, u16 tclass,
+	enum selinux_validatetrans_decision *decision);
+
 int selinux_ss_validate_transition_user(struct selinux_state *state, u32 oldsid,
 					u32 newsid, u32 tasksid, u16 tclass);
 
@@ -101,7 +107,15 @@ int selinux_ss_policy_genfs_sid(struct selinux_policy *policy,
 				const char *fstype, const char *path,
 				u16 sclass, u32 *sid);
 
-int selinux_ss_audit_rule_match(struct lsm_prop *prop, u32 field, u32 op,
+/*
+ * Translate a SID in an unpublished policy.  The returned context is borrowed
+ * from @policy and remains valid while the caller keeps that policy alive.
+ */
+int selinux_ss_policy_sid_to_context(struct selinux_policy *policy, u32 sid,
+				     const char **scontext,
+				     u32 *scontext_len);
+
+int selinux_ss_audit_rule_match(const struct lsm_prop *prop, u32 field, u32 op,
 				void *rule);
 
 #ifdef CONFIG_NETLABEL

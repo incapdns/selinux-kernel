@@ -171,6 +171,15 @@ static inline struct rtable *__ip_route_output_key(struct net *net,
 
 struct rtable *ip_route_output_flow(struct net *, struct flowi4 *flp,
 				    const struct sock *sk);
+struct rtable *ip_route_output_flow_origin(
+				    struct net *net, struct flowi4 *flp,
+				    const struct sock *sk,
+				    const struct xfrm_flow_origin *origin);
+struct rtable *ip_route_output_flow_origin_hash(
+				    struct net *net, struct flowi4 *flp,
+				    const struct sock *sk,
+				    const struct sk_buff *skb,
+				    const struct xfrm_flow_origin *origin);
 struct dst_entry *ipv4_blackhole_route(struct net *net,
 				       struct dst_entry *dst_orig);
 

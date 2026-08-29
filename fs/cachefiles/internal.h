@@ -128,8 +128,8 @@ struct cachefiles_cache {
 	struct xarray			ondemand_ids;	/* xarray for ondemand_id allocation */
 	u32				ondemand_id_next;
 	u32				msg_id_next;
-	u32				secid;		/* LSM security id */
-	bool				have_secid;	/* whether "secid" was set */
+	struct lsm_prop_ref		*secctx_ref;	/* Owned configured identity */
+	u32				secid;		/* Legacy diagnostic mirror */
 };
 
 static inline bool cachefiles_in_ondemand_mode(struct cachefiles_cache *cache)
@@ -389,6 +389,11 @@ extern int cachefiles_get_security_ID(struct cachefiles_cache *cache);
 extern int cachefiles_determine_cache_security(struct cachefiles_cache *cache,
 					       struct dentry *root,
 					       const struct cred **_saved_cred);
+#ifdef CONFIG_KUNIT
+int cachefiles_kunit_apply_secctx_ref(struct lsm_prop_ref *ref,
+				     u32 diagnostic_secid,
+				     struct lsm_prop *applied_prop);
+#endif
 
 static inline void cachefiles_begin_secure(struct cachefiles_cache *cache,
 					   const struct cred **_saved_cred)

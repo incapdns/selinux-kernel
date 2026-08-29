@@ -306,8 +306,10 @@ nfsd_proc_create(struct svc_rqst *rqstp)
 		goto done;
 	}
 
-	dchild = start_creating(&nop_mnt_idmap, dirfhp->fh_dentry,
-				&QSTR_LEN(argp->name, argp->len));
+	dchild = start_creating_mnt(&nop_mnt_idmap,
+				    dirfhp->fh_export->ex_path.mnt,
+				    dirfhp->fh_dentry,
+				    &QSTR_LEN(argp->name, argp->len));
 	if (IS_ERR(dchild)) {
 		resp->status = nfserrno(PTR_ERR(dchild));
 		goto out_write;

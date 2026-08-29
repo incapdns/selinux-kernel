@@ -3,6 +3,7 @@
  * Copyright (c) 2016 Facebook
  */
 #include <linux/bpf.h>
+#include <linux/security.h>
 #include <linux/btf.h>
 #include <linux/jhash.h>
 #include <linux/filter.h>
@@ -2632,6 +2633,7 @@ static void fd_htab_map_free(struct bpf_map *map)
 /* only called from syscall */
 int bpf_fd_htab_map_lookup_elem(struct bpf_map *map, void *key, u32 *value)
 {
+	struct bpf_map *inner;
 	void **ptr;
 	int ret = 0;
 
@@ -2640,11 +2642,16 @@ int bpf_fd_htab_map_lookup_elem(struct bpf_map *map, void *key, u32 *value)
 
 	rcu_read_lock();
 	ptr = htab_map_lookup_elem(map, key);
-	if (ptr)
-		*value = map->ops->map_fd_sys_lookup_elem(READ_ONCE(*ptr));
-	else
-		ret = -ENOENT;
+	inner = ptr ? __bpf_map_inc_not_zero(READ_ONCE(*ptr), false) : NULL;
 	rcu_read_unlock();
+	if (!inner)
+		return -ENOENT;
+	if (IS_ERR(inner))
+		return PTR_ERR(inner);
+	ret = security_bpf_map(inner, FMODE_READ);
+	if (!ret)
+		*value = map->ops->map_fd_sys_lookup_elem(inner);
+	bpf_map_put(inner);
 
 	return ret;
 }
@@ -2659,6 +2666,11 @@ int bpf_fd_htab_map_update_elem(struct bpf_map *map, struct file *map_file,
 	ptr = map->ops->map_fd_get_ptr(map, map_file, *(int *)value);
 	if (IS_ERR(ptr))
 		return PTR_ERR(ptr);
+	ret = security_bpf_map_relation(map, ptr, NULL);
+	if (ret) {
+		map->ops->map_fd_put_ptr(map, ptr, false);
+		return ret;
+	}
 
 	/* The htab bucket lock is always held during update operations in fd
 	 * htab map, and the following rcu_read_lock() is only used to avoid

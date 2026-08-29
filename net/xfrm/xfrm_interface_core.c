@@ -453,7 +453,12 @@ xfrmi_xmit2(struct sk_buff *skb, struct net_device *dev, struct flowi *fl)
 	}
 
 	dst_hold(dst);
-	dst = xfrm_lookup_with_ifid(xi->net, dst, fl, NULL, 0, if_id);
+	{
+		struct xfrm_flow_origin origin = xfrm_flow_origin_skb(skb);
+
+		dst = xfrm_lookup_with_ifid_origin(xi->net, dst, fl, NULL,
+						    &origin, 0, if_id);
+	}
 	if (IS_ERR(dst)) {
 		err = PTR_ERR(dst);
 		dst = NULL;

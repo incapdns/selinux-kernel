@@ -8968,7 +8968,7 @@ init_tracer_tracefs(struct trace_array *tr, struct dentry *d_tracer)
 }
 
 #ifdef CONFIG_TRACEFS_AUTOMOUNT_DEPRECATED
-static struct vfsmount *trace_automount(struct dentry *mntpt, void *ingore)
+static struct vfsmount *trace_automount(const struct path *path, void *ingore)
 {
 	struct vfsmount *mnt;
 	struct file_system_type *type;
@@ -8984,7 +8984,7 @@ static struct vfsmount *trace_automount(struct dentry *mntpt, void *ingore)
 	if (!type)
 		return NULL;
 
-	fc = fs_context_for_submount(type, mntpt);
+	fc = fs_context_for_submount(type, path);
 	put_filesystem(type);
 	if (IS_ERR(fc))
 		return ERR_CAST(fc);

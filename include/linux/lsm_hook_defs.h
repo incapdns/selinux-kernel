@@ -44,7 +44,8 @@ LSM_HOOK(int, 0, capset, struct cred *new, const struct cred *old,
 LSM_HOOK(int, 0, capable, const struct cred *cred, struct user_namespace *ns,
 	 int cap, unsigned int opts)
 LSM_HOOK(int, 0, quotactl, int cmds, int type, int id, const struct super_block *sb)
-LSM_HOOK(int, 0, quota_on, struct dentry *dentry)
+LSM_HOOK(int, 0, quota_on, const struct vfsmount *mnt,
+	 struct dentry *dentry)
 LSM_HOOK(int, 0, syslog, int type)
 LSM_HOOK(int, 0, settime, const struct timespec64 *ts,
 	 const struct timezone *tz)
@@ -54,21 +55,35 @@ LSM_HOOK(int, 0, bprm_creds_from_file, struct linux_binprm *bprm, const struct f
 LSM_HOOK(int, 0, bprm_check_security, struct linux_binprm *bprm)
 LSM_HOOK(void, LSM_RET_VOID, bprm_committing_creds, const struct linux_binprm *bprm)
 LSM_HOOK(void, LSM_RET_VOID, bprm_committed_creds, const struct linux_binprm *bprm)
-LSM_HOOK(int, 0, fs_context_submount, struct fs_context *fc, struct super_block *reference)
+LSM_HOOK(int, 0, fs_context_submount, struct fs_context *fc,
+	 const struct path *reference)
 LSM_HOOK(int, 0, fs_context_dup, struct fs_context *fc,
 	 struct fs_context *src_sc)
 LSM_HOOK(int, -ENOPARAM, fs_context_parse_param, struct fs_context *fc,
 	 struct fs_parameter *param)
+LSM_HOOK(int, 0, mnt_alloc_security, struct vfsmount *mnt,
+	 const struct vfsmount *src_mnt, struct fs_context *fc)
+LSM_HOOK(void, LSM_RET_VOID, mnt_free_security, struct vfsmount *mnt)
+LSM_HOOK(int, 0, mnt_topology_add, struct security_mnt_topology *topology,
+	 const struct vfsmount *source, const struct vfsmount *target)
+LSM_HOOK(int, 0, mnt_topology_apply, struct security_mnt_topology *topology,
+	 struct vfsmount *mnt, const struct vfsmount *target)
+LSM_HOOK(void, LSM_RET_VOID, mnt_topology_free,
+	 struct security_mnt_topology *topology)
 LSM_HOOK(int, 0, sb_alloc_security, struct super_block *sb)
+LSM_HOOK(int, 0, sb_pre_fill, struct super_block *sb, struct fs_context *fc,
+	 const void *security_carrier, bool is_new)
 LSM_HOOK(void, LSM_RET_VOID, sb_delete, struct super_block *sb)
 LSM_HOOK(void, LSM_RET_VOID, sb_free_security, struct super_block *sb)
 LSM_HOOK(void, LSM_RET_VOID, sb_free_mnt_opts, void *mnt_opts)
-LSM_HOOK(int, 0, sb_eat_lsm_opts, char *orig, void **mnt_opts)
+LSM_HOOK(int, 0, sb_eat_lsm_opts, char *orig, struct fs_context *fc)
 LSM_HOOK(int, 0, sb_mnt_opts_compat, struct super_block *sb, void *mnt_opts)
 LSM_HOOK(int, 0, sb_remount, struct super_block *sb, void *mnt_opts)
-LSM_HOOK(int, 0, sb_kern_mount, const struct super_block *sb)
+LSM_HOOK(int, 0, sb_kern_mount, const struct super_block *sb,
+	 struct fs_context *fc)
 LSM_HOOK(int, 0, sb_show_options, struct seq_file *m, struct super_block *sb)
-LSM_HOOK(int, 0, sb_statfs, struct dentry *dentry)
+LSM_HOOK(int, 0, sb_statfs, struct dentry *dentry,
+	 const struct vfsmount *mnt)
 LSM_HOOK(int, 0, sb_mount, const char *dev_name, const struct path *path,
 	 const char *type, unsigned long flags, void *data)
 LSM_HOOK(int, 0, sb_umount, struct vfsmount *mnt, int flags)
@@ -115,80 +130,121 @@ LSM_HOOK(int, 0, path_notify, const struct path *path, u64 mask,
 LSM_HOOK(int, 0, inode_alloc_security, struct inode *inode)
 LSM_HOOK(void, LSM_RET_VOID, inode_free_security, struct inode *inode)
 LSM_HOOK(void, LSM_RET_VOID, inode_free_security_rcu, void *inode_security)
+LSM_HOOK(int, 0, inode_create_plan_prepare,
+	 struct security_inode_create_plan *plan, const struct vfsmount *mnt,
+	 struct inode *dir, struct dentry *dentry, umode_t mode)
+LSM_HOOK(int, 0, inode_create_plan_attempt_abort, struct inode *inode)
+LSM_HOOK(int, 0, inode_create_plan_finish,
+	 struct security_inode_create_plan *plan, int result,
+	 struct inode *created_inode)
+LSM_HOOK(int, 0, inode_setxattr_plan_prepare,
+	 struct security_inode_setxattr_plan *plan, struct mnt_idmap *idmap,
+	 const struct vfsmount *mnt, struct dentry *dentry, const char *name,
+	 const void **value, size_t *size, int flags)
+LSM_HOOK(int, 0, inode_setxattr_plan_finish,
+	 struct security_inode_setxattr_plan *plan, int result)
+LSM_HOOK(int, 0, inode_init_security_plan, struct inode *inode,
+	 struct inode *dir, const struct qstr *qstr, struct xattr *xattrs,
+	 int *xattr_count)
+LSM_HOOK(int, 0, inode_init_security_commit, struct inode *inode, int result)
 LSM_HOOK(int, -EOPNOTSUPP, inode_init_security, struct inode *inode,
 	 struct inode *dir, const struct qstr *qstr, struct xattr *xattrs,
 	 int *xattr_count)
 LSM_HOOK(int, 0, inode_init_security_anon, struct inode *inode,
 	 const struct qstr *name, const struct inode *context_inode)
-LSM_HOOK(int, 0, inode_create, struct inode *dir, struct dentry *dentry,
-	 umode_t mode)
+LSM_HOOK(int, 0, inode_create, const struct vfsmount *mnt, struct inode *dir,
+	 struct dentry *dentry, umode_t mode)
 LSM_HOOK(void, LSM_RET_VOID, inode_post_create_tmpfile, struct mnt_idmap *idmap,
 	 struct inode *inode)
-LSM_HOOK(int, 0, inode_link, struct dentry *old_dentry, struct inode *dir,
+LSM_HOOK(int, 0, inode_link, const struct vfsmount *old_mnt,
+	 struct dentry *old_dentry, const struct vfsmount *new_mnt,
+	 struct inode *dir, struct dentry *new_dentry)
+LSM_HOOK(int, 0, inode_unlink, const struct vfsmount *mnt, struct inode *dir,
+	 struct dentry *dentry)
+LSM_HOOK(int, 0, inode_symlink, const struct vfsmount *mnt, struct inode *dir,
+	 struct dentry *dentry, const char *old_name)
+LSM_HOOK(int, 0, inode_mkdir, const struct vfsmount *mnt, struct inode *dir,
+	 struct dentry *dentry, umode_t mode)
+LSM_HOOK(int, 0, inode_rmdir, const struct vfsmount *mnt, struct inode *dir,
+	 struct dentry *dentry)
+LSM_HOOK(int, 0, inode_mknod, const struct vfsmount *mnt, struct inode *dir,
+	 struct dentry *dentry, umode_t mode, dev_t dev)
+LSM_HOOK(int, 0, inode_rename, const struct vfsmount *old_mnt,
+	 struct inode *old_dir, struct dentry *old_dentry,
+	 const struct vfsmount *new_mnt, struct inode *new_dir,
 	 struct dentry *new_dentry)
-LSM_HOOK(int, 0, inode_unlink, struct inode *dir, struct dentry *dentry)
-LSM_HOOK(int, 0, inode_symlink, struct inode *dir, struct dentry *dentry,
-	 const char *old_name)
-LSM_HOOK(int, 0, inode_mkdir, struct inode *dir, struct dentry *dentry,
-	 umode_t mode)
-LSM_HOOK(int, 0, inode_rmdir, struct inode *dir, struct dentry *dentry)
-LSM_HOOK(int, 0, inode_mknod, struct inode *dir, struct dentry *dentry,
-	 umode_t mode, dev_t dev)
-LSM_HOOK(int, 0, inode_rename, struct inode *old_dir, struct dentry *old_dentry,
-	 struct inode *new_dir, struct dentry *new_dentry)
-LSM_HOOK(int, 0, inode_readlink, struct dentry *dentry)
-LSM_HOOK(int, 0, inode_follow_link, struct dentry *dentry, struct inode *inode,
-	 bool rcu)
-LSM_HOOK(int, 0, inode_permission, struct inode *inode, int mask)
-LSM_HOOK(int, 0, inode_setattr, struct mnt_idmap *idmap, struct dentry *dentry,
-	 struct iattr *attr)
+LSM_HOOK(int, 0, inode_readlink, const struct vfsmount *mnt,
+	 struct dentry *dentry)
+LSM_HOOK(int, 0, inode_follow_link, const struct vfsmount *mnt,
+	 struct dentry *dentry, struct inode *inode, bool rcu)
+LSM_HOOK(int, 0, inode_permission, const struct vfsmount *mnt,
+	 struct inode *inode, int mask)
+LSM_HOOK(int, 0, inode_setattr, struct mnt_idmap *idmap,
+	 const struct vfsmount *mnt, struct dentry *dentry, struct iattr *attr)
 LSM_HOOK(void, LSM_RET_VOID, inode_post_setattr, struct mnt_idmap *idmap,
 	 struct dentry *dentry, int ia_valid)
 LSM_HOOK(int, 0, inode_getattr, const struct path *path)
 LSM_HOOK(int, 0, inode_xattr_skipcap, const char *name)
 LSM_HOOK(int, 0, inode_setxattr, struct mnt_idmap *idmap,
-	 struct dentry *dentry, const char *name, const void *value,
-	 size_t size, int flags)
+	 const struct vfsmount *mnt, struct dentry *dentry, const char *name,
+	 const void *value, size_t size, int flags)
 LSM_HOOK(void, LSM_RET_VOID, inode_post_setxattr, struct dentry *dentry,
 	 const char *name, const void *value, size_t size, int flags)
-LSM_HOOK(int, 0, inode_getxattr, struct dentry *dentry, const char *name)
-LSM_HOOK(int, 0, inode_listxattr, struct dentry *dentry)
-LSM_HOOK(int, 0, inode_removexattr, struct mnt_idmap *idmap,
+LSM_HOOK(int, 0, inode_getxattr, const struct vfsmount *mnt,
 	 struct dentry *dentry, const char *name)
+LSM_HOOK(int, 0, inode_listxattr, const struct vfsmount *mnt,
+	 struct dentry *dentry)
+LSM_HOOK(int, 0, inode_removexattr, struct mnt_idmap *idmap,
+	 const struct vfsmount *mnt, struct dentry *dentry, const char *name)
 LSM_HOOK(void, LSM_RET_VOID, inode_post_removexattr, struct dentry *dentry,
 	 const char *name)
-LSM_HOOK(int, 0, inode_file_setattr, struct dentry *dentry, struct file_kattr *fa)
-LSM_HOOK(int, 0, inode_file_getattr, struct dentry *dentry, struct file_kattr *fa)
+LSM_HOOK(int, 0, inode_file_setattr, const struct vfsmount *mnt,
+	 struct dentry *dentry, struct file_kattr *fa)
+LSM_HOOK(int, 0, inode_file_getattr, const struct vfsmount *mnt,
+	 struct dentry *dentry, struct file_kattr *fa)
 LSM_HOOK(int, 0, inode_set_acl, struct mnt_idmap *idmap,
-	 struct dentry *dentry, const char *acl_name, struct posix_acl *kacl)
+	 const struct vfsmount *mnt, struct dentry *dentry,
+	 const char *acl_name, struct posix_acl *kacl)
 LSM_HOOK(void, LSM_RET_VOID, inode_post_set_acl, struct dentry *dentry,
 	 const char *acl_name, struct posix_acl *kacl)
 LSM_HOOK(int, 0, inode_get_acl, struct mnt_idmap *idmap,
-	 struct dentry *dentry, const char *acl_name)
+	 const struct vfsmount *mnt, struct dentry *dentry,
+	 const char *acl_name)
 LSM_HOOK(int, 0, inode_remove_acl, struct mnt_idmap *idmap,
-	 struct dentry *dentry, const char *acl_name)
+	 const struct vfsmount *mnt, struct dentry *dentry,
+	 const char *acl_name)
 LSM_HOOK(void, LSM_RET_VOID, inode_post_remove_acl, struct mnt_idmap *idmap,
 	 struct dentry *dentry, const char *acl_name)
 LSM_HOOK(int, 0, inode_need_killpriv, struct dentry *dentry)
 LSM_HOOK(int, 0, inode_killpriv, struct mnt_idmap *idmap,
 	 struct dentry *dentry)
 LSM_HOOK(int, -EOPNOTSUPP, inode_getsecurity, struct mnt_idmap *idmap,
-	 struct inode *inode, const char *name, void **buffer, bool alloc)
+	 const struct vfsmount *mnt, struct inode *inode, const char *name,
+	 void **buffer, bool alloc)
 LSM_HOOK(int, -EOPNOTSUPP, inode_setsecurity, struct inode *inode,
 	 const char *name, const void *value, size_t size, int flags)
 LSM_HOOK(int, 0, inode_listsecurity, struct inode *inode, char **buffer,
 	 ssize_t *remaining_size)
 LSM_HOOK(void, LSM_RET_VOID, inode_getlsmprop, struct inode *inode,
 	 struct lsm_prop *prop)
-LSM_HOOK(int, 0, inode_copy_up, struct dentry *src, struct cred **new)
+LSM_HOOK(int, 0, inode_copy_up, const struct path *src,
+	 const struct vfsmount *dst_mnt, struct cred **new)
+LSM_HOOK(int, 0, inode_copy_up_post, const struct path *src,
+	 const struct vfsmount *dst_mnt, struct dentry *dst)
 LSM_HOOK(int, -EOPNOTSUPP, inode_copy_up_xattr, struct dentry *src,
 	 const char *name)
 LSM_HOOK(int, 0, inode_setintegrity, const struct inode *inode,
 	 enum lsm_integrity_type type, const void *value, size_t size)
+LSM_HOOK(int, 0, kernfs_root_alloc_security, void *root_security)
+LSM_HOOK(void, LSM_RET_VOID, kernfs_root_free_security, void *root_security)
+LSM_HOOK(int, 0, kernfs_root_to_sb, struct super_block *sb,
+	 const void *root_security)
 LSM_HOOK(int, 0, kernfs_init_security, struct kernfs_node *kn_dir,
-	 struct kernfs_node *kn)
+	 struct kernfs_node *kn, const void *root_security)
 LSM_HOOK(int, 0, file_permission, struct file *file, int mask)
 LSM_HOOK(int, 0, file_alloc_security, struct file *file)
+LSM_HOOK(int, 0, file_set_path, struct file *file)
+LSM_HOOK(int, 0, file_init_security_anon, struct file *file)
 LSM_HOOK(void, LSM_RET_VOID, file_release, struct file *file)
 LSM_HOOK(void, LSM_RET_VOID, file_free_security, struct file *file)
 LSM_HOOK(int, 0, backing_file_alloc, struct file *backing_file,
@@ -265,12 +321,29 @@ LSM_HOOK(int, -ENOSYS, task_prctl, int option, unsigned long arg2,
 LSM_HOOK(void, LSM_RET_VOID, task_to_inode, struct task_struct *p,
 	 struct inode *inode)
 LSM_HOOK(int, 0, userns_create, const struct cred *cred)
+LSM_HOOK(int, 0, ipc_namespace_alloc_security, struct ipc_namespace *ns,
+	 const struct ipc_namespace *old_ns, const struct cred *cred,
+	 bool initial)
+LSM_HOOK(void, LSM_RET_VOID, ipc_namespace_free_security,
+	 struct ipc_namespace *ns)
+LSM_HOOK(int, 0, ipc_namespace_reanchor_prepare,
+	 struct ipc_namespace *ns, const struct cred *cred, u64 token,
+	 struct cred *mutable_cred, struct cred **replacement_cred)
+LSM_HOOK(void, LSM_RET_VOID, ipc_namespace_reanchor_commit,
+	 struct ipc_namespace *ns, u64 token)
+LSM_HOOK(void, LSM_RET_VOID, ipc_namespace_reanchor_abort,
+	 struct ipc_namespace *ns, u64 token)
+LSM_HOOK(int, 0, ipc_namespace_create_gate, struct ipc_namespace *ns,
+	 const struct cred *cred)
+LSM_HOOK(void, LSM_RET_VOID, ipc_namespace_object_published,
+	 struct ipc_namespace *ns)
 LSM_HOOK(int, 0, ipc_permission, struct kern_ipc_perm *ipcp, short flag)
 LSM_HOOK(void, LSM_RET_VOID, ipc_getlsmprop, struct kern_ipc_perm *ipcp,
 	 struct lsm_prop *prop)
 LSM_HOOK(int, 0, msg_msg_alloc_security, struct msg_msg *msg)
 LSM_HOOK(void, LSM_RET_VOID, msg_msg_free_security, struct msg_msg *msg)
-LSM_HOOK(int, 0, msg_queue_alloc_security, struct kern_ipc_perm *perm)
+LSM_HOOK(int, 0, msg_queue_alloc_security, struct ipc_namespace *ns,
+	 struct kern_ipc_perm *perm)
 LSM_HOOK(void, LSM_RET_VOID, msg_queue_free_security,
 	 struct kern_ipc_perm *perm)
 LSM_HOOK(int, 0, msg_queue_associate, struct kern_ipc_perm *perm, int msqflg)
@@ -279,13 +352,15 @@ LSM_HOOK(int, 0, msg_queue_msgsnd, struct kern_ipc_perm *perm,
 	 struct msg_msg *msg, int msqflg)
 LSM_HOOK(int, 0, msg_queue_msgrcv, struct kern_ipc_perm *perm,
 	 struct msg_msg *msg, struct task_struct *target, long type, int mode)
-LSM_HOOK(int, 0, shm_alloc_security, struct kern_ipc_perm *perm)
+LSM_HOOK(int, 0, shm_alloc_security, struct ipc_namespace *ns,
+	 struct kern_ipc_perm *perm)
 LSM_HOOK(void, LSM_RET_VOID, shm_free_security, struct kern_ipc_perm *perm)
 LSM_HOOK(int, 0, shm_associate, struct kern_ipc_perm *perm, int shmflg)
 LSM_HOOK(int, 0, shm_shmctl, struct kern_ipc_perm *perm, int cmd)
 LSM_HOOK(int, 0, shm_shmat, struct kern_ipc_perm *perm, char __user *shmaddr,
 	 int shmflg)
-LSM_HOOK(int, 0, sem_alloc_security, struct kern_ipc_perm *perm)
+LSM_HOOK(int, 0, sem_alloc_security, struct ipc_namespace *ns,
+	 struct kern_ipc_perm *perm)
 LSM_HOOK(void, LSM_RET_VOID, sem_free_security, struct kern_ipc_perm *perm)
 LSM_HOOK(int, 0, sem_associate, struct kern_ipc_perm *perm, int semflg)
 LSM_HOOK(int, 0, sem_semctl, struct kern_ipc_perm *perm, int cmd)
@@ -303,9 +378,24 @@ LSM_HOOK(int, -EINVAL, getprocattr, struct task_struct *p, const char *name,
 LSM_HOOK(int, -EINVAL, setprocattr, const char *name, void *value, size_t size)
 LSM_HOOK(int, 0, ismaclabel, const char *name)
 LSM_HOOK(int, -EOPNOTSUPP, secid_to_secctx, u32 secid, struct lsm_context *cp)
-LSM_HOOK(int, -EOPNOTSUPP, lsmprop_to_secctx, struct lsm_prop *prop,
+LSM_HOOK(int, -EOPNOTSUPP, lsmprop_to_secctx,
+	 const struct lsm_prop *prop,
 	 struct lsm_context *cp)
 LSM_HOOK(int, 0, secctx_to_secid, const char *secdata, u32 seclen, u32 *secid)
+/*
+ * Return -EOPNOTSUPP without changing ref when the source is not understood.
+ * Returning zero claims the source and must populate ref->prop; SECCTX/SECID
+ * providers must also set ref->source_secid to the nonzero local secid they
+ * resolved.
+ */
+LSM_HOOK(int, -EOPNOTSUPP, prop_ref_capture, struct lsm_prop_ref *ref,
+	 const struct lsm_prop_ref_source *source, gfp_t gfp)
+LSM_HOOK(void, LSM_RET_VOID, prop_ref_free, struct lsm_prop_ref *ref)
+LSM_HOOK(int, -EOPNOTSUPP, prop_ref_to_secctx,
+	 const struct lsm_prop_ref *ref, const struct cred *observer,
+	 struct lsm_context *cp)
+LSM_HOOK(int, 0, kernel_act_as_ref, struct cred *new,
+	 const struct lsm_prop_ref *ref)
 LSM_HOOK(void, LSM_RET_VOID, release_secctx, struct lsm_context *cp)
 LSM_HOOK(void, LSM_RET_VOID, inode_invalidate_secctx, struct inode *inode)
 LSM_HOOK(int, 0, inode_notifysecctx, struct inode *inode, void *ctx, u32 ctxlen)
@@ -355,10 +445,30 @@ LSM_HOOK(int, -ENOPROTOOPT, socket_getpeersec_stream, struct socket *sock,
 	 sockptr_t optval, sockptr_t optlen, unsigned int len)
 LSM_HOOK(int, -ENOPROTOOPT, socket_getpeersec_dgram, struct socket *sock,
 	 struct sk_buff *skb, u32 *secid)
+LSM_HOOK(int, -EOPNOTSUPP, socket_getpeersec_dgram_ctx,
+	 struct sock *observer, struct sk_buff *skb, struct lsm_context *cp)
+LSM_HOOK(int, 0, scm_alloc_security, struct lsm_scm_security *scm,
+	 struct socket *sock, gfp_t gfp)
+LSM_HOOK(void, LSM_RET_VOID, scm_free_security,
+	 struct lsm_scm_security *scm)
+LSM_HOOK(int, 1, scm_secdata_eq, const struct lsm_scm_security *left,
+	 const struct lsm_scm_security *right)
+LSM_HOOK(int, -EOPNOTSUPP, scm_getsecctx,
+	 const struct lsm_scm_security *scm, const struct cred *observer_cred,
+	 struct sock *observer, struct lsm_context *cp)
 LSM_HOOK(int, 0, sk_alloc_security, struct sock *sk, int family, gfp_t priority)
 LSM_HOOK(void, LSM_RET_VOID, sk_free_security, struct sock *sk)
 LSM_HOOK(void, LSM_RET_VOID, sk_clone_security, const struct sock *sk,
 	 struct sock *newsk)
+LSM_HOOK(int, 0, req_alloc_security, struct request_sock *req,
+	 const struct sock *listener, gfp_t gfp)
+LSM_HOOK(void, LSM_RET_VOID, req_free_security, struct request_sock *req)
+LSM_HOOK(int, 0, req_clone_security, const struct request_sock *req,
+	 struct request_sock *newreq, gfp_t gfp)
+LSM_HOOK(int, 0, sctp_assoc_alloc_security,
+	 struct sctp_association *asoc, gfp_t gfp)
+LSM_HOOK(void, LSM_RET_VOID, sctp_assoc_free_security,
+	 struct sctp_association *asoc)
 LSM_HOOK(void, LSM_RET_VOID, sk_getsecid, const struct sock *sk, u32 *secid)
 LSM_HOOK(void, LSM_RET_VOID, sock_graft, struct sock *sk, struct socket *parent)
 LSM_HOOK(int, 0, inet_conn_request, const struct sock *sk, struct sk_buff *skb,
@@ -367,16 +477,22 @@ LSM_HOOK(void, LSM_RET_VOID, inet_csk_clone, struct sock *newsk,
 	 const struct request_sock *req)
 LSM_HOOK(void, LSM_RET_VOID, inet_conn_established, struct sock *sk,
 	 struct sk_buff *skb)
-LSM_HOOK(int, 0, secmark_relabel_packet, u32 secid)
+LSM_HOOK(int, 0, secmark_relabel_packet, const struct net *net, u32 secid,
+	 struct lsm_secmark *secmark)
+LSM_HOOK(void, LSM_RET_VOID, secmark_release, struct lsm_secmark *secmark)
 LSM_HOOK(void, LSM_RET_VOID, secmark_refcount_inc, void)
 LSM_HOOK(void, LSM_RET_VOID, secmark_refcount_dec, void)
 LSM_HOOK(void, LSM_RET_VOID, req_classify_flow, const struct request_sock *req,
 	 struct flowi_common *flic)
-LSM_HOOK(int, 0, tun_dev_alloc_security, void *security)
+LSM_HOOK(int, 0, tun_dev_alloc_security, void *security,
+	 const struct net *net)
+LSM_HOOK(void, LSM_RET_VOID, tun_dev_free_security, void *security)
 LSM_HOOK(int, 0, tun_dev_create, void)
-LSM_HOOK(int, 0, tun_dev_attach_queue, void *security)
-LSM_HOOK(int, 0, tun_dev_attach, struct sock *sk, void *security)
-LSM_HOOK(int, 0, tun_dev_open, void *security)
+LSM_HOOK(int, 0, tun_dev_attach_queue, void *security,
+	 const struct net *net)
+LSM_HOOK(int, 0, tun_dev_attach, struct sock *sk, void *security,
+	 const struct net *net)
+LSM_HOOK(int, 0, tun_dev_open, void *security, const struct net *net)
 LSM_HOOK(int, 0, sctp_assoc_request, struct sctp_association *asoc,
 	 struct sk_buff *skb)
 LSM_HOOK(int, 0, sctp_bind_connect, struct sock *sk, int optname,
@@ -393,6 +509,7 @@ LSM_HOOK(int, 0, ib_pkey_access, void *sec, u64 subnet_prefix, u16 pkey)
 LSM_HOOK(int, 0, ib_endport_manage_subnet, void *sec, const char *dev_name,
 	 u8 port_num)
 LSM_HOOK(int, 0, ib_alloc_security, void *sec)
+LSM_HOOK(void, LSM_RET_VOID, ib_free_security, void *sec)
 #endif /* CONFIG_SECURITY_INFINIBAND */
 
 #ifdef CONFIG_SECURITY_NETWORK_XFRM
@@ -406,12 +523,15 @@ LSM_HOOK(int, 0, xfrm_policy_delete_security, struct xfrm_sec_ctx *ctx)
 LSM_HOOK(int, 0, xfrm_state_alloc, struct xfrm_state *x,
 	 struct xfrm_user_sec_ctx *sec_ctx)
 LSM_HOOK(int, 0, xfrm_state_alloc_acquire, struct xfrm_state *x,
-	 struct xfrm_sec_ctx *polsec, u32 secid)
+	 struct xfrm_sec_ctx *polsec, u32 secid,
+	 const struct xfrm_flow_origin *origin)
 LSM_HOOK(void, LSM_RET_VOID, xfrm_state_free_security, struct xfrm_state *x)
 LSM_HOOK(int, 0, xfrm_state_delete_security, struct xfrm_state *x)
-LSM_HOOK(int, 0, xfrm_policy_lookup, struct xfrm_sec_ctx *ctx, u32 fl_secid)
+LSM_HOOK(int, 0, xfrm_policy_lookup, struct xfrm_sec_ctx *ctx, u32 fl_secid,
+	 const struct xfrm_flow_origin *origin)
 LSM_HOOK(int, 1, xfrm_state_pol_flow_match, struct xfrm_state *x,
-	 struct xfrm_policy *xp, const struct flowi_common *flic)
+	 struct xfrm_policy *xp, const struct flowi_common *flic,
+	 const struct xfrm_flow_origin *origin)
 LSM_HOOK(int, 0, xfrm_decode_session, struct sk_buff *skb, u32 *secid,
 	 int ckall)
 #endif /* CONFIG_SECURITY_NETWORK_XFRM */
@@ -420,6 +540,7 @@ LSM_HOOK(int, 0, xfrm_decode_session, struct sk_buff *skb, u32 *secid,
 #ifdef CONFIG_KEYS
 LSM_HOOK(int, 0, key_alloc, struct key *key, const struct cred *cred,
 	 unsigned long flags)
+LSM_HOOK(void, LSM_RET_VOID, key_free, struct key *key)
 LSM_HOOK(int, 0, key_permission, key_ref_t key_ref, const struct cred *cred,
 	 enum key_need_perm need_perm)
 LSM_HOOK(int, 0, key_getsecurity, struct key *key, char **buffer)
@@ -432,21 +553,37 @@ LSM_HOOK(void, LSM_RET_VOID, key_post_create_or_update, struct key *keyring,
 LSM_HOOK(int, 0, audit_rule_init, u32 field, u32 op, char *rulestr,
 	 void **lsmrule, gfp_t gfp)
 LSM_HOOK(int, 0, audit_rule_known, struct audit_krule *krule)
-LSM_HOOK(int, 0, audit_rule_match, struct lsm_prop *prop, u32 field, u32 op,
-	 void *lsmrule)
+LSM_HOOK(int, 0, audit_rule_match, const struct lsm_prop_ref *ref,
+	 const struct lsm_prop *prop, u32 field, u32 op, void *lsmrule)
 LSM_HOOK(void, LSM_RET_VOID, audit_rule_free, void *lsmrule)
 #endif /* CONFIG_AUDIT */
 
 #ifdef CONFIG_BPF_SYSCALL
 LSM_HOOK(int, 0, bpf, int cmd, union bpf_attr *attr, unsigned int size, bool kernel)
 LSM_HOOK(int, 0, bpf_map, struct bpf_map *map, fmode_t fmode)
+LSM_HOOK(int, 0, bpf_map_relation, struct bpf_map *outer,
+	 const struct bpf_map *inner, const struct bpf_prog *prog)
 LSM_HOOK(int, 0, bpf_prog, struct bpf_prog *prog)
+LSM_HOOK(int, 0, bpf_prog_map_relation, struct bpf_prog *prog,
+	 const struct bpf_map *map)
 LSM_HOOK(int, 0, bpf_map_create, struct bpf_map *map, union bpf_attr *attr,
 	 struct bpf_token *token, bool kernel)
 LSM_HOOK(void, LSM_RET_VOID, bpf_map_free, struct bpf_map *map)
 LSM_HOOK(int, 0, bpf_prog_load, struct bpf_prog *prog, union bpf_attr *attr,
 	 struct bpf_token *token, bool kernel)
+LSM_HOOK(int, 0, bpf_prog_commit, struct bpf_prog *prog)
 LSM_HOOK(void, LSM_RET_VOID, bpf_prog_free, struct bpf_prog *prog)
+LSM_HOOK(int, 0, bpf_link_create, struct bpf_link *link,
+	 const struct bpf_prog *related_prog, const struct bpf_map *related_map)
+LSM_HOOK(void, LSM_RET_VOID, bpf_link_free, struct bpf_link *link)
+LSM_HOOK(int, 0, bpf_link_access, struct bpf_link *link, enum bpf_cmd cmd)
+LSM_HOOK(int, 0, bpf_link_update, struct bpf_link *link,
+	 const struct bpf_prog *new_prog, const struct bpf_prog *old_prog,
+	 const struct bpf_map *new_map, const struct bpf_map *old_map)
+LSM_HOOK(int, 0, bpf_btf, const struct btf *btf)
+LSM_HOOK(int, 0, bpf_btf_load, struct btf *btf, const union bpf_attr *attr,
+	 struct bpf_token *token, enum bpf_btf_origin origin)
+LSM_HOOK(void, LSM_RET_VOID, bpf_btf_free, struct btf *btf)
 LSM_HOOK(int, 0, bpf_token_create, struct bpf_token *token, union bpf_attr *attr,
 	 const struct path *path)
 LSM_HOOK(void, LSM_RET_VOID, bpf_token_free, struct bpf_token *token)
@@ -459,8 +596,11 @@ LSM_HOOK(int, 0, locked_down, enum lockdown_reason what)
 #ifdef CONFIG_PERF_EVENTS
 LSM_HOOK(int, 0, perf_event_open, int type)
 LSM_HOOK(int, 0, perf_event_alloc, struct perf_event *event)
+LSM_HOOK(void, LSM_RET_VOID, perf_event_free, struct perf_event *event)
 LSM_HOOK(int, 0, perf_event_read, struct perf_event *event)
 LSM_HOOK(int, 0, perf_event_write, struct perf_event *event)
+LSM_HOOK(int, 0, perf_event_relation, struct perf_event *event,
+	 unsigned int access)
 #endif /* CONFIG_PERF_EVENTS */
 
 #ifdef CONFIG_IO_URING

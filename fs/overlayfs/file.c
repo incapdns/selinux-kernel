@@ -41,7 +41,8 @@ static struct file *ovl_open_realfile(const struct file *file,
 
 	with_ovl_creds(inode->i_sb) {
 		real_idmap = mnt_idmap(realpath->mnt);
-		err = inode_permission(real_idmap, realinode, MAY_OPEN | acc_mode);
+		err = inode_permission_mnt(real_idmap, realpath->mnt, realinode,
+					   MAY_OPEN | acc_mode);
 		if (err) {
 			realfile = ERR_PTR(err);
 		} else {

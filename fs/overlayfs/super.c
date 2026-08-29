@@ -578,6 +578,8 @@ static int ovl_check_rename_whiteout(struct ovl_fs *ofs)
 		return err;
 
 	rd.mnt_idmap = ovl_upper_mnt_idmap(ofs);
+	rd.old_mnt = ovl_upper_mnt(ofs);
+	rd.new_mnt = ovl_upper_mnt(ofs);
 	rd.old_parent = workdir;
 	rd.new_parent = workdir;
 	rd.flags = RENAME_WHITEOUT;

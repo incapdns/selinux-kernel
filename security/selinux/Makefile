@@ -14,16 +14,20 @@ ccflags-y := -I$(srctree)/security/selinux -I$(srctree)/security/selinux/include
 
 ccflags-$(CONFIG_SECURITY_SELINUX_DEBUG) += -DDEBUG
 
-selinux-y := avc.o hooks.o selinuxfs.o netlink.o nlmsgtab.o netif.o \
-	     netnode.o netport.o status.o initcalls.o \
+selinux-y := avc.o hooks.o label.o label_view.o resource.o net_assertion.o selinuxfs.o \
+	     netlink.o nlmsgtab.o netif.o netnode.o netport.o status.o initcalls.o \
 	     ss/ebitmap.o ss/hashtab.o ss/symtab.o ss/sidtab.o ss/avtab.o \
 	     ss/policydb.o ss/services.o ss/conditional.o ss/mls.o ss/context.o
 
 selinux-$(CONFIG_SECURITY_NETWORK_XFRM) += xfrm.o
+selinux-$(CONFIG_NET) += netns.o
 selinux-$(CONFIG_NETLABEL) += netlabel.o
 selinux-$(CONFIG_SECURITY_INFINIBAND) += ibpkey.o
 selinux-$(CONFIG_IMA) += ima.o
-selinux-$(CONFIG_SECURITY_SELINUX_NS) += global_sidtab.o
+selinux-$(CONFIG_SECURITY_SELINUX_NS) += global_sidtab.o label_map.o pathless.o namespace.o ipcns.o
+selinux-$(CONFIG_SECURITY_SELINUX_KUNIT_TEST) += namespaces_test.o namespace_test.o create_plan_test.o kernfs_test.o \
+	global_sid_fault_test.o label_resource_fault_test.o \
+	map_view_pathless_fault_test.o
 
 genhdrs := flask.h av_permissions.h
 

@@ -595,6 +595,7 @@ out:
 /**
  * evm_inode_setxattr - protect the EVM extended attribute
  * @idmap: idmap of the mount
+ * @mnt: mount containing the affected dentry
  * @dentry: pointer to the affected dentry
  * @xattr_name: pointer to the affected extended attribute name
  * @xattr_value: pointer to the new extended attribute value
@@ -607,7 +608,8 @@ out:
  * userspace from writing HMAC value.  Writing 'security.evm' requires
  * requires CAP_SYS_ADMIN privileges.
  */
-static int evm_inode_setxattr(struct mnt_idmap *idmap, struct dentry *dentry,
+static int evm_inode_setxattr(struct mnt_idmap *idmap,
+			      const struct vfsmount *mnt, struct dentry *dentry,
 			      const char *xattr_name, const void *xattr_value,
 			      size_t xattr_value_len, int flags)
 {
@@ -633,13 +635,16 @@ static int evm_inode_setxattr(struct mnt_idmap *idmap, struct dentry *dentry,
 /**
  * evm_inode_removexattr - protect the EVM extended attribute
  * @idmap: idmap of the mount
+ * @mnt: mount containing the affected dentry
  * @dentry: pointer to the affected dentry
  * @xattr_name: pointer to the affected extended attribute name
  *
  * Removing 'security.evm' requires CAP_SYS_ADMIN privileges and that
  * the current value is valid.
  */
-static int evm_inode_removexattr(struct mnt_idmap *idmap, struct dentry *dentry,
+static int evm_inode_removexattr(struct mnt_idmap *idmap,
+				 const struct vfsmount *mnt,
+				 struct dentry *dentry,
 				 const char *xattr_name)
 {
 	/* Policy permits modification of the protected xattrs even though
@@ -683,6 +688,7 @@ static inline int evm_inode_set_acl_change(struct mnt_idmap *idmap,
 /**
  * evm_inode_set_acl - protect the EVM extended attribute from posix acls
  * @idmap: idmap of the idmapped mount
+ * @mnt: mount containing the affected dentry
  * @dentry: pointer to the affected dentry
  * @acl_name: name of the posix acl
  * @kacl: pointer to the posix acls
@@ -693,7 +699,8 @@ static inline int evm_inode_set_acl_change(struct mnt_idmap *idmap,
  *
  * Return: zero on success, -EPERM on failure.
  */
-static int evm_inode_set_acl(struct mnt_idmap *idmap, struct dentry *dentry,
+static int evm_inode_set_acl(struct mnt_idmap *idmap,
+			     const struct vfsmount *mnt, struct dentry *dentry,
 			     const char *acl_name, struct posix_acl *kacl)
 {
 	enum integrity_status evm_status;
@@ -736,6 +743,7 @@ static int evm_inode_set_acl(struct mnt_idmap *idmap, struct dentry *dentry,
 /**
  * evm_inode_remove_acl - Protect the EVM extended attribute from posix acls
  * @idmap: idmap of the mount
+ * @mnt: mount containing the affected dentry
  * @dentry: pointer to the affected dentry
  * @acl_name: name of the posix acl
  *
@@ -745,10 +753,11 @@ static int evm_inode_set_acl(struct mnt_idmap *idmap, struct dentry *dentry,
  *
  * Return: zero on success, -EPERM on failure.
  */
-static int evm_inode_remove_acl(struct mnt_idmap *idmap, struct dentry *dentry,
-				const char *acl_name)
+static int evm_inode_remove_acl(struct mnt_idmap *idmap,
+				const struct vfsmount *mnt,
+				struct dentry *dentry, const char *acl_name)
 {
-	return evm_inode_set_acl(idmap, dentry, acl_name, NULL);
+	return evm_inode_set_acl(idmap, mnt, dentry, acl_name, NULL);
 }
 
 static void evm_reset_status(struct inode *inode)
@@ -950,13 +959,15 @@ static int evm_attr_change(struct mnt_idmap *idmap,
 /**
  * evm_inode_setattr - prevent updating an invalid EVM extended attribute
  * @idmap: idmap of the mount
+ * @mnt: mount containing the affected dentry
  * @dentry: pointer to the affected dentry
  * @attr: iattr structure containing the new file attributes
  *
  * Permit update of file attributes when files have a valid EVM signature,
  * except in the case of them having an immutable portable signature.
  */
-static int evm_inode_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+static int evm_inode_setattr(struct mnt_idmap *idmap,
+			     const struct vfsmount *mnt, struct dentry *dentry,
 			     struct iattr *attr)
 {
 	unsigned int ia_valid = attr->ia_valid;

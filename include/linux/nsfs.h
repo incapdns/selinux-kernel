@@ -23,6 +23,12 @@ bool ns_match(const struct ns_common *ns, dev_t dev, ino_t ino);
 int ns_get_name(char *buf, size_t size, struct task_struct *task,
 			const struct proc_ns_operations *ns_ops);
 void nsfs_init(void);
+int open_namespace(struct ns_common *ns);
+struct file *open_namespace_file(struct ns_common *ns);
+
+#if IS_ENABLED(CONFIG_KUNIT)
+bool nsfs_kunit_handle_fields_valid(u64 ns_id, u32 ns_inum, u32 ns_type);
+#endif
 
 #define __current_namespace_from_type(__ns)				\
 	_Generic((__ns),						\

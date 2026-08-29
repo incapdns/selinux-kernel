@@ -58,6 +58,69 @@ config SECURITY_SELINUX_SIDTAB_HASH_BITS
 	  chain lengths are high (e.g. > 20) then selecting a higher value here
 	  will ensure that lookups times are short and stable.
 
+config SECURITY_SELINUX_LABELS_PER_DOMAIN
+	int "Maximum canonical SELinux labels per provenance domain"
+	depends on SECURITY_SELINUX
+	range 1024 1048576
+	default 65536
+	help
+	  This option sets a hard upper bound on the number of canonical label
+	  references interned in one SELinux provenance domain.  It is enforced
+	  together with SECURITY_SELINUX_LABEL_BYTES_PER_DOMAIN so neither many
+	  small labels nor fewer large contexts can consume unbounded kernel
+	  memory.  Independent provenance domains have independent limits.
+
+config SECURITY_SELINUX_LABEL_BYTES_PER_DOMAIN
+	int "Maximum canonical SELinux label bytes per provenance domain"
+	depends on SECURITY_SELINUX
+	range 1048576 1073741824
+	default 16777216
+	help
+	  This option sets a hard upper bound on the bytes charged to canonical
+	  label references interned in one SELinux provenance domain.  It is
+	  enforced together with SECURITY_SELINUX_LABELS_PER_DOMAIN so both label
+	  count and aggregate memory are bounded with O(1) accounting.
+
+config SECURITY_SELINUX_RESOURCE_OBJECTS_PER_USERNS
+	int "Maximum charged SELinux objects per owning user namespace"
+	depends on SECURITY_SELINUX
+	range 4096 16777216
+	default 1048576
+	help
+	  Hard aggregate limit for SELinux namespace objects owned by one user
+	  namespace.  The central account covers domains, labels, maps, map
+	  entries, views, pathless projections, policies, AVC entries and audit
+	  reservations, so creating many SELinux states cannot multiply a
+	  per-state allowance without bound.
+
+config SECURITY_SELINUX_RESOURCE_BYTES_PER_USERNS
+	int "Maximum charged SELinux bytes per owning user namespace"
+	depends on SECURITY_SELINUX
+	range SECURITY_SELINUX_POLICY_MAX_BYTES 2147483647
+	default 268435456
+	help
+	  Hard aggregate byte limit for all charged SELinux objects owned by one
+	  user namespace.  Reservation occurs before publication and is rolled
+	  back on failure in O(1).  The lower bound admits one maximum-size policy
+	  slot; policy reload additionally requires room for the old and staged
+	  policies to coexist.
+
+config SECURITY_SELINUX_RESOURCE_OBJECTS_GLOBAL
+	int "Maximum globally charged SELinux objects"
+	depends on SECURITY_SELINUX
+	range 16384 16777216
+	default 4194304
+	help
+	  Host-wide hard object cap applied in addition to each owner limit.
+
+config SECURITY_SELINUX_RESOURCE_BYTES_GLOBAL
+	int "Maximum globally charged SELinux bytes"
+	depends on SECURITY_SELINUX
+	range SECURITY_SELINUX_POLICY_MAX_BYTES 2147483647
+	default 1073741824
+	help
+	  Host-wide hard byte cap applied in addition to each owner limit.
+
 config SECURITY_SELINUX_AVC_HASH_BITS
 	int "SELinux avc hashtable size"
 	depends on SECURITY_SELINUX
@@ -68,6 +131,70 @@ config SECURITY_SELINUX_AVC_HASH_BITS
 	  to 2^SECURITY_SELINUX_AVC_HASH_BITS. A higher value helps maintain
 	  shorter chain lengths especially when expanding AVC nodes via
 	  /sys/fs/selinux/avc/cache_threshold.
+
+config SECURITY_SELINUX_AVC_MAX_NODES_PER_STATE
+	int "Hard maximum SELinux AVC nodes per policy state"
+	depends on SECURITY_SELINUX
+	range 512 1048576
+	default 32768
+	help
+	  Immutable hard ceiling for one state's AVC.  The writable cache
+	  threshold may select a lower operating target but cannot exceed this
+	  value.  When either this ceiling or the owner's aggregate quota is
+	  exhausted, SELinux computes the decision without caching it.
+
+config SECURITY_SELINUX_POLICY_MAX_BYTES
+	int "Maximum SELinux binary policy size in bytes"
+	depends on SECURITY_SELINUX
+	range 1048576 1073741824
+	default 67108864
+	help
+	  This option sets a hard upper bound on the size of a binary policy
+	  accepted through selinuxfs.  The limit is checked before allocating
+	  the staging buffer.  Policy loading is serialized per SELinux state,
+	  so at most this many input bytes can be staged for one state at a
+	  time.  The same bound caps the aggregate bytes retained by userspace
+	  policy snapshots for one state.  The configured value is exported
+	  read-only through
+	  /sys/fs/selinux/policy_max_bytes.
+
+	  64 MiB is deliberately larger than normal distribution and Android
+	  policies while remaining a bounded, conservative default.
+
+config SECURITY_SELINUX_AUDIT_TOKENS_PER_USERNS
+	int "SELinux audit burst per owning user namespace"
+	depends on SECURITY_SELINUX
+	range 8 65536
+	default 256
+	help
+	  Maximum burst of mandatory SELinux audit records attributable to one
+	  owning user namespace. Tokens refill at the rate selected below.
+
+config SECURITY_SELINUX_AUDIT_CHILD_TOKENS_GLOBAL
+	int "SELinux aggregate child audit burst"
+	depends on SECURITY_SELINUX
+	range 16 1048576
+	default 4096
+	help
+	  Shared burst limit for records attributable to non-initial user
+	  namespaces. This pool is disjoint from the host reserve.
+
+config SECURITY_SELINUX_AUDIT_HOST_TOKENS_RESERVED
+	int "SELinux host audit reserved burst"
+	depends on SECURITY_SELINUX
+	range 8 65536
+	default 512
+	help
+	  Audit tokens reserved exclusively for init_user_ns traffic. A child
+	  cannot consume this capacity.
+
+config SECURITY_SELINUX_AUDIT_REFILL_PER_SECOND
+	int "SELinux mandatory audit refill rate"
+	depends on SECURITY_SELINUX
+	range 1 65536
+	default 64
+	help
+	  Token refill rate for owner, child-global, and host-reserved buckets.
 
 config SECURITY_SELINUX_DEBUG
 	bool "SELinux kernel debugging support"
@@ -91,6 +218,7 @@ config SECURITY_SELINUX_DEBUG
 config SECURITY_SELINUX_NS
 	bool "SELinux namespace support (experimental)"
 	depends on SECURITY_SELINUX
+	select CRYPTO_LIB_SHA256
 	default n
 	help
 	  This enables (experimental) support for SELinux namespaces,
@@ -119,6 +247,18 @@ config SECURITY_SELINUX_MAXNS
 	  This option sets the default maximum number of SELinux namespaces.
 	  The value may be viewed or modified via /sys/fs/selinux/maxns.
 
+config SECURITY_SELINUX_MAXNS_PER_USERNS
+	int "Maximum SELinux namespaces per owning user namespace"
+	depends on SECURITY_SELINUX_NS
+	range 1 65535
+	default 1024
+	help
+	  This option sets a hard per-owner limit on SELinux namespaces.  A
+	  namespace is charged to the user namespace that owns its label domain
+	  from dormant construction until final teardown.  The limit is enforced
+	  in addition to the host-wide maxns setting and aggregate SELinux resource
+	  limits, preventing one user namespace from consuming the global pool.
+
 config SECURITY_SELINUX_MAXNSDEPTH
 	int "SELinux default maximum depth of namespaces"
 	depends on SECURITY_SELINUX_NS
@@ -138,3 +278,20 @@ config SECURITY_SELINUX_SS_SID_CACHE_SIZE
 	  Setting this option to 0 disables the cache completely.
 
 	  If unsure, keep the default value.
+
+config SECURITY_SELINUX_KUNIT_TEST
+	bool "KUnit tests for SELinux namespaces" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && SECURITY_SELINUX_NS && USER_NS
+	depends on SECURITY_SELINUX_SS_SID_CACHE_SIZE > 0
+	default KUNIT_ALL_TESTS
+	help
+	  Build focused KUnit regression tests for SELinux namespace policy-chain
+	  generations, file permission cache validation, global-to-policy SID
+	  cache invalidation, deterministic constructor-failure rollback,
+	  policy-state cache keys, and selinuxfs per-mm VMA
+	  tracking.
+
+	  These tests run during boot and emit TAP output to the kernel log. They
+	  are intended for kernel development and are not for production builds.
+
+	  If unsure, say N.

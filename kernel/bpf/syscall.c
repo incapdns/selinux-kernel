@@ -1009,6 +1009,9 @@ static void bpf_map_show_fdinfo(struct seq_file *m, struct file *filp)
 	struct bpf_map *map = filp->private_data;
 	u32 type = 0, jited = 0;
 
+	if (security_bpf_map(map, filp->f_mode))
+		return;
+
 	spin_lock(&map->owner_lock);
 	if (map->owner) {
 		type  = map->owner->type;
@@ -1086,7 +1089,16 @@ static const struct vm_operations_struct bpf_map_default_vmops = {
 static int bpf_map_mmap(struct file *filp, struct vm_area_struct *vma)
 {
 	struct bpf_map *map = filp->private_data;
+	fmode_t mode = 0;
 	int err = 0;
+
+	if (vma->vm_flags & VM_READ)
+		mode |= FMODE_READ;
+	if (vma->vm_flags & VM_WRITE)
+		mode |= FMODE_WRITE;
+	err = security_bpf_map(map, mode);
+	if (err)
+		return err;
 
 	if (!map->ops->map_mmap || !IS_ERR_OR_NULL(map->record))
 		return -ENOTSUPP;
@@ -1144,6 +1156,9 @@ static __poll_t bpf_map_poll(struct file *filp, struct poll_table_struct *pts)
 {
 	struct bpf_map *map = filp->private_data;
 
+	if (security_bpf_map(map, FMODE_READ))
+		return EPOLLERR;
+
 	if (map->ops->map_poll)
 		return map->ops->map_poll(map, filp, pts);
 
@@ -1155,6 +1170,11 @@ static unsigned long bpf_get_unmapped_area(struct file *filp, unsigned long addr
 					   unsigned long flags)
 {
 	struct bpf_map *map = filp->private_data;
+	int err;
+
+	err = security_bpf_map(map, FMODE_READ);
+	if (err)
+		return err;
 
 	if (map->ops->map_get_unmapped_area)
 		return map->ops->map_get_unmapped_area(filp, addr, len, pgoff, flags);
@@ -1706,9 +1726,14 @@ struct bpf_map *bpf_map_get(u32 ufd)
 {
 	CLASS(fd, f)(ufd);
 	struct bpf_map *map = __bpf_map_get(f);
+	int err;
 
-	if (!IS_ERR(map))
+	if (!IS_ERR(map)) {
+		err = security_bpf_map(map, fd_file(f)->f_mode);
+		if (err)
+			return ERR_PTR(err);
 		bpf_map_inc(map);
+	}
 
 	return map;
 }
@@ -1718,9 +1743,14 @@ struct bpf_map *bpf_map_get_with_uref(u32 ufd)
 {
 	CLASS(fd, f)(ufd);
 	struct bpf_map *map = __bpf_map_get(f);
+	int err;
 
-	if (!IS_ERR(map))
+	if (!IS_ERR(map)) {
+		err = security_bpf_map(map, fd_file(f)->f_mode);
+		if (err)
+			return ERR_PTR(err);
 		bpf_map_inc_with_uref(map);
+	}
 
 	return map;
 }
@@ -1795,6 +1825,9 @@ static int map_lookup_elem(union bpf_attr *attr)
 	map = __bpf_map_get(f);
 	if (IS_ERR(map))
 		return PTR_ERR(map);
+	err = security_bpf_map(map, fd_file(f)->f_mode);
+	if (err)
+		return err;
 	if (!(map_get_sys_perms(map, f) & FMODE_CAN_READ))
 		return -EPERM;
 
@@ -1857,6 +1890,9 @@ static int map_update_elem(union bpf_attr *attr, bpfptr_t uattr)
 	map = __bpf_map_get(f);
 	if (IS_ERR(map))
 		return PTR_ERR(map);
+	err = security_bpf_map(map, fd_file(f)->f_mode);
+	if (err)
+		return err;
 	bpf_map_write_active_inc(map);
 	if (!(map_get_sys_perms(map, f) & FMODE_CAN_WRITE)) {
 		err = -EPERM;
@@ -1908,6 +1944,9 @@ static int map_delete_elem(union bpf_attr *attr, bpfptr_t uattr)
 	map = __bpf_map_get(f);
 	if (IS_ERR(map))
 		return PTR_ERR(map);
+	err = security_bpf_map(map, fd_file(f)->f_mode);
+	if (err)
+		return err;
 	bpf_map_write_active_inc(map);
 	if (!(map_get_sys_perms(map, f) & FMODE_CAN_WRITE)) {
 		err = -EPERM;
@@ -1962,6 +2001,9 @@ static int map_get_next_key(union bpf_attr *attr)
 	map = __bpf_map_get(f);
 	if (IS_ERR(map))
 		return PTR_ERR(map);
+	err = security_bpf_map(map, fd_file(f)->f_mode);
+	if (err)
+		return err;
 	if (!(map_get_sys_perms(map, f) & FMODE_CAN_READ))
 		return -EPERM;
 
@@ -2229,6 +2271,9 @@ static int map_lookup_and_delete_elem(union bpf_attr *attr)
 	map = __bpf_map_get(f);
 	if (IS_ERR(map))
 		return PTR_ERR(map);
+	err = security_bpf_map(map, fd_file(f)->f_mode);
+	if (err)
+		return err;
 	bpf_map_write_active_inc(map);
 	if (!(map_get_sys_perms(map, f) & FMODE_CAN_READ) ||
 	    !(map_get_sys_perms(map, f) & FMODE_CAN_WRITE)) {
@@ -2314,6 +2359,9 @@ static int map_freeze(const union bpf_attr *attr)
 	map = __bpf_map_get(f);
 	if (IS_ERR(map))
 		return PTR_ERR(map);
+	err = security_bpf_map(map, fd_file(f)->f_mode);
+	if (err)
+		return err;
 
 	if (map->map_type == BPF_MAP_TYPE_STRUCT_OPS || !IS_ERR_OR_NULL(map->record))
 		return -ENOTSUPP;
@@ -2562,6 +2610,9 @@ static void bpf_prog_show_fdinfo(struct seq_file *m, struct file *filp)
 	char prog_tag[sizeof(prog->tag) * 2 + 1] = { };
 	struct bpf_prog_kstats stats;
 
+	if (security_bpf_prog((struct bpf_prog *)prog))
+		return;
+
 	bpf_prog_get_stats(prog, &stats);
 	bin2hex(prog_tag, prog->tag, sizeof(prog->tag));
 	seq_printf(m,
@@ -2664,6 +2715,7 @@ static struct bpf_prog *__bpf_prog_get(u32 ufd, enum bpf_prog_type *attach_type,
 {
 	CLASS(fd, f)(ufd);
 	struct bpf_prog *prog;
+	int err;
 
 	if (fd_empty(f))
 		return ERR_PTR(-EBADF);
@@ -2673,6 +2725,9 @@ static struct bpf_prog *__bpf_prog_get(u32 ufd, enum bpf_prog_type *attach_type,
 	prog = fd_file(f)->private_data;
 	if (!bpf_prog_get_ok(prog, attach_type, attach_drv))
 		return ERR_PTR(-EINVAL);
+	err = security_bpf_prog(prog);
+	if (err)
+		return ERR_PTR(err);
 
 	bpf_prog_inc(prog);
 	return prog;
@@ -3189,7 +3244,8 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, struct bpf_log_at
 	if (err < 0)
 		goto free_prog;
 
-	err = security_bpf_prog_load(prog, attr, token, uattr.is_kernel);
+	err = security_bpf_prog_load(prog, attr, prog->aux->token,
+				     uattr.is_kernel);
 	if (err)
 		goto free_prog;
 
@@ -3199,6 +3255,9 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, struct bpf_log_at
 		goto free_used_maps;
 
 	err = bpf_prog_mark_insn_arrays_ready(prog);
+	if (err < 0)
+		goto free_used_maps;
+	err = security_bpf_prog_commit(prog);
 	if (err < 0)
 		goto free_used_maps;
 
@@ -3301,6 +3360,8 @@ void bpf_link_init_sleepable(struct bpf_link *link, enum bpf_link_type type,
 	link->id = 0;
 	link->ops = ops;
 	link->prog = prog;
+	link->security = NULL;
+	link->security_initialized = false;
 	link->attach_type = attach_type;
 }
 
@@ -3354,6 +3415,8 @@ void bpf_link_inc(struct bpf_link *link)
 
 static void bpf_link_dealloc(struct bpf_link *link)
 {
+	security_bpf_link_free(link);
+
 	/* now that we know that bpf_link itself can't be reached, put underlying BPF program */
 	if (link->prog)
 		bpf_prog_put(link->prog);
@@ -3475,6 +3538,10 @@ static void bpf_link_show_fdinfo(struct seq_file *m, struct file *filp)
 	enum bpf_link_type type = link->type;
 	char prog_tag[sizeof(prog->tag) * 2 + 1] = { };
 
+	if (security_bpf_link_access((struct bpf_link *)link,
+				     BPF_OBJ_GET_INFO_BY_FD))
+		return;
+
 	if (type < ARRAY_SIZE(bpf_link_type_strs) && bpf_link_type_strs[type]) {
 		if (link->type == BPF_LINK_TYPE_KPROBE_MULTI)
 			seq_printf(m, "link_type:\t%s\n", link->flags == BPF_F_KPROBE_MULTI_RETURN ?
@@ -3507,10 +3574,13 @@ static __poll_t bpf_link_poll(struct file *file, struct poll_table_struct *pts)
 {
 	struct bpf_link *link = file->private_data;
 
+	if (security_bpf_link_access(link, BPF_OBJ_GET))
+		return EPOLLERR;
+
 	return link->ops->poll(file, pts);
 }
 
-static const struct file_operations bpf_link_fops = {
+const struct file_operations bpf_link_fops = {
 #ifdef CONFIG_PROC_FS
 	.show_fdinfo	= bpf_link_show_fdinfo,
 #endif
@@ -3519,7 +3589,7 @@ static const struct file_operations bpf_link_fops = {
 	.write		= bpf_dummy_write,
 };
 
-static const struct file_operations bpf_link_fops_poll = {
+const struct file_operations bpf_link_fops_poll = {
 #ifdef CONFIG_PROC_FS
 	.show_fdinfo	= bpf_link_show_fdinfo,
 #endif
@@ -3555,29 +3625,36 @@ static int bpf_link_alloc_id(struct bpf_link *link)
  * expensive (and potentially failing) roll back operations in a rare case
  * that file, FD, or ID can't be allocated.
  */
-int bpf_link_prime(struct bpf_link *link, struct bpf_link_primer *primer)
+int bpf_link_prime(struct bpf_link *link, struct bpf_link_primer *primer,
+		   const struct bpf_prog *related_prog,
+		   const struct bpf_map *related_map)
 {
 	struct file *file;
-	int fd, id;
+	int err, fd, id;
+
+	err = security_bpf_link_create(link, related_prog, related_map);
+	if (err)
+		return err;
 
 	fd = get_unused_fd_flags(O_CLOEXEC);
-	if (fd < 0)
-		return fd;
-
+	if (fd < 0) {
+		err = fd;
+		goto err_security;
+	}
 
 	id = bpf_link_alloc_id(link);
 	if (id < 0) {
-		put_unused_fd(fd);
-		return id;
+		err = id;
+		goto err_fd;
 	}
 
 	file = anon_inode_getfile("bpf_link",
 				  link->ops->poll ? &bpf_link_fops_poll : &bpf_link_fops,
 				  link, O_CLOEXEC);
 	if (IS_ERR(file)) {
+		err = PTR_ERR(file);
 		bpf_link_free_id(id);
-		put_unused_fd(fd);
-		return PTR_ERR(file);
+		goto err_fd;
 	}
 
 	primer->link = link;
@@ -3585,6 +3662,12 @@ int bpf_link_prime(struct bpf_link *link, struct bpf_link_primer *primer)
 	primer->fd = fd;
 	primer->id = id;
 	return 0;
+
+err_fd:
+	put_unused_fd(fd);
+err_security:
+	security_bpf_link_free(link);
+	return err;
 }
 
 int bpf_link_settle(struct bpf_link_primer *primer)
@@ -3601,6 +3684,12 @@ int bpf_link_settle(struct bpf_link_primer *primer)
 
 int bpf_link_new_fd(struct bpf_link *link)
 {
+	int err;
+
+	err = security_bpf_link_access(link, BPF_OBJ_GET);
+	if (err)
+		return err;
+
 	return anon_inode_getfd("bpf-link",
 				link->ops->poll ? &bpf_link_fops_poll : &bpf_link_fops,
 				link, O_CLOEXEC);
@@ -3610,6 +3699,7 @@ struct bpf_link *bpf_link_get_from_fd(u32 ufd)
 {
 	CLASS(fd, f)(ufd);
 	struct bpf_link *link;
+	int err;
 
 	if (fd_empty(f))
 		return ERR_PTR(-EBADF);
@@ -3617,6 +3707,9 @@ struct bpf_link *bpf_link_get_from_fd(u32 ufd)
 		return ERR_PTR(-EINVAL);
 
 	link = fd_file(f)->private_data;
+	err = security_bpf_link_access(link, BPF_OBJ_GET);
+	if (err)
+		return ERR_PTR(err);
 	bpf_link_inc(link);
 	return link;
 }
@@ -3863,7 +3956,7 @@ static int bpf_tracing_prog_attach(struct bpf_prog *prog,
 		goto out_unlock;
 	}
 
-	err = bpf_link_prime(&link->link.link, &link_primer);
+	err = bpf_link_prime(&link->link.link, &link_primer, tgt_prog, NULL);
 	if (err)
 		goto out_unlock;
 
@@ -4311,6 +4404,11 @@ static int bpf_perf_link_attach(const union bpf_attr *attr, struct bpf_prog *pro
 	perf_file = perf_event_get(attr->link_create.target_fd);
 	if (IS_ERR(perf_file))
 		return PTR_ERR(perf_file);
+	event = perf_file->private_data;
+	err = security_perf_event_relation(event,
+					   PERF_SECURITY_RELATION_WRITE);
+	if (err)
+		goto out_put_file;
 
 	link = kzalloc_obj(*link, GFP_USER);
 	if (!link) {
@@ -4321,13 +4419,12 @@ static int bpf_perf_link_attach(const union bpf_attr *attr, struct bpf_prog *pro
 		      attr->link_create.attach_type);
 	link->perf_file = perf_file;
 
-	err = bpf_link_prime(&link->link, &link_primer);
+	err = bpf_link_prime(&link->link, &link_primer, NULL, NULL);
 	if (err) {
 		kfree(link);
 		goto out_put_file;
 	}
 
-	event = perf_file->private_data;
 	err = perf_event_set_bpf_prog(event, prog, attr->link_create.perf_event.bpf_cookie);
 	if (err) {
 		bpf_link_cleanup(&link_primer);
@@ -4406,7 +4503,7 @@ static int bpf_raw_tp_link_attach(struct bpf_prog *prog,
 	link->btp = btp;
 	link->cookie = cookie;
 
-	err = bpf_link_prime(&link->link, &link_primer);
+	err = bpf_link_prime(&link->link, &link_primer, NULL, NULL);
 	if (err) {
 		kfree(link);
 		goto out_put_btp;
@@ -4890,6 +4987,42 @@ static int bpf_obj_get_next_id(const union bpf_attr *attr,
 	return err;
 }
 
+static int bpf_link_get_next_id(const union bpf_attr *attr,
+				union bpf_attr __user *uattr)
+{
+	struct bpf_link *link;
+	u32 next_id = attr->start_id;
+	int err = 0;
+
+	if (CHECK_ATTR(BPF_OBJ_GET_NEXT_ID) || next_id >= INT_MAX)
+		return -EINVAL;
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	next_id++;
+	spin_lock_bh(&link_idr_lock);
+	for (;;) {
+		link = idr_get_next(&link_idr, &next_id);
+		if (!link) {
+			err = -ENOENT;
+			break;
+		}
+		/* Reserved links are not externally visible until settle(). */
+		if (link->id == next_id)
+			break;
+		if (next_id == INT_MAX) {
+			err = -ENOENT;
+			break;
+		}
+		next_id++;
+	}
+	spin_unlock_bh(&link_idr_lock);
+
+	if (!err)
+		err = put_user(next_id, &uattr->next_id);
+	return err;
+}
+
 struct bpf_map *bpf_map_get_curr_or_next(u32 *id)
 {
 	struct bpf_map *map;
@@ -4905,6 +5038,14 @@ again:
 		}
 	}
 	spin_unlock_bh(&map_idr_lock);
+	if (map) {
+		int err = security_bpf_map(map, FMODE_READ);
+
+		if (err) {
+			bpf_map_put(map);
+			return ERR_PTR(err);
+		}
+	}
 
 	return map;
 }
@@ -4924,6 +5065,14 @@ again:
 		}
 	}
 	spin_unlock_bh(&prog_idr_lock);
+	if (prog) {
+		int err = security_bpf_prog(prog);
+
+		if (err) {
+			bpf_prog_put(prog);
+			return ERR_PTR(err);
+		}
+	}
 
 	return prog;
 }
@@ -5538,6 +5687,10 @@ static int bpf_link_get_info_by_fd(struct file *file,
 	u32 info_len = attr->info.info_len;
 	int err;
 
+	err = security_bpf_link_access(link, BPF_OBJ_GET_INFO_BY_FD);
+	if (err)
+		return err;
+
 	err = bpf_check_uarg_tail_zero(USER_BPFPTR(uinfo), sizeof(info), info_len);
 	if (err)
 		return err;
@@ -5593,13 +5746,22 @@ static int bpf_obj_get_info_by_fd(const union bpf_attr *attr,
 	if (fd_empty(f))
 		return -EBADFD;
 
-	if (fd_file(f)->f_op == &bpf_prog_fops)
+	if (fd_file(f)->f_op == &bpf_prog_fops) {
+		int err = security_bpf_prog(fd_file(f)->private_data);
+
+		if (err)
+			return err;
 		return bpf_prog_get_info_by_fd(fd_file(f), fd_file(f)->private_data, attr,
 					      uattr);
-	else if (fd_file(f)->f_op == &bpf_map_fops)
+	} else if (fd_file(f)->f_op == &bpf_map_fops) {
+		int err = security_bpf_map(fd_file(f)->private_data,
+					   fd_file(f)->f_mode);
+
+		if (err)
+			return err;
 		return bpf_map_get_info_by_fd(fd_file(f), fd_file(f)->private_data, attr,
 					     uattr);
-	else if (fd_file(f)->f_op == &btf_fops)
+	} else if (fd_file(f)->f_op == &btf_fops)
 		return bpf_btf_get_info_by_fd(fd_file(f), fd_file(f)->private_data, attr, uattr);
 	else if (fd_file(f)->f_op == &bpf_link_fops || fd_file(f)->f_op == &bpf_link_fops_poll)
 		return bpf_link_get_info_by_fd(fd_file(f), fd_file(f)->private_data,
@@ -5615,6 +5777,7 @@ static int bpf_obj_get_info_by_fd(const union bpf_attr *attr,
 static int bpf_btf_load(const union bpf_attr *attr, bpfptr_t uattr, struct bpf_log_attr *attr_log)
 {
 	struct bpf_token *token = NULL;
+	int ret;
 
 	if (CHECK_ATTR(BPF_BTF_LOAD))
 		return -EINVAL;
@@ -5637,9 +5800,10 @@ static int bpf_btf_load(const union bpf_attr *attr, bpfptr_t uattr, struct bpf_l
 		return -EPERM;
 	}
 
+	ret = btf_new_fd(attr, uattr, attr_log, token);
 	bpf_token_put(token);
 
-	return btf_new_fd(attr, uattr, attr_log);
+	return ret;
 }
 
 #define BPF_BTF_GET_FD_BY_ID_LAST_FIELD fd_by_id_token_fd
@@ -5746,6 +5910,10 @@ static int bpf_task_fd_query(const union bpf_attr *attr,
 	if (file->f_op == &bpf_link_fops || file->f_op == &bpf_link_fops_poll) {
 		struct bpf_link *link = file->private_data;
 
+		err = security_bpf_link_access(link, BPF_TASK_FD_QUERY);
+		if (err)
+			goto put_file;
+
 		if (link->ops == &bpf_raw_tp_link_lops) {
 			struct bpf_raw_tp_link *raw_tp =
 				container_of(link, struct bpf_raw_tp_link, link);
@@ -5766,6 +5934,10 @@ static int bpf_task_fd_query(const union bpf_attr *attr,
 		u32 prog_id, fd_type;
 		const char *buf;
 
+		err = security_perf_event_relation(
+			(struct perf_event *)event, PERF_SECURITY_RELATION_READ);
+		if (err)
+			goto put_file;
 		err = bpf_get_perf_event_info(event, &prog_id, &fd_type,
 					      &buf, &probe_offset,
 					      &probe_addr, NULL);
@@ -5813,6 +5985,9 @@ static int bpf_map_do_batch(const union bpf_attr *attr,
 	map = __bpf_map_get(f);
 	if (IS_ERR(map))
 		return PTR_ERR(map);
+	err = security_bpf_map(map, fd_file(f)->f_mode);
+	if (err)
+		return err;
 	if (has_write)
 		bpf_map_write_active_inc(map);
 	if (has_read && !(map_get_sys_perms(map, f) & FMODE_CAN_READ)) {
@@ -5966,12 +6141,15 @@ static int link_update_map(struct bpf_link *link, union bpf_attr *attr)
 		ret = -EINVAL;
 		goto out_put;
 	}
+	ret = security_bpf_link_update(link, NULL, NULL, new_map, old_map);
+	if (ret)
+		goto out_put;
 
 	ret = link->ops->update_map(link, new_map, old_map);
 
+out_put:
 	if (old_map)
 		bpf_map_put(old_map);
-out_put:
 	bpf_map_put(new_map);
 	return ret;
 }
@@ -5995,7 +6173,6 @@ static int link_update(union bpf_attr *attr)
 	link = bpf_link_get_from_fd(attr->link_update.link_fd);
 	if (IS_ERR(link))
 		return PTR_ERR(link);
-
 	if (link->ops->update_map) {
 		ret = link_update_map(link, attr);
 		goto out_put_link;
@@ -6018,6 +6195,9 @@ static int link_update(union bpf_attr *attr)
 		ret = -EINVAL;
 		goto out_put_progs;
 	}
+	ret = security_bpf_link_update(link, new_prog, old_prog, NULL, NULL);
+	if (ret)
+		goto out_put_progs;
 
 	if (link->ops->update_prog)
 		ret = link->ops->update_prog(link, new_prog, old_prog);
@@ -6047,12 +6227,16 @@ static int link_detach(union bpf_attr *attr)
 	link = bpf_link_get_from_fd(attr->link_detach.link_fd);
 	if (IS_ERR(link))
 		return PTR_ERR(link);
+	ret = security_bpf_link_access(link, BPF_LINK_DETACH);
+	if (ret)
+		goto out_put;
 
 	if (link->ops->detach)
 		ret = link->ops->detach(link);
 	else
 		ret = -EOPNOTSUPP;
 
+out_put:
 	bpf_link_put_direct(link);
 	return ret;
 }
@@ -6100,6 +6284,14 @@ again:
 		}
 	}
 	spin_unlock_bh(&link_idr_lock);
+	if (link) {
+		int err = security_bpf_link_access(link, BPF_OBJ_GET);
+
+		if (err) {
+			bpf_link_put_direct(link);
+			return ERR_PTR(err);
+		}
+	}
 
 	return link;
 }
@@ -6110,7 +6302,7 @@ static int bpf_link_get_fd_by_id(const union bpf_attr *attr)
 {
 	struct bpf_link *link;
 	u32 id = attr->link_id;
-	int fd;
+	int err, fd;
 
 	if (CHECK_ATTR(BPF_LINK_GET_FD_BY_ID))
 		return -EINVAL;
@@ -6121,8 +6313,14 @@ static int bpf_link_get_fd_by_id(const union bpf_attr *attr)
 	link = bpf_link_by_id(id);
 	if (IS_ERR(link))
 		return PTR_ERR(link);
+	err = security_bpf_link_access(link, BPF_LINK_GET_FD_BY_ID);
+	if (err) {
+		fd = err;
+		goto out_put;
+	}
 
 	fd = bpf_link_new_fd(link);
+out_put:
 	if (fd < 0)
 		bpf_link_put_direct(link);
 
@@ -6230,6 +6428,9 @@ static int bpf_prog_bind_map(union bpf_attr *attr)
 		ret = PTR_ERR(map);
 		goto out_prog_put;
 	}
+	ret = security_bpf_prog_map_relation(prog, map);
+	if (ret)
+		goto out_map_put;
 
 	mutex_lock(&prog->aux->used_maps_mutex);
 
@@ -6264,9 +6465,10 @@ static int bpf_prog_bind_map(union bpf_attr *attr)
 
 out_unlock:
 	mutex_unlock(&prog->aux->used_maps_mutex);
-
-	if (ret)
-		bpf_map_put(map);
+	if (!ret)
+		goto out_prog_put;
+out_map_put:
+	bpf_map_put(map);
 out_prog_put:
 	bpf_prog_put(prog);
 	return ret;
@@ -6499,8 +6701,7 @@ static int __sys_bpf(enum bpf_cmd cmd, bpfptr_t uattr, unsigned int size,
 		err = bpf_link_get_fd_by_id(&attr);
 		break;
 	case BPF_LINK_GET_NEXT_ID:
-		err = bpf_obj_get_next_id(&attr, uattr.user,
-					  &link_idr, &link_idr_lock);
+		err = bpf_link_get_next_id(&attr, uattr.user);
 		break;
 	case BPF_ENABLE_STATS:
 		err = bpf_enable_stats(&attr);

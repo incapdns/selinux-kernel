@@ -15,10 +15,12 @@
 #include <linux/ip.h>
 #include <linux/ipv6.h>
 #include <linux/random.h>
+#include <linux/selinux_net.h>
 #include <linux/smp.h>
 #include <linux/static_key.h>
 #include <net/dst.h>
 #include <net/ip.h>
+#include <net/net_namespace.h>
 #include <net/sock.h>
 #include <net/tcp_states.h> /* for TCP_TIME_WAIT */
 #include <net/netfilter/nf_tables.h>
@@ -502,7 +504,7 @@ void nft_meta_set_eval(const struct nft_expr *expr,
 		break;
 #ifdef CONFIG_NETWORK_SECMARK
 	case NFT_META_SECMARK:
-		skb->secmark = value;
+		skb_set_secmark(skb, value, NULL);
 		break;
 #endif
 	default:
@@ -915,9 +917,30 @@ struct nft_expr_type nft_meta_type __read_mostly = {
 };
 
 #ifdef CONFIG_NETWORK_SECMARK
+#ifdef CONFIG_SECURITY_SELINUX_NS
+struct nft_secmark_binding {
+	struct rcu_head rcu;
+	struct selinux_net_provenance *provenance;
+	u32 secid;
+};
+
+static void nft_secmark_binding_free_rcu(struct rcu_head *rcu)
+{
+	struct nft_secmark_binding *binding =
+		container_of(rcu, struct nft_secmark_binding, rcu);
+
+	selinux_net_provenance_put(binding->provenance);
+	kfree(binding);
+}
+#endif
+
 struct nft_secmark {
 	u32 secid;
 	char *ctx;
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	struct net *net;
+	struct nft_secmark_binding __rcu *binding;
+#endif
 };
 
 static const struct nla_policy nft_secmark_policy[NFTA_SECMARK_MAX + 1] = {
@@ -926,22 +949,74 @@ static const struct nla_policy nft_secmark_policy[NFTA_SECMARK_MAX + 1] = {
 
 static int nft_secmark_compute_secid(struct nft_secmark *priv)
 {
+	const struct net *net = NULL;
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	struct nft_secmark_binding *binding, *old;
+#endif
+	struct lsm_prop_ref *prop_ref = NULL;
+	struct lsm_secmark secmark;
 	u32 tmp_secid = 0;
 	int err;
 
-	err = security_secctx_to_secid(priv->ctx, strlen(priv->ctx), &tmp_secid);
+	err = security_secctx_to_lsmprop_ref(priv->ctx, strlen(priv->ctx),
+					 LSM_ID_UNDEF, GFP_KERNEL, &prop_ref);
 	if (err)
 		return err;
+	if (security_lsm_prop_ref_provider_count(prop_ref) != 1) {
+		err = -ENOTUNIQ;
+		goto out_ref;
+	}
+	if (!security_lsm_prop_ref_source_secid(prop_ref, &tmp_secid)) {
+		err = -EINVAL;
+		goto out_ref;
+	}
 
-	if (!tmp_secid)
-		return -ENOENT;
+	if (!tmp_secid) {
+		err = -ENOENT;
+		goto out_ref;
+	}
 
-	err = security_secmark_relabel_packet(tmp_secid);
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	binding = kzalloc(sizeof(*binding), GFP_KERNEL);
+	if (!binding) {
+		err = -ENOMEM;
+		goto out_ref;
+	}
+	binding->secid = tmp_secid;
+	net = priv->net;
+#endif
+
+	err = security_secmark_relabel_packet(net, tmp_secid, &secmark);
+	security_lsm_prop_ref_put(prop_ref);
+	prop_ref = NULL;
 	if (err)
-		return err;
+		goto out_binding;
 
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	binding->provenance = selinux_secmark_provenance_take(&secmark);
+	security_secmark_release(&secmark);
+	if (!binding->provenance) {
+		err = -EACCES;
+		goto out_binding;
+	}
+	old = rcu_replace_pointer(priv->binding, binding, 1);
+	WRITE_ONCE(priv->secid, tmp_secid);
+	if (old)
+		call_rcu(&old->rcu, nft_secmark_binding_free_rcu);
+#else
+	security_secmark_release(&secmark);
 	priv->secid = tmp_secid;
+#endif
 	return 0;
+
+out_binding:
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	selinux_net_provenance_put(binding->provenance);
+	kfree(binding);
+#endif
+out_ref:
+	security_lsm_prop_ref_put(prop_ref);
+	return err;
 }
 
 static void nft_secmark_obj_eval(struct nft_object *obj, struct nft_regs *regs,
@@ -950,7 +1025,22 @@ static void nft_secmark_obj_eval(struct nft_object *obj, struct nft_regs *regs,
 	const struct nft_secmark *priv = nft_obj_data(obj);
 	struct sk_buff *skb = pkt->skb;
 
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	rcu_read_lock();
+	{
+		const struct nft_secmark_binding *binding =
+			rcu_dereference(priv->binding);
+
+		if (binding)
+			skb_set_secmark(skb, binding->secid,
+					binding->provenance);
+		else
+			skb_set_secmark(skb, 0, NULL);
+	}
+	rcu_read_unlock();
+#else
 	skb->secmark = priv->secid;
+#endif
 }
 
 static int nft_secmark_obj_init(const struct nft_ctx *ctx,
@@ -967,8 +1057,14 @@ static int nft_secmark_obj_init(const struct nft_ctx *ctx,
 	if (!priv->ctx)
 		return -ENOMEM;
 
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	priv->net = get_net(ctx->net);
+#endif
 	err = nft_secmark_compute_secid(priv);
 	if (err) {
+#ifdef CONFIG_SECURITY_SELINUX_NS
+		put_net(priv->net);
+#endif
 		kfree(priv->ctx);
 		return err;
 	}
@@ -982,16 +1078,19 @@ static int nft_secmark_obj_dump(struct sk_buff *skb, struct nft_object *obj,
 				bool reset)
 {
 	struct nft_secmark *priv = nft_obj_data(obj);
-	int err;
 
 	if (nla_put_string(skb, NFTA_SECMARK_CTX, priv->ctx))
 		return -1;
 
+#ifndef CONFIG_SECURITY_SELINUX_NS
 	if (reset) {
+		int err;
+
 		err = nft_secmark_compute_secid(priv);
 		if (err)
 			return err;
 	}
+#endif
 
 	return 0;
 }
@@ -1002,6 +1101,17 @@ static void nft_secmark_obj_destroy(const struct nft_ctx *ctx, struct nft_object
 
 	security_secmark_refcount_dec();
 
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	{
+		struct nft_secmark_binding *binding =
+			rcu_replace_pointer(priv->binding, NULL, 1);
+
+		if (binding)
+			call_rcu(&binding->rcu,
+				 nft_secmark_binding_free_rcu);
+		put_net(priv->net);
+	}
+#endif
 	kfree(priv->ctx);
 }
 

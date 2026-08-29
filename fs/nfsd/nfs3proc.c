@@ -281,8 +281,9 @@ nfsd3_create_file(struct svc_rqst *rqstp, struct svc_fh *fhp,
 	if (host_err)
 		return nfserrno(host_err);
 
-	child = start_creating(&nop_mnt_idmap, parent,
-			       &QSTR_LEN(argp->name, argp->len));
+	child = start_creating_mnt(&nop_mnt_idmap,
+				   fhp->fh_export->ex_path.mnt, parent,
+				   &QSTR_LEN(argp->name, argp->len));
 	if (IS_ERR(child)) {
 		status = nfserrno(PTR_ERR(child));
 		goto out_write;
@@ -341,7 +342,9 @@ nfsd3_create_file(struct svc_rqst *rqstp, struct svc_fh *fhp,
 	status = fh_fill_pre_attrs(fhp);
 	if (status != nfs_ok)
 		goto out;
-	host_err = vfs_create(&nop_mnt_idmap, child, iap->ia_mode, NULL);
+	host_err = vfs_create_mnt(&nop_mnt_idmap,
+				  fhp->fh_export->ex_path.mnt, child,
+				  iap->ia_mode, NULL);
 	if (host_err < 0) {
 		status = nfserrno(host_err);
 		goto out;
@@ -724,7 +727,8 @@ nfsd3_proc_pathconf(struct svc_rqst *rqstp)
 			resp->p_name_max = EXT2_NAME_LEN;
 		}
 
-		err = nfsd_get_case_info(argp->fh.fh_dentry,
+		err = nfsd_get_case_info(argp->fh.fh_export->ex_path.mnt,
+					 argp->fh.fh_dentry,
 					 &resp->p_case_insensitive,
 					 &resp->p_case_preserving);
 		/*

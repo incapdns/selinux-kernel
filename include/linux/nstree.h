@@ -46,6 +46,7 @@ void ns_tree_node_del(struct ns_tree_node *node, struct ns_tree_root *root);
 			 (((__ns) == ns_init_ns(__ns)) ? ns_init_id(__ns) : 0))
 
 u64 __ns_tree_gen_id(struct ns_common *ns, u64 id);
+int __ns_tree_reserve_id(struct ns_common *ns, u64 expected_id);
 void __ns_tree_add_raw(struct ns_common *ns, struct ns_tree_root *ns_tree);
 void __ns_tree_remove(struct ns_common *ns, struct ns_tree_root *ns_tree);
 struct ns_common *ns_tree_lookup_rcu(u64 ns_id, int ns_type);

@@ -192,6 +192,7 @@ static struct file *secretmem_file_create(unsigned long flags)
 	struct file *file;
 	struct inode *inode;
 	const char *anon_name = "[secretmem]";
+	int err;
 
 	inode = anon_inode_make_secure_inode(secretmem_mnt->mnt_sb, anon_name, NULL);
 	if (IS_ERR(inode))
@@ -213,6 +214,11 @@ static struct file *secretmem_file_create(unsigned long flags)
 	inode->i_size = 0;
 
 	atomic_inc(&secretmem_users);
+	err = security_file_init_security_anon(file);
+	if (err) {
+		fput(file);
+		return ERR_PTR(err);
+	}
 
 	return file;
 

@@ -1763,22 +1763,41 @@ bool inode_owner_or_capable(struct mnt_idmap *idmap,
  */
 int vfs_create(struct mnt_idmap *, struct dentry *, umode_t,
 	       struct delegated_inode *);
+int vfs_create_mnt(struct mnt_idmap *, const struct vfsmount *,
+		   struct dentry *, umode_t, struct delegated_inode *);
 struct dentry *vfs_mkdir(struct mnt_idmap *, struct inode *,
 			 struct dentry *, umode_t, struct delegated_inode *);
+struct dentry *vfs_mkdir_mnt(struct mnt_idmap *, const struct vfsmount *,
+			     struct inode *, struct dentry *, umode_t,
+			     struct delegated_inode *);
 int vfs_mknod(struct mnt_idmap *, struct inode *, struct dentry *,
 	      umode_t, dev_t, struct delegated_inode *);
+int vfs_mknod_mnt(struct mnt_idmap *, const struct vfsmount *, struct inode *,
+		  struct dentry *, umode_t, dev_t, struct delegated_inode *);
 int vfs_symlink(struct mnt_idmap *, struct inode *,
 		struct dentry *, const char *, struct delegated_inode *);
+int vfs_symlink_mnt(struct mnt_idmap *, const struct vfsmount *,
+		    struct inode *, struct dentry *, const char *,
+		    struct delegated_inode *);
 int vfs_link(struct dentry *, struct mnt_idmap *, struct inode *,
 	     struct dentry *, struct delegated_inode *);
+int vfs_link_mnt(const struct vfsmount *, struct dentry *,
+		 struct mnt_idmap *, const struct vfsmount *, struct inode *,
+		 struct dentry *, struct delegated_inode *);
 int vfs_rmdir(struct mnt_idmap *, struct inode *, struct dentry *,
 	      struct delegated_inode *);
+int vfs_rmdir_mnt(struct mnt_idmap *, const struct vfsmount *, struct inode *,
+		  struct dentry *, struct delegated_inode *);
 int vfs_unlink(struct mnt_idmap *, struct inode *, struct dentry *,
 	       struct delegated_inode *);
+int vfs_unlink_mnt(struct mnt_idmap *, const struct vfsmount *, struct inode *,
+		   struct dentry *, struct delegated_inode *);
 
 /**
  * struct renamedata - contains all information required for renaming
  * @mnt_idmap:     idmap of the mount in which the rename is happening.
+ * @old_mnt:           borrowed mount through which the source is accessed
+ * @new_mnt:           borrowed mount through which the destination is accessed
  * @old_parent:        parent of source
  * @old_dentry:                source
  * @new_parent:        parent of destination
@@ -1788,6 +1807,8 @@ int vfs_unlink(struct mnt_idmap *, struct inode *, struct dentry *,
  */
 struct renamedata {
 	struct mnt_idmap *mnt_idmap;
+	const struct vfsmount *old_mnt;
+	const struct vfsmount *new_mnt;
 	struct dentry *old_parent;
 	struct dentry *old_dentry;
 	struct dentry *new_parent;
@@ -1805,6 +1826,14 @@ static inline int vfs_whiteout(struct mnt_idmap *idmap,
 			 WHITEOUT_DEV, NULL);
 }
 
+static inline int vfs_whiteout_mnt(struct mnt_idmap *idmap,
+				   const struct vfsmount *mnt,
+				   struct inode *dir, struct dentry *dentry)
+{
+	return vfs_mknod_mnt(idmap, mnt, dir, dentry,
+			     S_IFCHR | WHITEOUT_MODE, WHITEOUT_DEV, NULL);
+}
+
 struct file *kernel_tmpfile_open(struct mnt_idmap *idmap,
 				 const struct path *parentpath,
 				 umode_t mode, int open_flag,
@@ -1812,9 +1841,14 @@ struct file *kernel_tmpfile_open(struct mnt_idmap *idmap,
 struct file *kernel_file_open(const struct path *path, int flags,
 			      const struct cred *cred);
 
-int vfs_mkobj(struct dentry *, umode_t,
-		int (*f)(struct dentry *, umode_t, void *),
-		void *);
+struct vfs_mkobj_ops {
+	int (*create)(struct dentry *, umode_t, void *);
+	u32 security_create_plan_ops;
+};
+
+int vfs_mkobj(struct dentry *, umode_t, const struct vfs_mkobj_ops *, void *);
+int vfs_mkobj_mnt(const struct vfsmount *, struct dentry *, umode_t,
+		  const struct vfs_mkobj_ops *, void *);
 
 int vfs_fchown(struct file *file, uid_t user, gid_t group);
 int vfs_fchmod(struct file *file, umode_t mode);
@@ -1993,6 +2027,24 @@ enum fs_update_time {
 	FS_UPD_CMTIME,
 };
 
+/*
+ * Creation callbacks opt in per operation only after they have been audited
+ * to call security_inode_init_security() before publication and to propagate
+ * every hard error from it.  Zero is deliberately fail-closed.
+ */
+enum security_inode_create_kind {
+	SECURITY_INODE_CREATE,
+	SECURITY_INODE_ATOMIC_OPEN,
+	SECURITY_INODE_MKOBJ,
+	SECURITY_INODE_TMPFILE,
+	SECURITY_INODE_MKNOD,
+	SECURITY_INODE_MKDIR,
+	SECURITY_INODE_SYMLINK,
+	SECURITY_INODE_CREATE_KIND_MAX,
+};
+
+#define SECURITY_INODE_CREATE_OP(kind)	BIT(kind)
+
 struct inode_operations {
 	struct dentry * (*lookup) (struct inode *,struct dentry *, unsigned int);
 	const char * (*get_link) (struct dentry *, struct inode *, struct delayed_call *);
@@ -2036,6 +2088,7 @@ struct inode_operations {
 			    struct dentry *dentry, struct file_kattr *fa);
 	int (*fileattr_get)(struct dentry *dentry, struct file_kattr *fa);
 	struct offset_ctx *(*get_offset_ctx)(struct inode *inode);
+	u32 security_create_plan_ops;
 } ____cacheline_aligned;
 
 /* Did the driver provide valid mmap hook configuration? */
@@ -2337,6 +2390,11 @@ void free_anon_bdev(dev_t);
 struct super_block *sget_fc(struct fs_context *fc,
 			    int (*test)(struct super_block *, struct fs_context *),
 			    int (*set)(struct super_block *, struct fs_context *));
+struct super_block *sget_fc_intrinsic(
+			    struct fs_context *fc,
+			    int (*test)(struct super_block *, struct fs_context *),
+			    int (*set)(struct super_block *, struct fs_context *),
+			    const void *security_carrier);
 struct super_block *sget_dev(struct fs_context *fc, dev_t dev);
 
 /* Alas, no aliases. Too much hassle with bringing module.h everywhere */
@@ -2465,6 +2523,9 @@ static inline bool is_idmapped_mnt(const struct vfsmount *mnt)
 int vfs_truncate(const struct path *, loff_t);
 int do_truncate(struct mnt_idmap *, struct dentry *, loff_t start,
 		unsigned int time_attrs, struct file *filp);
+int do_truncate_mnt(struct mnt_idmap *idmap, const struct vfsmount *mnt,
+		    struct dentry *dentry, loff_t start,
+		    unsigned int time_attrs, struct file *filp);
 extern int vfs_fallocate(struct file *file, int mode, loff_t offset,
 			loff_t len);
 int do_sys_open(int dfd, const char __user *filename, int flags,
@@ -2689,25 +2750,37 @@ static inline int bmap(struct inode *inode,  sector_t *block)
 
 int notify_change(struct mnt_idmap *, struct dentry *,
 		  struct iattr *, struct delegated_inode *);
+int notify_change_mnt(struct mnt_idmap *idmap, const struct vfsmount *mnt,
+		      struct dentry *dentry, struct iattr *attr,
+		      struct delegated_inode *delegated_inode);
 int inode_permission(struct mnt_idmap *, struct inode *, int);
+int inode_permission_mnt(struct mnt_idmap *idmap, const struct vfsmount *mnt,
+			 struct inode *inode, int mask);
 int generic_permission(struct mnt_idmap *, struct inode *, int);
 static inline int file_permission(struct file *file, int mask)
 {
-	return inode_permission(file_mnt_idmap(file),
-				file_inode(file), mask);
+	return inode_permission_mnt(file_mnt_idmap(file), file->f_path.mnt,
+				   file_inode(file), mask);
 }
 static inline int path_permission(const struct path *path, int mask)
 {
-	return inode_permission(mnt_idmap(path->mnt),
-				d_inode(path->dentry), mask);
+	return inode_permission_mnt(mnt_idmap(path->mnt), path->mnt,
+				   d_inode(path->dentry), mask);
 }
 int __check_sticky(struct mnt_idmap *idmap, struct inode *dir,
 		   struct inode *inode);
 
+/* Legacy inode-only entry points; use the _mnt variants for path operations. */
 int may_delete_dentry(struct mnt_idmap *idmap, struct inode *dir,
 		      struct dentry *victim, bool isdir);
+int may_delete_dentry_mnt(struct mnt_idmap *idmap,
+			  const struct vfsmount *mnt, struct inode *dir,
+			  struct dentry *victim, bool isdir);
 int may_create_dentry(struct mnt_idmap *idmap,
 		      struct inode *dir, struct dentry *child);
+int may_create_dentry_mnt(struct mnt_idmap *idmap,
+			  const struct vfsmount *mnt, struct inode *dir,
+			  struct dentry *child);
 
 static inline bool execute_ok(struct inode *inode)
 {
@@ -3222,6 +3295,8 @@ static inline int vfs_lstat(const char __user *name, struct kstat *stat)
 }
 
 extern const char *vfs_get_link(struct dentry *, struct delayed_call *);
+extern const char *vfs_get_link_mnt(const struct vfsmount *, struct dentry *,
+				    struct delayed_call *);
 extern int vfs_readlink(struct dentry *, char __user *, int);
 
 extern struct file_system_type *get_filesystem(struct file_system_type *fs);
@@ -3379,6 +3454,8 @@ static inline bool generic_ci_validate_strict_name(struct inode *dir,
 
 int may_setattr(struct mnt_idmap *idmap, struct inode *inode,
 		unsigned int ia_valid);
+int may_setattr_mnt(struct mnt_idmap *idmap, const struct vfsmount *mnt,
+		    struct inode *inode, unsigned int ia_valid);
 int setattr_prepare(struct mnt_idmap *, struct dentry *, struct iattr *);
 extern int inode_newsize_ok(const struct inode *, loff_t offset);
 void setattr_copy(struct mnt_idmap *, struct inode *inode,

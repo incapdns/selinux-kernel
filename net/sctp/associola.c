@@ -32,6 +32,7 @@
 #include <linux/fcntl.h>
 #include <linux/poll.h>
 #include <linux/init.h>
+#include <linux/security.h>
 
 #include <linux/slab.h>
 #include <linux/in.h>
@@ -298,10 +299,16 @@ struct sctp_association *sctp_association_new(const struct sctp_endpoint *ep,
 
 	SCTP_DBG_OBJCNT_INC(assoc);
 
+	if (security_sctp_assoc_alloc(asoc, gfp))
+		goto fail_security;
+
 	pr_debug("Created asoc %p\n", asoc);
 
 	return asoc;
 
+fail_security:
+	sctp_association_free(asoc);
+	return NULL;
 fail_init:
 	kfree(asoc);
 fail:
@@ -335,6 +342,8 @@ void sctp_association_free(struct sctp_association *asoc)
 	 * going away.
 	 */
 	asoc->base.dead = true;
+
+	security_sctp_assoc_free(asoc);
 
 	/* Dispose of any data lying around in the outqueue. */
 	sctp_outq_free(&asoc->outqueue);
@@ -1066,6 +1075,8 @@ void sctp_assoc_migrate(struct sctp_association *assoc, struct sock *newsk)
 	struct sctp_sock *newsp = sctp_sk(newsk);
 	struct sock *oldsk = assoc->base.sk;
 
+	/* Peel-off moves this association, including its LSM blob, intact. */
+
 	/* Delete the association from the old endpoint's list of
 	 * associations.
 	 */
@@ -1097,6 +1108,8 @@ int sctp_assoc_update(struct sctp_association *asoc,
 {
 	struct sctp_transport *trans;
 	struct list_head *pos, *temp;
+
+	/* Keep @asoc's LSM identity; @new remains owner of its own blob. */
 
 	/* Copy in new parameters of peer. */
 	asoc->c = new->c;

@@ -302,6 +302,7 @@ static struct mount *find_master(struct mount *m,
  * @dest_mp:     destination mountpoint.
  * @source_mnt:  source mount.
  * @tree_list:   list of secondaries to be attached.
+ * @topology:    prepared LSM topology transaction.
  *
  * Create secondary copies for attaching a tree with root @source_mnt
  * at mount @dest_mnt with mountpoint @dest_mp.  Link all new mounts
@@ -309,7 +310,8 @@ static struct mount *find_master(struct mount *m,
  * link their roots into @tree_list via ->mnt_hash.
  */
 int propagate_mnt(struct mount *dest_mnt, struct mountpoint *dest_mp,
-		  struct mount *source_mnt, struct hlist_head *tree_list)
+		  struct mount *source_mnt, struct hlist_head *tree_list,
+		  struct security_mnt_topology *topology)
 {
 	struct mount *m, *n, *copy, *this;
 	int err = 0, type;
@@ -337,9 +339,17 @@ int propagate_mnt(struct mount *dest_mnt, struct mountpoint *dest_mp,
 				continue;
 			if (type & CL_SLAVE) // first in this peer group
 				copy = find_master(n, copy, source_mnt);
+			err = mnt_topology_add_tree(topology, copy, n);
+			if (err)
+				break;
 			this = copy_tree(copy, copy->mnt.mnt_root, type);
 			if (IS_ERR(this)) {
 				err = PTR_ERR(this);
+				break;
+			}
+			err = mnt_topology_apply_tree(topology, this, n);
+			if (err) {
+				mnt_topology_discard_tree(this);
 				break;
 			}
 			scoped_guard(mount_locked_reader)

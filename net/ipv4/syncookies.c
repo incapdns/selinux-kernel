@@ -12,6 +12,7 @@
 #include <linux/export.h>
 #include <net/secure_seq.h>
 #include <net/tcp.h>
+#include <net/xfrm.h>
 #include <net/tcp_ecn.h>
 #include <net/route.h>
 
@@ -465,7 +466,11 @@ struct sock *cookie_v4_check(struct sock *sk, struct sk_buff *skb)
 			   ireq->ir_loc_addr, th->source, th->dest,
 			   sk_uid(sk));
 	security_req_classify_flow(req, flowi4_to_flowi_common(&fl4));
-	rt = ip_route_output_key(net, &fl4);
+	{
+		struct xfrm_flow_origin origin = xfrm_flow_origin_request(req);
+
+		rt = ip_route_output_flow_origin(net, &fl4, NULL, &origin);
+	}
 	if (IS_ERR(rt)) {
 		SKB_DR_SET(reason, IP_OUTNOROUTES);
 		goto out_free;

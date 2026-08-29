@@ -3610,9 +3610,7 @@ int smb2_open(struct ksmbd_work *work)
 		if (!file_present) {
 			daccess = cpu_to_le32(GENERIC_ALL_FLAGS);
 		} else {
-			ksmbd_vfs_query_maximal_access(idmap,
-							    path.dentry,
-							    &daccess);
+			ksmbd_vfs_query_maximal_access(idmap, &path, &daccess);
 			already_permitted = true;
 		}
 		maximal_access = daccess;
@@ -3669,17 +3667,17 @@ int smb2_open(struct ksmbd_work *work)
 		 * is already granted.
 		 */
 		if (daccess & ~(FILE_READ_ATTRIBUTES_LE | FILE_READ_CONTROL_LE)) {
-			rc = inode_permission(idmap,
-					      d_inode(path.dentry),
-					      may_flags);
+			rc = inode_permission_mnt(idmap, path.mnt,
+						  d_inode(path.dentry), may_flags);
 			if (rc)
 				goto err_out;
 
 			if ((daccess & FILE_DELETE_LE) ||
 			    (req->CreateOptions & FILE_DELETE_ON_CLOSE_LE)) {
-				rc = inode_permission(idmap,
-						      d_inode(path.dentry->d_parent),
-						      MAY_EXEC | MAY_WRITE);
+				rc = inode_permission_mnt(
+					idmap, path.mnt,
+					d_inode(path.dentry->d_parent),
+					MAY_EXEC | MAY_WRITE);
 				if (rc)
 					goto err_out;
 			}
@@ -3982,7 +3980,7 @@ int smb2_open(struct ksmbd_work *work)
 	if (!created)
 		smb2_update_xattrs(tcon, &path, fp);
 
-	ksmbd_vfs_update_compressed_fattr(path.dentry, &fp->f_ci->m_fattr);
+	ksmbd_vfs_update_compressed_fattr(&path, &fp->f_ci->m_fattr);
 
 	if (created)
 		smb2_new_xattrs(tcon, &path, fp);
@@ -4074,8 +4072,7 @@ reconnected_fp:
 		struct create_context *mxac_ccontext;
 
 		if (maximal_access == 0)
-			ksmbd_vfs_query_maximal_access(idmap,
-						       path.dentry,
+			ksmbd_vfs_query_maximal_access(idmap, &path,
 						       &maximal_access);
 		mxac_ccontext = (struct create_context *)(rsp->Buffer +
 				le32_to_cpu(rsp->CreateContextsLength));
@@ -4576,10 +4573,11 @@ static int process_query_dir_entries(struct smb2_query_dir_private *priv)
 		if (dentry_name(priv->d_info, priv->info_level))
 			return -EINVAL;
 
-		dent = lookup_one_unlocked(idmap,
-					   &QSTR_LEN(priv->d_info->name,
-						     priv->d_info->name_len),
-					   priv->dir_fp->filp->f_path.dentry);
+		dent = lookup_one_unlocked_mnt(
+			idmap, priv->dir_fp->filp->f_path.mnt,
+			&QSTR_LEN(priv->d_info->name,
+				  priv->d_info->name_len),
+			priv->dir_fp->filp->f_path.dentry);
 
 		if (IS_ERR(dent)) {
 			ksmbd_debug(SMB, "Cannot lookup `%s' [%ld]\n",
@@ -4852,9 +4850,7 @@ int smb2_query_dir(struct ksmbd_work *work)
 	}
 
 	if (!(dir_fp->daccess & FILE_LIST_DIRECTORY_LE) ||
-	    inode_permission(file_mnt_idmap(dir_fp->filp),
-			     file_inode(dir_fp->filp),
-			     MAY_READ | MAY_EXEC)) {
+	    file_permission(dir_fp->filp, MAY_READ | MAY_EXEC)) {
 		pr_err("no right to enumerate directory (%pD)\n", dir_fp->filp);
 		rc = -EACCES;
 		goto err_out2;
@@ -5995,7 +5991,7 @@ static int smb2_get_info_filesystem(struct ksmbd_work *work,
 			FILE_UNICODE_ON_DISK |
 			FILE_SUPPORTS_BLOCK_REFCOUNTING;
 
-		err = vfs_fileattr_get(path.dentry, &fa);
+		err = vfs_fileattr_get_mnt(path.mnt, path.dentry, &fa);
 		/*
 		 * -EINVAL, -EOPNOTSUPP: ntfs-3g and other FUSE
 		 * filesystems that lack FS_IOC_FSGETXATTR support.
@@ -6756,7 +6752,8 @@ static int set_file_basic_info(struct ksmbd_file *fp,
 			return -EACCES;
 
 		inode_lock(inode);
-		rc = notify_change(idmap, dentry, &attrs, NULL);
+		rc = notify_change_mnt(idmap, filp->f_path.mnt, dentry, &attrs,
+				       NULL);
 		inode_unlock(inode);
 	}
 	return rc;

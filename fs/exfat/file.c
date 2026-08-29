@@ -494,8 +494,8 @@ static int exfat_ioctl_set_attributes(struct file *file, u32 __user *user_attr)
 	 * out the RO attribute for checking by the security
 	 * module, just because it maps to a file mode.
 	 */
-	err = security_inode_setattr(file_mnt_idmap(file),
-				     file->f_path.dentry, &ia);
+	err = security_inode_setattr_mnt(file_mnt_idmap(file), file->f_path.mnt,
+					 file->f_path.dentry, &ia);
 	if (err)
 		goto out_unlock_inode;
 

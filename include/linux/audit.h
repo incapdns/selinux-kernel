@@ -171,6 +171,21 @@ extern struct audit_buffer *audit_log_start(struct audit_context *ctx, gfp_t gfp
 extern __printf(2, 3)
 void audit_log_format(struct audit_buffer *ab, const char *fmt, ...);
 extern void		    audit_log_end(struct audit_buffer *ab);
+extern int		    audit_log_end_status(struct audit_buffer *ab);
+#ifdef CONFIG_KUNIT
+struct audit_kunit_format_fault_result {
+	int failure_rc;
+	int retry_rc;
+	u16 expansion_failures;
+	u16 failure_enqueues;
+	u16 retry_enqueues;
+};
+
+int
+audit_kunit_format_expand_failure(struct audit_kunit_format_fault_result *result);
+int audit_kunit_lsm_filter_result(int match, int action,
+				  unsigned int listtype);
+#endif
 extern bool		    audit_string_contains_control(const char *string,
 							  size_t len);
 extern void		    audit_log_n_hex(struct audit_buffer *ab,
@@ -194,7 +209,8 @@ extern void		    audit_log_path_denied(int type,
 extern void		    audit_log_lost(const char *message);
 
 extern int audit_log_subj_ctx(struct audit_buffer *ab, struct lsm_prop *prop);
-extern int audit_log_obj_ctx(struct audit_buffer *ab, struct lsm_prop *prop);
+extern int audit_log_obj_ctx(struct audit_buffer *ab,
+			     const struct lsm_prop *prop);
 extern int audit_log_task_context(struct audit_buffer *ab);
 extern void audit_log_task_info(struct audit_buffer *ab);
 extern int audit_log_nf_skb(struct audit_buffer *ab,
@@ -239,6 +255,10 @@ void audit_log_format(struct audit_buffer *ab, const char *fmt, ...)
 { }
 static inline void audit_log_end(struct audit_buffer *ab)
 { }
+static inline int audit_log_end_status(struct audit_buffer *ab)
+{
+	return -EOPNOTSUPP;
+}
 static inline void audit_log_n_hex(struct audit_buffer *ab,
 				   const unsigned char *buf, size_t len)
 { }
@@ -265,7 +285,7 @@ static inline int audit_log_subj_ctx(struct audit_buffer *ab,
 	return 0;
 }
 static inline int audit_log_obj_ctx(struct audit_buffer *ab,
-				    struct lsm_prop *prop)
+				    const struct lsm_prop *prop)
 {
 	return 0;
 }

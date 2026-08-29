@@ -462,7 +462,12 @@ static void icmp_reply(struct icmp_bxm *icmp_param, struct sk_buff *skb)
 	fl4.flowi4_proto = IPPROTO_ICMP;
 	fl4.flowi4_oif = l3mdev_master_ifindex(skb->dev);
 	security_skb_classify_flow(skb, flowi4_to_flowi_common(&fl4));
-	rt = ip_route_output_key(net, &fl4);
+	{
+		struct xfrm_flow_origin origin = xfrm_flow_origin_skb(skb);
+
+		rt = ip_route_output_flow_origin_hash(net, &fl4, NULL, NULL,
+						      &origin);
+	}
 	if (IS_ERR(rt))
 		goto out_unlock;
 	if (icmpv4_xrlim_allow(net, rt, &fl4, type, code, apply_ratelimit))
@@ -524,8 +529,12 @@ static struct rtable *icmp_route_lookup(struct net *net, struct flowi4 *fl4,
 	/* No need to clone since we're just using its address. */
 	rt2 = rt;
 
-	dst = xfrm_lookup(net, &rt->dst,
-			  flowi4_to_flowi(fl4), NULL, 0);
+	{
+		struct xfrm_flow_origin origin = xfrm_flow_origin_skb(skb_in);
+
+		dst = xfrm_lookup_origin(net, &rt->dst, flowi4_to_flowi(fl4),
+					 NULL, &origin, 0);
+	}
 	rt = dst_rtable(dst);
 	if (!IS_ERR(dst)) {
 		if (rt != rt2)
@@ -599,8 +608,13 @@ static struct rtable *icmp_route_lookup(struct net *net, struct flowi4 *fl4,
 	if (err)
 		goto relookup_failed;
 
-	dst2 = xfrm_lookup(net, &rt2->dst, flowi4_to_flowi(&fl4_dec), NULL,
-			   XFRM_LOOKUP_ICMP);
+	{
+		struct xfrm_flow_origin origin = xfrm_flow_origin_skb(skb_in);
+
+		dst2 = xfrm_lookup_origin(net, &rt2->dst,
+					  flowi4_to_flowi(&fl4_dec), NULL,
+					  &origin, XFRM_LOOKUP_ICMP);
+	}
 	rt2 = dst_rtable(dst2);
 	if (!IS_ERR(dst2)) {
 		dst_release(&rt->dst);

@@ -1101,6 +1101,7 @@ int ip6_tnl_xmit(struct sk_buff *skb, struct net_device *dev, __u8 dsfield,
 		 struct flowi6 *fl6, int encap_limit, __u32 *pmtu,
 		 __u8 proto)
 {
+	struct xfrm_flow_origin origin = xfrm_flow_origin_none();
 	struct ip6_tnl *t = netdev_priv(dev);
 	struct net *net = t->net;
 	struct ipv6hdr *ipv6h;
@@ -1181,7 +1182,8 @@ route_lookup:
 
 		if (dst->error)
 			goto tx_err_link_failure;
-		dst = xfrm_lookup(net, dst, flowi6_to_flowi(fl6), NULL, 0);
+		dst = xfrm_lookup_origin(net, dst, flowi6_to_flowi(fl6), NULL,
+					 &origin, 0);
 		if (IS_ERR(dst)) {
 			err = PTR_ERR(dst);
 			dst = NULL;

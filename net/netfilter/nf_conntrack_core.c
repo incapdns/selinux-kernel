@@ -549,6 +549,11 @@ EXPORT_SYMBOL_GPL(nf_ct_tmpl_alloc);
 
 void nf_ct_tmpl_free(struct nf_conn *tmpl)
 {
+#if defined(CONFIG_NF_CONNTRACK_SECMARK) && \
+	defined(CONFIG_SECURITY_SELINUX_NS)
+	selinux_net_provenance_put(rcu_access_pointer(tmpl->secmark_provenance));
+	RCU_INIT_POINTER(tmpl->secmark_provenance, NULL);
+#endif
 	kfree(tmpl->ext);
 
 	if (ARCH_KMALLOC_MINALIGN <= NFCT_INFOMASK)
@@ -557,6 +562,106 @@ void nf_ct_tmpl_free(struct nf_conn *tmpl)
 		kfree(tmpl);
 }
 EXPORT_SYMBOL_GPL(nf_ct_tmpl_free);
+
+#if defined(CONFIG_NF_CONNTRACK_SECMARK) && \
+	defined(CONFIG_SECURITY_SELINUX_NS)
+static int nf_conn_secmark_snapshot(
+	struct nf_conn *ct, u32 *secmark,
+	struct selinux_net_provenance **provenance)
+{
+	struct selinux_net_provenance *candidate;
+	u32 sid;
+	int err = 0;
+
+	spin_lock_bh(&ct->lock);
+	candidate = rcu_dereference_protected(
+		ct->secmark_provenance, lockdep_is_held(&ct->lock));
+	sid = READ_ONCE(ct->secmark);
+	if ((!sid && !candidate) ||
+	    (sid && candidate &&
+	     selinux_secmark_provenance_matches(candidate, sid))) {
+		*secmark = sid;
+		*provenance = selinux_net_provenance_get(candidate);
+	} else {
+		err = -ESTALE;
+	}
+	spin_unlock_bh(&ct->lock);
+	return err;
+}
+
+void nf_conn_secmark_set(struct nf_conn *ct, u32 secmark,
+			 struct selinux_net_provenance *provenance)
+{
+	struct selinux_net_provenance *old;
+
+	provenance = selinux_net_provenance_get(provenance);
+	spin_lock_bh(&ct->lock);
+	WRITE_ONCE(ct->secmark, secmark);
+	old = rcu_replace_pointer(ct->secmark_provenance, provenance,
+				  lockdep_is_held(&ct->lock));
+	spin_unlock_bh(&ct->lock);
+	selinux_net_provenance_put(old);
+}
+EXPORT_SYMBOL_GPL(nf_conn_secmark_set);
+
+void nf_conn_secmark_save(struct nf_conn *ct, const struct sk_buff *skb)
+{
+	struct selinux_net_provenance *old = NULL, *provenance = NULL;
+	u32 secmark = READ_ONCE(skb->secmark);
+
+	if (!secmark)
+		return;
+	if (selinux_secmark_provenance_matches(skb->secmark_provenance,
+					       secmark))
+		provenance = selinux_net_provenance_get(
+			skb->secmark_provenance);
+	spin_lock_bh(&ct->lock);
+	if (!ct->secmark) {
+		WRITE_ONCE(ct->secmark, secmark);
+		old = rcu_replace_pointer(ct->secmark_provenance, provenance,
+					  lockdep_is_held(&ct->lock));
+		provenance = NULL;
+	}
+	spin_unlock_bh(&ct->lock);
+	selinux_net_provenance_put(old);
+	selinux_net_provenance_put(provenance);
+}
+EXPORT_SYMBOL_GPL(nf_conn_secmark_save);
+
+void nf_conn_secmark_restore(struct sk_buff *skb, struct nf_conn *ct)
+{
+	struct selinux_net_provenance *provenance;
+	u32 secmark;
+
+	if (skb->secmark)
+		return;
+	if (nf_conn_secmark_snapshot(ct, &secmark, &provenance)) {
+		/*
+		 * Preserve the ABI projection, but make missing provenance visible
+		 * to SELinux as a fail-closed bare mark.
+		 */
+		skb_set_secmark(skb, READ_ONCE(ct->secmark), NULL);
+		return;
+	}
+	skb_set_secmark(skb, secmark, provenance);
+	selinux_net_provenance_put(provenance);
+}
+EXPORT_SYMBOL_GPL(nf_conn_secmark_restore);
+
+void nf_conn_secmark_copy(struct nf_conn *dst, struct nf_conn *src)
+{
+	struct selinux_net_provenance *provenance;
+	u32 secmark;
+
+	if (nf_conn_secmark_snapshot(src, &secmark, &provenance)) {
+		nf_conn_secmark_set(dst, READ_ONCE(src->secmark), NULL);
+		return;
+	}
+	nf_conn_secmark_set(dst, secmark, provenance);
+	selinux_net_provenance_put(provenance);
+}
+EXPORT_SYMBOL_GPL(nf_conn_secmark_copy);
+#endif
 
 static void destroy_gre_conntrack(struct nf_conn *ct)
 {
@@ -1738,6 +1843,12 @@ void nf_conntrack_free(struct nf_conn *ct)
 	nf_ct_timeout_put(ct);
 	rcu_read_unlock();
 
+#if defined(CONFIG_NF_CONNTRACK_SECMARK) && \
+	defined(CONFIG_SECURITY_SELINUX_NS)
+	selinux_net_provenance_put(rcu_access_pointer(ct->secmark_provenance));
+	RCU_INIT_POINTER(ct->secmark_provenance, NULL);
+#endif
+
 	kfree(ct->ext);
 	kmem_cache_free(nf_conntrack_cachep, ct);
 	cnet = nf_ct_pernet(net);
@@ -1826,7 +1937,11 @@ init_conntrack(struct net *net, struct nf_conn *tmpl,
 			ct->mark = READ_ONCE(exp->master->mark);
 #endif
 #ifdef CONFIG_NF_CONNTRACK_SECMARK
+#ifdef CONFIG_SECURITY_SELINUX_NS
+			nf_conn_secmark_copy(ct, exp->master);
+#else
 			ct->secmark = exp->master->secmark;
+#endif
 #endif
 			NF_CT_STAT_INC(net, expect_new);
 		}

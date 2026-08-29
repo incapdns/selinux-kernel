@@ -109,6 +109,7 @@ TARGETS += rtc
 TARGETS += rust
 TARGETS += sched_ext
 TARGETS += seccomp
+TARGETS += selinuxns
 TARGETS += sgx
 TARGETS += signal
 TARGETS += size

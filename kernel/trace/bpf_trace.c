@@ -2881,7 +2881,7 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 	bpf_link_init(&link->link, BPF_LINK_TYPE_KPROBE_MULTI,
 		      &bpf_kprobe_multi_link_lops, prog, attr->link_create.attach_type);
 
-	err = bpf_link_prime(&link->link, &link_primer);
+	err = bpf_link_prime(&link->link, &link_primer, NULL, NULL);
 	if (err)
 		goto error;
 
@@ -3381,7 +3381,7 @@ int bpf_uprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 		}
 	}
 
-	err = bpf_link_prime(&link->link, &link_primer);
+	err = bpf_link_prime(&link->link, &link_primer, NULL, NULL);
 	if (err)
 		goto error_unregister;
 
@@ -3846,7 +3846,7 @@ int bpf_tracing_multi_attach(struct bpf_prog *prog, const union bpf_attr *attr)
 	bpf_link_init(&link->link, BPF_LINK_TYPE_TRACING_MULTI,
 		      &bpf_tracing_multi_link_lops, prog, prog->expected_attach_type);
 
-	err = bpf_link_prime(&link->link, &link_primer);
+	err = bpf_link_prime(&link->link, &link_primer, NULL, NULL);
 	if (err)
 		goto error;
 

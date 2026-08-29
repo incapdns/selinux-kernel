@@ -264,11 +264,15 @@ int aa_audit_rule_known(struct audit_krule *rule)
 	return 0;
 }
 
-int aa_audit_rule_match(struct lsm_prop *prop, u32 field, u32 op, void *vrule)
+int aa_audit_rule_match(const struct lsm_prop_ref *ref,
+			const struct lsm_prop *prop, u32 field, u32 op,
+			void *vrule)
 {
 	struct aa_audit_rule *rule = vrule;
 	struct aa_label *label;
 	int found = 0;
+
+	(void)ref;
 
 	label = prop->apparmor.label;
 

@@ -35,6 +35,7 @@
 #include <linux/buffer_head.h>
 #include <linux/bio.h>
 #include <linux/iversion.h>
+#include <linux/security.h>
 #include <linux/unicode.h>
 #include "ext4.h"
 #include "ext4_jbd2.h"
@@ -2884,7 +2885,7 @@ static int ext4_tmpfile(struct mnt_idmap *idmap, struct inode *dir,
 {
 	handle_t *handle;
 	struct inode *inode;
-	int err, retries = 0;
+	int abort_err, err, retries = 0;
 
 	err = dquot_initialize(dir);
 	if (err)
@@ -2892,7 +2893,7 @@ static int ext4_tmpfile(struct mnt_idmap *idmap, struct inode *dir,
 
 retry:
 	inode = ext4_new_inode_start_handle(idmap, dir, mode,
-					    NULL, 0, NULL,
+					    &file_dentry(file)->d_name, 0, NULL,
 					    EXT4_HT_DIR,
 			EXT4_MAXQUOTAS_TRANS_BLOCKS(dir->i_sb) +
 			  4 + EXT4_XATTR_TRANS_BLOCKS);
@@ -2915,6 +2916,9 @@ retry:
 		goto retry;
 	return finish_open_simple(file, err);
 err_unlock_inode:
+	abort_err = security_inode_create_plan_attempt_abort(inode);
+	if (abort_err)
+		err = abort_err;
 	ext4_journal_stop(handle);
 	unlock_new_inode(inode);
 	return err;
@@ -4238,6 +4242,8 @@ const struct inode_operations ext4_dir_inode_operations = {
 	.fiemap         = ext4_fiemap,
 	.fileattr_get	= ext4_fileattr_get,
 	.fileattr_set	= ext4_fileattr_set,
+	.security_create_plan_ops =
+		SECURITY_INODE_CREATE_OP(SECURITY_INODE_TMPFILE),
 };
 
 const struct inode_operations ext4_special_inode_operations = {

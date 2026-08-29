@@ -65,7 +65,7 @@ static const struct file_operations __fops = {				\
 #define DEFINE_DEBUGFS_ATTRIBUTE_SIGNED(__fops, __get, __set, __fmt)	\
 	DEFINE_DEBUGFS_ATTRIBUTE_XSIGNED(__fops, __get, __set, __fmt, true)
 
-typedef struct vfsmount *(*debugfs_automount_t)(struct dentry *, void *);
+typedef struct vfsmount *(*debugfs_automount_t)(const struct path *, void *);
 
 struct debugfs_short_fops {
 	ssize_t (*read)(struct file *, char __user *, size_t, loff_t *);

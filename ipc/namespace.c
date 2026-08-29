@@ -17,6 +17,7 @@
 #include <linux/proc_ns.h>
 #include <linux/nstree.h>
 #include <linux/sched/task.h>
+#include <linux/security.h>
 
 #include "util.h"
 
@@ -69,10 +70,13 @@ static struct ipc_namespace *create_ipc_ns(struct user_namespace *user_ns,
 	ns_tree_gen_id(ns);
 	ns->user_ns = get_user_ns(user_ns);
 	ns->ucounts = ucounts;
+	err = security_ipc_namespace_alloc(ns, old_ns, current_cred(), false);
+	if (err)
+		goto fail_put;
 
 	err = mq_init_ns(ns);
 	if (err)
-		goto fail_put;
+		goto fail_security;
 
 	err = -ENOMEM;
 	if (!setup_mq_sysctls(ns))
@@ -97,6 +101,8 @@ fail_mq_sysctls:
 	retire_mq_sysctls(ns);
 fail_mq_mount:
 	mntput(ns->mq_mnt);
+fail_security:
+	security_ipc_namespace_free(ns);
 fail_put:
 	put_user_ns(ns->user_ns);
 	ns_common_free(ns);
@@ -161,6 +167,7 @@ static void free_ipc_ns(struct ipc_namespace *ns)
 	retire_mq_sysctls(ns);
 	retire_ipc_sysctls(ns);
 
+	security_ipc_namespace_free(ns);
 	dec_ipc_namespaces(ns->ucounts);
 	put_user_ns(ns->user_ns);
 	ns_common_free(ns);
@@ -234,9 +241,29 @@ static int ipcns_install(struct nsset *nsset, struct ns_common *new)
 {
 	struct nsproxy *nsproxy = nsset->nsproxy;
 	struct ipc_namespace *ns = to_ipc_ns(new);
+	const struct cred *cred = nsset->security_cred ?: nsset->cred;
+	struct cred *replacement = NULL;
+	int err;
+
 	if (!ns_capable(ns->user_ns, CAP_SYS_ADMIN) ||
 	    !ns_capable(nsset->cred->user_ns, CAP_SYS_ADMIN))
 		return -EPERM;
+	/* A later namespace validation supersedes any earlier IPC candidate. */
+	security_ipc_namespace_reanchor_abort(&nsset->ipc_security_txn);
+	err = security_ipc_namespace_reanchor_prepare(
+		&nsset->ipc_security_txn, ns, cred,
+		nsset->security_cred ? NULL : nsset_cred(nsset), &replacement);
+	if (err)
+		return err;
+	if (replacement) {
+		err = nsset_install_security_cred(nsset, replacement);
+		if (err) {
+			security_ipc_namespace_reanchor_abort(
+				&nsset->ipc_security_txn);
+			abort_creds(replacement);
+			return err;
+		}
+	}
 
 	put_ipc_ns(nsproxy->ipc_ns);
 	nsproxy->ipc_ns = get_ipc_ns(ns);

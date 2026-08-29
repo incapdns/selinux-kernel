@@ -557,6 +557,8 @@ static int ovl_create_index(struct dentry *dentry, const struct ovl_fh *fh,
 		goto out;
 
 	rd.mnt_idmap = ovl_upper_mnt_idmap(ofs);
+	rd.old_mnt = ovl_upper_mnt(ofs);
+	rd.new_mnt = ovl_upper_mnt(ofs);
 	rd.old_parent = indexdir;
 	rd.new_parent = indexdir;
 	err = start_renaming_dentry(&rd, 0, temp, &name);
@@ -724,12 +726,15 @@ static int ovl_copy_up_metadata(struct ovl_copy_up_ctx *c, struct dentry *temp)
 	return err;
 }
 
-static const struct cred *ovl_prepare_copy_up_creds(struct dentry *dentry)
+static const struct cred *
+ovl_prepare_copy_up_creds(struct ovl_copy_up_ctx *ctx)
 {
 	struct cred *copy_up_cred = NULL;
+	struct ovl_fs *ofs = OVL_FS(ctx->dentry->d_sb);
 	int err;
 
-	err = security_inode_copy_up(dentry, &copy_up_cred);
+	err = security_inode_copy_up(&ctx->lowerpath, ovl_upper_mnt(ofs),
+				     &copy_up_cred);
 	if (err < 0)
 		return ERR_PTR(err);
 
@@ -749,7 +754,7 @@ static void ovl_revert_copy_up_creds(const struct cred *orig_cred)
 
 DEFINE_CLASS(copy_up_creds, const struct cred *,
 	     if (!IS_ERR_OR_NULL(_T)) ovl_revert_copy_up_creds(_T),
-	     ovl_prepare_copy_up_creds(dentry), struct dentry *dentry)
+	     ovl_prepare_copy_up_creds(ctx), struct ovl_copy_up_ctx *ctx)
 
 /*
  * Copyup using workdir to prepare temp file.  Used when copying up directories,
@@ -770,7 +775,7 @@ static int ovl_copy_up_workdir(struct ovl_copy_up_ctx *c)
 		.link = c->link
 	};
 
-	scoped_class(copy_up_creds, copy_up_creds, c->dentry) {
+	scoped_class(copy_up_creds, copy_up_creds, c) {
 		if (IS_ERR(copy_up_creds))
 			return PTR_ERR(copy_up_creds);
 
@@ -787,6 +792,12 @@ static int ovl_copy_up_workdir(struct ovl_copy_up_ctx *c)
 	 * xattrs will remove security.capability xattr automatically.
 	 */
 	path.dentry = temp;
+	err = security_inode_copy_up_post(&c->lowerpath, ovl_upper_mnt(ofs),
+					  temp);
+	if (err) {
+		ovl_start_write(c->dentry);
+		goto cleanup_unlocked;
+	}
 	err = ovl_copy_up_data(c, &path);
 	ovl_start_write(c->dentry);
 	if (err)
@@ -805,6 +816,8 @@ static int ovl_copy_up_workdir(struct ovl_copy_up_ctx *c)
 	 * temp wasn't moved before copy up completion or cleanup.
 	 */
 	rd.mnt_idmap = ovl_upper_mnt_idmap(ofs);
+	rd.old_mnt = ovl_upper_mnt(ofs);
+	rd.new_mnt = ovl_upper_mnt(ofs);
 	rd.old_parent = c->workdir;
 	rd.new_parent = c->destdir;
 	rd.flags = 0;
@@ -857,7 +870,7 @@ static int ovl_copy_up_tmpfile(struct ovl_copy_up_ctx *c)
 	struct file *tmpfile;
 	int err;
 
-	scoped_class(copy_up_creds, copy_up_creds, c->dentry) {
+	scoped_class(copy_up_creds, copy_up_creds, c) {
 		if (IS_ERR(copy_up_creds))
 			return PTR_ERR(copy_up_creds);
 
@@ -870,6 +883,10 @@ static int ovl_copy_up_tmpfile(struct ovl_copy_up_ctx *c)
 		return PTR_ERR(tmpfile);
 
 	temp = tmpfile->f_path.dentry;
+	err = security_inode_copy_up_post(&c->lowerpath, ovl_upper_mnt(ofs),
+					  temp);
+	if (err)
+		goto out_fput;
 	if (!c->metacopy && c->stat.size) {
 		err = ovl_copy_up_file(ofs, c->dentry, tmpfile, c->stat.size,
 				       !c->metadata_fsync);
@@ -1182,7 +1199,8 @@ static int ovl_copy_up_one(struct dentry *parent, struct dentry *dentry,
 		ctx.stat.size = 0;
 
 	if (S_ISLNK(ctx.stat.mode)) {
-		ctx.link = vfs_get_link(ctx.lowerpath.dentry, &done);
+		ctx.link = vfs_get_link_mnt(ctx.lowerpath.mnt,
+					 ctx.lowerpath.dentry, &done);
 		if (IS_ERR(ctx.link))
 			return PTR_ERR(ctx.link);
 	}

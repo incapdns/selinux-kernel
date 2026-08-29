@@ -339,6 +339,7 @@ static void put_nsset(struct nsset *nsset)
 {
 	unsigned flags = nsset->flags;
 
+	security_ipc_namespace_reanchor_abort(&nsset->ipc_security_txn);
 	if (flags & CLONE_NEWUSER)
 		put_cred(nsset_cred(nsset));
 	/*
@@ -349,6 +350,8 @@ static void put_nsset(struct nsset *nsset)
 		free_fs_struct(nsset->fs);
 	if (nsset->nsproxy)
 		nsproxy_free(nsset->nsproxy);
+	if (nsset->security_cred)
+		abort_creds(nsset->security_cred);
 }
 
 static int prepare_nsset(unsigned flags, struct nsset *nsset)
@@ -537,6 +540,9 @@ static void commit_nsset(struct nsset *nsset)
 	unsigned flags = nsset->flags;
 	struct task_struct *me = current;
 
+	/* Infallible after prepare; object constructors are gated by pending. */
+	security_ipc_namespace_reanchor_commit(&nsset->ipc_security_txn);
+
 #ifdef CONFIG_USER_NS
 	if (flags & CLONE_NEWUSER) {
 		/* transfer ownership */
@@ -564,6 +570,10 @@ static void commit_nsset(struct nsset *nsset)
 	/* transfer ownership */
 	switch_task_namespaces(me, nsset->nsproxy);
 	nsset->nsproxy = NULL;
+	if (nsset->security_cred) {
+		commit_creds(nsset->security_cred);
+		nsset->security_cred = NULL;
+	}
 }
 
 SYSCALL_DEFINE2(setns, int, fd, int, flags)

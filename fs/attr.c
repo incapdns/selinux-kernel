@@ -369,8 +369,8 @@ void setattr_copy(struct mnt_idmap *idmap, struct inode *inode,
 }
 EXPORT_SYMBOL(setattr_copy);
 
-int may_setattr(struct mnt_idmap *idmap, struct inode *inode,
-		unsigned int ia_valid)
+int may_setattr_mnt(struct mnt_idmap *idmap, const struct vfsmount *mnt,
+		    struct inode *inode, unsigned int ia_valid)
 {
 	int error;
 
@@ -388,18 +388,26 @@ int may_setattr(struct mnt_idmap *idmap, struct inode *inode,
 			return -EPERM;
 
 		if (!inode_owner_or_capable(idmap, inode)) {
-			error = inode_permission(idmap, inode, MAY_WRITE);
+			error = inode_permission_mnt(idmap, mnt, inode, MAY_WRITE);
 			if (error)
 				return error;
 		}
 	}
 	return 0;
 }
+EXPORT_SYMBOL(may_setattr_mnt);
+
+int may_setattr(struct mnt_idmap *idmap, struct inode *inode,
+		unsigned int ia_valid)
+{
+	return may_setattr_mnt(idmap, NULL, inode, ia_valid);
+}
 EXPORT_SYMBOL(may_setattr);
 
 /**
- * notify_change - modify attributes of a filesystem object
+ * notify_change_mnt - modify attributes of a filesystem object
  * @idmap:	idmap of the mount the inode was found from
+ * @mnt:	mount selecting the object's LSM label view, or NULL for a raw object
  * @dentry:	object affected
  * @attr:	new attributes
  * @delegated_inode: returns inode, if the inode is delegated
@@ -424,8 +432,9 @@ EXPORT_SYMBOL(may_setattr);
  * permissions. On non-idmapped mounts or if permission checking is to be
  * performed on the raw inode simply pass @nop_mnt_idmap.
  */
-int notify_change(struct mnt_idmap *idmap, struct dentry *dentry,
-		  struct iattr *attr, struct delegated_inode *delegated_inode)
+int notify_change_mnt(struct mnt_idmap *idmap, const struct vfsmount *mnt,
+		      struct dentry *dentry, struct iattr *attr,
+		      struct delegated_inode *delegated_inode)
 {
 	struct inode *inode = dentry->d_inode;
 	umode_t mode = inode->i_mode;
@@ -435,7 +444,7 @@ int notify_change(struct mnt_idmap *idmap, struct dentry *dentry,
 
 	WARN_ON_ONCE(!inode_is_locked(inode));
 
-	error = may_setattr(idmap, inode, ia_valid);
+	error = may_setattr_mnt(idmap, mnt, inode, ia_valid);
 	if (error)
 		return error;
 
@@ -537,7 +546,7 @@ int notify_change(struct mnt_idmap *idmap, struct dentry *dentry,
 	    !vfsgid_valid(i_gid_into_vfsgid(idmap, inode)))
 		return -EOVERFLOW;
 
-	error = security_inode_setattr(idmap, dentry, attr);
+	error = security_inode_setattr_mnt(idmap, mnt, dentry, attr);
 	if (error)
 		return error;
 
@@ -563,5 +572,17 @@ int notify_change(struct mnt_idmap *idmap, struct dentry *dentry,
 	}
 
 	return error;
+}
+EXPORT_SYMBOL(notify_change_mnt);
+
+int notify_change(struct mnt_idmap *idmap, struct dentry *dentry,
+		  struct iattr *attr, struct delegated_inode *delegated_inode)
+{
+	const struct vfsmount *mnt = NULL;
+
+	/* ATTR_FILE is an explicit, durable mount/view source for FD callers. */
+	if ((attr->ia_valid & ATTR_FILE) && attr->ia_file)
+		mnt = attr->ia_file->f_path.mnt;
+	return notify_change_mnt(idmap, mnt, dentry, attr, delegated_inode);
 }
 EXPORT_SYMBOL(notify_change);

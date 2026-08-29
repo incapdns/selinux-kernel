@@ -91,11 +91,13 @@ struct lsm_id {
  * @scalls: The beginning of the array of static calls assigned to this hook.
  * @hook: The callback for the hook.
  * @lsm: The name of the lsm that owns this hook.
+ * @lsm_slot: Dense slot assigned to the owning LSM at boot.
  */
 struct security_hook_list {
 	struct lsm_static_call *scalls;
 	union security_list_options hook;
 	const struct lsm_id *lsmid;
+	u16 lsm_slot;
 } __randomize_layout;
 
 /*
@@ -105,11 +107,21 @@ struct lsm_blob_sizes {
 	unsigned int lbs_cred;
 	unsigned int lbs_file;
 	unsigned int lbs_backing_file;
+	unsigned int lbs_mnt;
+	unsigned int lbs_mnt_topology;
+	unsigned int lbs_inode_create_plan;
+	unsigned int lbs_inode_setxattr_plan;
 	unsigned int lbs_ib;
 	unsigned int lbs_inode;
+	unsigned int lbs_prop_ref;
+	unsigned int lbs_req;
+	unsigned int lbs_scm;
+	unsigned int lbs_sctp_assoc;
 	unsigned int lbs_sock;
 	unsigned int lbs_superblock;
+	unsigned int lbs_kernfs_root;
 	unsigned int lbs_ipc;
+	unsigned int lbs_ipc_namespace;
 	unsigned int lbs_key;
 	unsigned int lbs_msg_msg;
 	unsigned int lbs_perf_event;
@@ -119,6 +131,8 @@ struct lsm_blob_sizes {
 	unsigned int lbs_bdev;
 	unsigned int lbs_bpf_map;
 	unsigned int lbs_bpf_prog;
+	unsigned int lbs_bpf_link;
+	unsigned int lbs_bpf_btf;
 	unsigned int lbs_bpf_token;
 };
 
@@ -156,6 +170,8 @@ enum lsm_order {
  * struct lsm_info - Define an individual LSM for the LSM framework.
  * @id: LSM name/ID info
  * @order: ordering with respect to other LSMs, optional
+ * @slot: dense boot-time slot in the active LSM order
+ * @plan_hooks: internal create/setxattr plan-hook registration mask
  * @flags: descriptive flags, optional
  * @blobs: LSM blob sharing, optional
  * @enabled: controlled by CONFIG_LSM, optional
@@ -171,6 +187,8 @@ enum lsm_order {
 struct lsm_info {
 	const struct lsm_id *id;
 	enum lsm_order order;
+	u16 slot;
+	u8 plan_hooks;
 	unsigned long flags;
 	struct lsm_blob_sizes *blobs;
 	int *enabled;

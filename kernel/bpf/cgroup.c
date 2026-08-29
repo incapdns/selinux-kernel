@@ -1535,7 +1535,7 @@ int cgroup_bpf_link_attach(const union bpf_attr *attr, struct bpf_prog *prog)
 		      prog, attr->link_create.attach_type);
 	link->cgroup = cgrp;
 
-	err = bpf_link_prime(&link->link, &link_primer);
+	err = bpf_link_prime(&link->link, &link_primer, NULL, NULL);
 	if (err) {
 		kfree(link);
 		goto out_put_cgroup;

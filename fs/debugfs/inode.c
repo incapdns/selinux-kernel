@@ -257,7 +257,7 @@ static struct vfsmount *debugfs_automount(struct path *path)
 {
 	struct inode *inode = path->dentry->d_inode;
 
-	return DEBUGFS_I(inode)->automount(path->dentry, inode->i_private);
+	return DEBUGFS_I(inode)->automount(path, inode->i_private);
 }
 
 static const struct dentry_operations debugfs_dops = {

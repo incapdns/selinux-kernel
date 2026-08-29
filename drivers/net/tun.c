@@ -695,7 +695,8 @@ static int tun_attach(struct tun_struct *tun, struct file *file,
 	struct net_device *dev = tun->dev;
 	int err;
 
-	err = security_tun_dev_attach(tfile->socket.sk, tun->security);
+	err = security_tun_dev_attach(tfile->socket.sk, tun->security,
+				      dev_net(dev));
 	if (err < 0)
 		goto out;
 
@@ -916,7 +917,7 @@ static int tun_net_init(struct net_device *dev)
 
 	spin_lock_init(&tun->lock);
 
-	err = security_tun_dev_alloc_security(&tun->security);
+	err = security_tun_dev_alloc_security(&tun->security, dev_net(dev));
 	if (err < 0)
 		return err;
 
@@ -956,6 +957,24 @@ static void tun_net_uninit(struct net_device *dev)
 /* Net device open. */
 static int tun_net_open(struct net_device *dev)
 {
+	struct tun_struct *tun = netdev_priv(dev);
+	struct tun_file *tfile;
+	int i, err;
+
+	ASSERT_RTNL();
+	for (i = 0; i < tun->numqueues; i++) {
+		tfile = rtnl_dereference(tun->tfiles[i]);
+		err = security_tun_dev_attach(tfile->socket.sk, tun->security,
+					      dev_net(dev));
+		if (err)
+			return err;
+	}
+	list_for_each_entry(tfile, &tun->disabled, next) {
+		err = security_tun_dev_attach(tfile->socket.sk, tun->security,
+					      dev_net(dev));
+		if (err)
+			return err;
+	}
 	netif_tx_start_all_queues(dev);
 
 	return 0;
@@ -2731,7 +2750,7 @@ static int tun_set_iff(struct net *net, struct file *file, struct ifreq *ifr)
 
 		if (tun_not_capable(tun))
 			return -EPERM;
-		err = security_tun_dev_open(tun->security);
+		err = security_tun_dev_open(tun->security, dev_net(tun->dev));
 		if (err < 0)
 			return err;
 
@@ -2962,7 +2981,8 @@ static int tun_set_queue(struct file *file, struct ifreq *ifr)
 			ret = -EINVAL;
 			goto unlock;
 		}
-		ret = security_tun_dev_attach_queue(tun->security);
+		ret = security_tun_dev_attach_queue(tun->security,
+						dev_net(tun->dev));
 		if (ret < 0)
 			goto unlock;
 		ret = tun_attach(tun, file, false, tun->flags & IFF_NAPI,

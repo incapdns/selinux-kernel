@@ -45,7 +45,9 @@ static int ovl_xattr_set(struct dentry *dentry, struct inode *inode, const char 
 	if (!value && !upperdentry) {
 		ovl_path_lower(dentry, &realpath);
 		with_ovl_creds(dentry->d_sb)
-			err = vfs_getxattr(mnt_idmap(realpath.mnt), realdentry, name, NULL, 0);
+			err = vfs_getxattr_mnt(mnt_idmap(realpath.mnt),
+					       realpath.mnt, realdentry, name,
+					       NULL, 0);
 		if (err < 0)
 			goto out;
 	}
@@ -85,7 +87,8 @@ static int ovl_xattr_get(struct dentry *dentry, struct inode *inode, const char 
 
 	ovl_i_path_real(inode, &realpath);
 	with_ovl_creds(dentry->d_sb)
-		return vfs_getxattr(mnt_idmap(realpath.mnt), realpath.dentry, name, value, size);
+		return vfs_getxattr_mnt(mnt_idmap(realpath.mnt), realpath.mnt,
+					realpath.dentry, name, value, size);
 }
 
 static bool ovl_can_list(struct super_block *sb, const char *s)

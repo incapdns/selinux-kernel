@@ -115,6 +115,10 @@ struct nf_conn {
 
 #ifdef CONFIG_NF_CONNTRACK_SECMARK
 	u_int32_t secmark;
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	/* RCU-published strong carrier; secmark remains the ABI projection. */
+	struct selinux_net_provenance __rcu *secmark_provenance;
+#endif
 #endif
 
 	/* Extensions */
@@ -249,6 +253,14 @@ void nf_ct_iterate_destroy(int (*iter)(struct nf_conn *i, void *data),
 struct nf_conntrack_zone;
 
 void nf_conntrack_free(struct nf_conn *ct);
+#if defined(CONFIG_NF_CONNTRACK_SECMARK) && \
+	defined(CONFIG_SECURITY_SELINUX_NS)
+void nf_conn_secmark_set(struct nf_conn *ct, u32 secmark,
+			 struct selinux_net_provenance *provenance);
+void nf_conn_secmark_save(struct nf_conn *ct, const struct sk_buff *skb);
+void nf_conn_secmark_restore(struct sk_buff *skb, struct nf_conn *ct);
+void nf_conn_secmark_copy(struct nf_conn *dst, struct nf_conn *src);
+#endif
 struct nf_conn *nf_conntrack_alloc(struct net *net,
 				   const struct nf_conntrack_zone *zone,
 				   const struct nf_conntrack_tuple *orig,

@@ -156,7 +156,8 @@ __be32		nfsd_readdir(struct svc_rqst *, struct svc_fh *,
 			     loff_t *, struct readdir_cd *, nfsd_filldir_t);
 __be32		nfsd_statfs(struct svc_rqst *, struct svc_fh *,
 				struct kstatfs *, int access);
-int		nfsd_get_case_info(struct dentry *dentry,
+int		nfsd_get_case_info(const struct vfsmount *mnt,
+				   struct dentry *dentry,
 				   bool *case_insensitive,
 				   bool *case_preserving);
 

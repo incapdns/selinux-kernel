@@ -240,7 +240,7 @@ int bpf_nf_link_attach(const union bpf_attr *attr, struct bpf_prog *prog)
 	link->dead = false;
 	link->defrag_hook = NULL;
 
-	err = bpf_link_prime(&link->link, &link_primer);
+	err = bpf_link_prime(&link->link, &link_primer, NULL, NULL);
 	if (err) {
 		kfree(link);
 		return err;

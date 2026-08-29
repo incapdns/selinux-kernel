@@ -299,7 +299,17 @@ config SECURITY_COMMONCAP_KUNIT_TEST
 
 	  If unsure, say N.
 
+config SECURITY_PLAN_KUNIT_TEST
+	bool "Build KUnit tests for transactional LSM plans" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && SECURITY
+	default KUNIT_ALL_TESTS
+	help
+	  Test the generic prepare/finish protocol used by transactional inode
+	  create and setxattr plans, including exact participant tracking and
+	  cleanup error precedence.
+
+	  If unsure, say N.
+
 source "security/Kconfig.hardening"
 
 endmenu
-

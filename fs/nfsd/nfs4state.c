@@ -9694,7 +9694,8 @@ void nfsd_update_cmtime_attr(struct file *f, unsigned int flags)
 	};
 
 	inode_lock(inode);
-	ret = notify_change(&nop_mnt_idmap, f->f_path.dentry, &attr, NULL);
+	ret = notify_change_mnt(&nop_mnt_idmap, f->f_path.mnt,
+				f->f_path.dentry, &attr, NULL);
 	inode_unlock(inode);
 	if (ret)
 		pr_notice_ratelimited("nfsd: Unable to update timestamps on "

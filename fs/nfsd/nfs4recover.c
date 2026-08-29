@@ -145,7 +145,8 @@ nfsd4_create_clid_dir(struct nfs4_client *clp)
 
 	dir = nn->rec_file->f_path.dentry;
 
-	dentry = start_creating(&nop_mnt_idmap, dir, &QSTR(dname));
+	dentry = start_creating_mnt(&nop_mnt_idmap, nn->rec_file->f_path.mnt,
+				    dir, &QSTR(dname));
 	if (IS_ERR(dentry)) {
 		status = PTR_ERR(dentry);
 		goto out;
@@ -262,7 +263,8 @@ nfsd4_unlink_clid_dir(char *name, struct nfsd_net *nn)
 	dprintk("NFSD: nfsd4_unlink_clid_dir. name %s\n", name);
 
 	dir = nn->rec_file->f_path.dentry;
-	dentry = start_removing(&nop_mnt_idmap, dir, &QSTR(name));
+	dentry = start_removing_mnt(&nop_mnt_idmap, nn->rec_file->f_path.mnt,
+				    dir, &QSTR(name));
 	if (IS_ERR(dentry))
 		return PTR_ERR(dentry);
 

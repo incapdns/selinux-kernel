@@ -64,8 +64,8 @@ int vfs_utimes(const struct path *path, struct timespec64 *times)
 	}
 retry_deleg:
 	inode_lock(inode);
-	error = notify_change(mnt_idmap(path->mnt), path->dentry, &newattrs,
-			      &delegated_inode);
+	error = notify_change_mnt(mnt_idmap(path->mnt), path->mnt, path->dentry,
+				  &newattrs, &delegated_inode);
 	inode_unlock(inode);
 	if (is_delegated(&delegated_inode)) {
 		error = break_deleg_wait(&delegated_inode);

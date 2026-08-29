@@ -3,6 +3,8 @@
 #ifndef _LINUX_FILEATTR_H
 #define _LINUX_FILEATTR_H
 
+struct vfsmount;
+
 /* Flags shared betwen flags/xflags */
 #define FS_COMMON_FL \
 	(FS_SYNC_FL | FS_IMMUTABLE_FL | FS_APPEND_FL | \
@@ -74,8 +76,13 @@ static inline bool fileattr_has_fsx(const struct file_kattr *fa)
 }
 
 int vfs_fileattr_get(struct dentry *dentry, struct file_kattr *fa);
+int vfs_fileattr_get_mnt(const struct vfsmount *mnt, struct dentry *dentry,
+			 struct file_kattr *fa);
 int vfs_fileattr_set(struct mnt_idmap *idmap, struct dentry *dentry,
 		     struct file_kattr *fa);
+int vfs_fileattr_set_mnt(struct mnt_idmap *idmap,
+			 const struct vfsmount *mnt, struct dentry *dentry,
+			 struct file_kattr *fa);
 int ioctl_getflags(struct file *file, unsigned int __user *argp);
 int ioctl_setflags(struct file *file, unsigned int __user *argp);
 int ioctl_fsgetxattr(struct file *file, void __user *argp);

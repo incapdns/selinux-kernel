@@ -94,6 +94,21 @@ void __ns_common_free(struct ns_common *ns)
 	proc_free_inum(ns->inum);
 }
 
+struct ns_common *__must_check ns_get_unless_inactive(struct ns_common *ns)
+{
+	if (!__ns_ref_active_read(ns)) {
+		VFS_WARN_ON_ONCE(is_ns_init_id(ns));
+		return NULL;
+	}
+	if (!__ns_ref_get(ns))
+		return NULL;
+	if (ns->ops->get_lifetime && !ns->ops->get_lifetime(ns)) {
+		WARN_ON_ONCE(!__ns_ref_put(ns));
+		return NULL;
+	}
+	return ns;
+}
+
 struct ns_common *__must_check ns_owner(struct ns_common *ns)
 {
 	struct user_namespace *owner;
