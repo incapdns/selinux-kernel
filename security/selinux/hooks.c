@@ -4214,6 +4214,20 @@ static inline u32 signal_to_av(int sig)
 #error Fix SELinux to handle capabilities > 63.
 #endif
 
+#ifdef CONFIG_SECURITY_SELINUX_NS
+static bool selinux_cred_chain_uninitialized(const struct cred *cred)
+{
+	while (cred) {
+		const struct cred_security_struct *crsec = selinux_cred(cred);
+
+		if (selinux_initialized(crsec->state))
+			return false;
+		cred = crsec->parent_cred;
+	}
+	return true;
+}
+#endif
+
 /* Check whether a task is allowed to use a capability. */
 static int cred_has_capability(const struct cred *cred,
 			       int cap, unsigned int opts, bool initns)
@@ -4222,6 +4236,11 @@ static int cred_has_capability(const struct cred *cred,
 	u16 sclass;
 	u32 av = CAP_TO_MASK(cap);
 	int rc;
+
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	if (!selinux_initialized(selinux_cred(cred)->state))
+		return selinux_cred_chain_uninitialized(cred) ? 0 : -EACCES;
+#endif
 
 	ad.type = LSM_AUDIT_DATA_CAP;
 	ad.u.cap = cap;
@@ -4284,6 +4303,7 @@ static int inode_has_perm_view(const struct cred *cred, struct inode *inode,
 			       const struct selinux_label_view *view, u32 perms,
 			       struct common_audit_data *adp)
 {
+	const struct cred_security_struct *crsec = selinux_cred(cred);
 	struct inode_security_struct *isec;
 	struct selinux_pathless_projection *projection;
 	struct selinux_inode_label_snapshot snapshot;
@@ -4291,6 +4311,15 @@ static int inode_has_perm_view(const struct cred *cred, struct inode *inode,
 
 	if (unlikely(IS_PRIVATE(inode)))
 		return 0;
+	/*
+	 * Before the initial policy load, inode labels are deliberately left on
+	 * the superblock's deferred-initialization list.  Preserve the upstream
+	 * policy-less bootstrap semantics for the root state rather than treating
+	 * that expected LABEL_INVALID tuple as stale.  A namespaced child without
+	 * a policy must never bypass its already-existing parent policy.
+	 */
+	if (!selinux_initialized(crsec->state))
+		return selinux_cred_chain_uninitialized(cred) ? 0 : -EACCES;
 	/*
 	 * Do not revalidate here: file_path_has_perm() can reach this helper
 	 * while holding tty->files_lock.  Sleepable path-based callers perform
@@ -4517,6 +4546,12 @@ static int __file_has_perm(const struct cred *cred, const struct file *file,
 	if (!opener)
 		return -EIO;
 #ifdef CONFIG_SECURITY_SELINUX_NS
+	{
+		const struct cred_security_struct *crsec = selinux_cred(cred);
+
+		if (!selinux_initialized(crsec->state))
+			return selinux_cred_chain_uninitialized(cred) ? 0 : -EACCES;
+	}
 	return selinux_file_transfer_has_perm(
 		cred, file, opener, inode, view, pathless, av, &ad);
 #else
@@ -4640,7 +4675,8 @@ static int may_create(const struct vfsmount *mnt, struct inode *dir,
 	    && !selinux_task(current)->create_plan_kunit_force
 #endif
 	)
-		return 0;
+		return selinux_cred_chain_uninitialized(current_cred()) ?
+			0 : -EACCES;
 	if (!plan || !view || plan->view != view || plan->dir != dir ||
 	    plan->sb != dir->i_sb || plan->tclass != tclass ||
 	    plan->name.len != dentry->d_name.len ||
@@ -5200,7 +5236,8 @@ static int selinux_inode_create_plan_prepare(
 	    && !tsec->create_plan_kunit_force
 #endif
 	)
-		return 0;
+		return selinux_cred_chain_uninitialized(current_cred()) ?
+			0 : -EACCES;
 	view = selinux_mnt_label_view(mnt);
 	if (!view)
 		return -EOPNOTSUPP;
@@ -6524,12 +6561,27 @@ static int selinux_bprm_creds_for_exec(struct linux_binprm *bprm)
 {
 	struct selinux_exec_file_label target;
 #ifdef CONFIG_SECURITY_SELINUX_NS
+	const struct cred_security_struct *crsec =
+		selinux_cred(current_cred());
+	struct selinux_policy_snapshot bootstrap_snapshot = {};
 	struct selinux_policy_chain_snapshot *chain __free(kfree) = NULL;
 #else
 	struct selinux_policy_snapshot leaf_snapshot;
 #endif
 	int rc;
 
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	/* The executable inode has no stable label before the root policy load. */
+	if (!selinux_initialized(crsec->state)) {
+		if (!selinux_cred_chain_uninitialized(current_cred()))
+			return -EACCES;
+		memset(&target, 0, sizeof(target));
+		target.leaf_sclass = SECCLASS_FILE;
+		rc = selinux_bprm_creds_for_exec_resolved(
+			bprm, &target, &bootstrap_snapshot);
+		goto out;
+	}
+#endif
 	rc = selinux_exec_file_label_get(bprm->file, &target);
 	if (rc)
 		goto out;
@@ -8154,11 +8206,19 @@ static int selinux_pathless_build_sealed(
 	kernel_global = label->domain->flags &
 			SELINUX_LABEL_DOMAIN_KERNEL_GLOBAL;
 	if ((!kernel_global && label->domain != leaf_domain) ||
-	    (kernel_global && (source != SELINUX_LABEL_SOURCE_KERNEL_INITIAL ||
-			      leaf_sid > SECINITSID_NUM))) {
+	    (kernel_global && leaf_sid > SECINITSID_NUM)) {
 		rc = -EXDEV;
 		goto out;
 	}
+	/*
+	 * Initial SIDs belong to the immutable kernel-global label domain.  The
+	 * caller describes how the SID was selected (for example, from a task or
+	 * keycreate_sid), but the canonical label itself originates in the kernel
+	 * bootstrap table.  Preserve that provenance so early-boot pathless
+	 * objects can be sealed before a policy is loaded.
+	 */
+	if (kernel_global)
+		source = SELINUX_LABEL_SOURCE_KERNEL_INITIAL;
 
 	if (anchored_view) {
 		if (anchored_view->origin_domain != leaf_domain ||
@@ -8727,12 +8787,17 @@ static int selinux_inode_follow_link(const struct vfsmount *mnt,
 				     struct dentry *dentry, struct inode *inode,
 				     bool rcu)
 {
+	const struct cred *cred = current_cred();
 	struct common_audit_data ad;
 	struct inode_security_struct *isec;
 #ifdef CONFIG_SECURITY_SELINUX_NS
+	const struct cred_security_struct *crsec = selinux_cred(cred);
 	const struct selinux_label_view *view;
 	struct selinux_inode_label_snapshot snapshot;
 	int rc;
+
+	if (!selinux_initialized(crsec->state))
+		return selinux_cred_chain_uninitialized(cred) ? 0 : -EACCES;
 #endif
 
 	ad.type = LSM_AUDIT_DATA_DENTRY;
@@ -8748,12 +8813,12 @@ static int selinux_inode_follow_link(const struct vfsmount *mnt,
 	rc = selinux_inode_label_snapshot_get(isec, &snapshot);
 	if (rc)
 		return rcu && rc == -ESTALE ? -ECHILD : rc;
-	rc = cred_label_has_perm(current_cred(), snapshot.sid, snapshot.label,
+	rc = cred_label_has_perm(cred, snapshot.sid, snapshot.label,
 				 view, snapshot.sclass, FILE__READ, &ad);
 	selinux_inode_label_snapshot_put(&snapshot);
 	return rc;
 #else
-	return cred_tsid_has_perm(current_cred(), isec->sid, isec->sclass,
+	return cred_tsid_has_perm(cred, isec->sid, isec->sclass,
 				  FILE__READ, &ad);
 #endif
 }
@@ -8932,6 +8997,18 @@ static int selinux_inode_permission(const struct vfsmount *mnt,
 	if (!mask)
 		return 0;
 
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	/* See inode_has_perm_view(): the root state has no inode policy yet. */
+	{
+		const struct cred_security_struct *crsec =
+			selinux_cred(current_cred());
+
+		if (!selinux_initialized(crsec->state))
+			return selinux_cred_chain_uninitialized(current_cred()) ?
+				0 : -EACCES;
+	}
+#endif
+
 	isec = inode_security_rcu(inode, requested & MAY_NOT_BLOCK);
 	if (IS_ERR(isec))
 		return PTR_ERR(isec);
@@ -9038,6 +9115,15 @@ static int selinux_inode_setattr(struct mnt_idmap *idmap,
 		if (!ia_valid)
 			return 0;
 	}
+
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	{
+		const struct cred_security_struct *crsec = selinux_cred(cred);
+
+		if (!selinux_initialized(crsec->state))
+			return selinux_cred_chain_uninitialized(cred) ? 0 : -EACCES;
+	}
+#endif
 
 	if (ia_valid & (ATTR_MODE | ATTR_UID | ATTR_GID |
 			ATTR_ATIME_SET | ATTR_MTIME_SET | ATTR_TIMES_SET))
@@ -9736,7 +9822,8 @@ static int selinux_inode_setxattr_plan_prepare(
 	    && !tsec->create_plan_kunit_force
 #endif
 	)
-		return 0;
+		return selinux_cred_chain_uninitialized(current_cred()) ?
+			0 : -EACCES;
 	if (!mnt || !selinux_mnt_label_view(mnt))
 		return -EOPNOTSUPP;
 	memset(plan, 0, sizeof(*plan));
@@ -10005,8 +10092,15 @@ static int selinux_inode_setxattr(struct mnt_idmap *idmap,
 #ifdef CONFIG_SECURITY_SELINUX_KUNIT_TEST
 	    && !selinux_task(current)->create_plan_kunit_force
 #endif
-	)
-		return (inode_owner_or_capable(idmap, inode) ? 0 : -EPERM);
+	) {
+#ifdef CONFIG_SECURITY_SELINUX_NS
+		return selinux_cred_chain_uninitialized(cred) ?
+			(inode_owner_or_capable(idmap, inode) ? 0 : -EPERM) :
+			-EACCES;
+#else
+		return inode_owner_or_capable(idmap, inode) ? 0 : -EPERM;
+#endif
+	}
 
 #ifdef CONFIG_SECURITY_SELINUX_NS
 	{
@@ -10249,8 +10343,14 @@ static int selinux_inode_removexattr(struct mnt_idmap *idmap,
 		return dentry_has_perm_mnt(current_cred(), mnt, dentry,
 					    FILE__SETATTR);
 
-	if (!selinux_initialized(current_selinux_state))
+	if (!selinux_initialized(current_selinux_state)) {
+#ifdef CONFIG_SECURITY_SELINUX_NS
+		return selinux_cred_chain_uninitialized(current_cred()) ?
+			0 : -EACCES;
+#else
 		return 0;
+#endif
+	}
 
 	/* No one is allowed to remove a SELinux security label.
 	   You can change the label, but all data must be labeled. */
@@ -11233,6 +11333,17 @@ static int selinux_file_permission(struct file *file, int mask)
 		/* No permission to check.  Existence test. */
 		return 0;
 
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	{
+		const struct cred_security_struct *crsec =
+			selinux_cred(current_cred());
+
+		if (!selinux_initialized(crsec->state))
+			return selinux_cred_chain_uninitialized(current_cred()) ?
+				0 : -EACCES;
+	}
+#endif
+
 	isec = inode_security(inode);
 #ifdef CONFIG_SECURITY_SELINUX_NS
 	if (!fsec->pathless) {
@@ -11989,6 +12100,14 @@ static int selinux_file_open(struct file *file)
 	}
 	av = file_to_av(file);
 #ifdef CONFIG_SECURITY_SELINUX_NS
+	{
+		const struct cred_security_struct *crsec = selinux_cred(cred);
+
+		if (!selinux_initialized(crsec->state)) {
+			fsec->isid = READ_ONCE(isec->sid);
+			return selinux_cred_chain_uninitialized(cred) ? 0 : -EACCES;
+		}
+	}
 	if (fsec->pathless) {
 		fsec->isid = isec->sid;
 		return selinux_pathless_file_open_has_perm(
