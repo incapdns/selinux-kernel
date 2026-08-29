@@ -335,6 +335,13 @@ static void nfs_clear_label_invalid(struct inode *inode)
 	spin_unlock(&inode->i_lock);
 }
 
+static void nfs_mark_label_invalid(struct inode *inode)
+{
+	spin_lock(&inode->i_lock);
+	NFS_I(inode)->cache_validity |= NFS_INO_INVALID_LABEL;
+	spin_unlock(&inode->i_lock);
+}
+
 void nfs_setsecurity(struct inode *inode, struct nfs_fattr *fattr)
 {
 	int error;
@@ -345,13 +352,15 @@ void nfs_setsecurity(struct inode *inode, struct nfs_fattr *fattr)
 	if ((fattr->valid & NFS_ATTR_FATTR_V4_SECURITY_LABEL) && inode->i_security) {
 		error = security_inode_notifysecctx(inode, fattr->label->label,
 				fattr->label->len);
-		if (error)
-			printk(KERN_ERR "%s() %s %d "
-					"security_inode_notifysecctx() %d\n",
-					__func__,
-					(char *)fattr->label->label,
-					fattr->label->len, error);
-		nfs_clear_label_invalid(inode);
+		if (error) {
+			pr_err_ratelimited(
+				"%s(): inode %llu security label update (%u bytes) failed: %d\n",
+				__func__, (unsigned long long)inode->i_ino,
+				fattr->label->len, error);
+			nfs_mark_label_invalid(inode);
+		} else {
+			nfs_clear_label_invalid(inode);
+		}
 	}
 }
 

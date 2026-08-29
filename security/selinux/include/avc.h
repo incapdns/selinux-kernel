@@ -411,9 +411,21 @@ int cred_other_has_perm(const struct cred *cred, const struct cred *other,
 			u16 tclass, u32 requested,
 			struct common_audit_data *ad);
 bool cred_sid_chain_equal(const struct cred *left, const struct cred *right);
+#ifdef CONFIG_SECURITY_SELINUX_NS
+int cred_binder_transaction_has_perm(const struct cred *actor,
+				     const struct cred *from,
+				     const struct cred *to);
+#endif
 
 int task_obj_has_perm(const struct task_struct *s, const struct task_struct *t,
 		      u16 tclass, u32 requested, struct common_audit_data *ad);
+
+#ifdef CONFIG_SECURITY_SELINUX_KUNIT_TEST
+int selinux_kunit_cred_pair_levels(
+	const struct cred *policy_cred, const struct cred *subject,
+	const struct cred *target, struct selinux_state **states, u32 *ssids,
+	u32 *tsids, u16 capacity, u16 *countp);
+#endif
 
 int selinux_state_has_perm(struct selinux_state *state, u32 ssid, u32 tsid,
 			   u16 tclass, u32 requested,

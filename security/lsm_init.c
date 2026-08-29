@@ -327,6 +327,8 @@ static void __init lsm_prepare(struct lsm_info *lsm)
 	lsm_blob_size_update(&blobs->lbs_msg_msg, &blob_sizes.lbs_msg_msg);
 	lsm_blob_size_update(&blobs->lbs_perf_event,
 			     &blob_sizes.lbs_perf_event);
+	lsm_blob_size_update(&blobs->lbs_perf_event_relation,
+			     &blob_sizes.lbs_perf_event_relation);
 	lsm_blob_size_update(&blobs->lbs_sock, &blob_sizes.lbs_sock);
 	lsm_blob_size_update(&blobs->lbs_superblock,
 			     &blob_sizes.lbs_superblock);

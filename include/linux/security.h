@@ -32,6 +32,8 @@
 #include <linux/string.h>
 #include <linux/mm.h>
 #include <linux/refcount.h>
+#include <linux/workqueue.h>
+#include <linux/irq_work.h>
 #include <linux/sockptr.h>
 #include <linux/bpf.h>
 #include <linux/btf.h>
@@ -93,6 +95,13 @@ struct timezone;
 enum lsm_event {
 	LSM_POLICY_CHANGE,
 	LSM_STARTED_ALL,
+	LSM_POLICY_CHANGE_PRE,
+	LSM_POLICY_CHANGE_ABORT,
+};
+
+struct lsm_policy_change {
+	bool scoped;
+	u64 scope_id;
 };
 
 struct dm_verity_digest {
@@ -647,7 +656,8 @@ int security_inode_copy_up(const struct path *src,
 			   const struct vfsmount *dst_mnt, struct cred **new);
 int security_inode_copy_up_post(const struct path *src,
 				const struct vfsmount *dst_mnt,
-				struct dentry *dst);
+				struct dentry *dst,
+				const struct cred *copy_up_cred);
 int security_inode_copy_up_xattr(struct dentry *src, const char *name);
 int security_inode_setintegrity(const struct inode *inode,
 				enum lsm_integrity_type type, const void *value,
@@ -663,6 +673,7 @@ int security_file_permission(struct file *file, int mask);
 int security_file_alloc(struct file *file);
 int security_file_set_path(struct file *file);
 int security_file_init_security_anon(struct file *file);
+int security_file_kho_preserve(struct file *file);
 void security_file_release(struct file *file);
 void security_file_free(struct file *file);
 int security_backing_file_alloc(struct file *backing_file,
@@ -1601,8 +1612,9 @@ static inline int security_inode_copy_up(const struct path *src,
 }
 
 static inline int security_inode_copy_up_post(const struct path *src,
-					      const struct vfsmount *dst_mnt,
-					      struct dentry *dst)
+					       const struct vfsmount *dst_mnt,
+					       struct dentry *dst,
+					       const struct cred *copy_up_cred)
 {
 	return 0;
 }
@@ -1658,6 +1670,11 @@ static inline int security_file_set_path(struct file *file)
 }
 
 static inline int security_file_init_security_anon(struct file *file)
+{
+	return 0;
+}
+
+static inline int security_file_kho_preserve(struct file *file)
 {
 	return 0;
 }
@@ -2740,6 +2757,7 @@ int security_ib_pkey_access(void *sec, u64 subnet_prefix, u16 pkey);
 int security_ib_endport_manage_subnet(void *sec, const char *name, u8 port_num);
 int security_ib_alloc_security(void **sec);
 void security_ib_free_security(void *sec);
+int security_ib_policy_scopes(void *sec, u64 *scope_ids, u16 capacity);
 #else	/* CONFIG_SECURITY_INFINIBAND */
 static inline int security_ib_pkey_access(void *sec, u64 subnet_prefix, u16 pkey)
 {
@@ -2758,6 +2776,12 @@ static inline int security_ib_alloc_security(void **sec)
 
 static inline void security_ib_free_security(void *sec)
 {
+}
+
+static inline int security_ib_policy_scopes(void *sec, u64 *scope_ids,
+					    u16 capacity)
+{
+	return 0;
 }
 #endif	/* CONFIG_SECURITY_INFINIBAND */
 
@@ -3235,13 +3259,23 @@ static inline int security_bpf_token_capable(const struct bpf_token *token, int 
 #endif /* CONFIG_SECURITY */
 #endif /* CONFIG_BPF_SYSCALL */
 
-#ifdef CONFIG_PERF_EVENTS
-struct perf_event_attr;
 struct perf_event;
+struct perf_event_relation;
 
 #define PERF_SECURITY_RELATION_READ  0x1U
 #define PERF_SECURITY_RELATION_WRITE 0x2U
 
+#ifdef CONFIG_PERF_EVENTS
+struct perf_event_attr;
+
+/* Durable authorization attached to one retained perf-event relation. */
+struct perf_event_relation {
+	refcount_t usage;
+	atomic_t work_pending;
+	struct irq_work irq_work;
+	struct work_struct work;
+	void *security;
+};
 #ifdef CONFIG_SECURITY
 extern int security_perf_event_open(int type);
 extern int security_perf_event_alloc(struct perf_event *event);
@@ -3250,6 +3284,27 @@ extern int security_perf_event_read(struct perf_event *event);
 extern int security_perf_event_write(struct perf_event *event);
 extern int security_perf_event_relation(struct perf_event *event,
 					unsigned int access);
+extern int security_perf_event_relation_create(
+	struct perf_event *event, unsigned int access,
+	struct perf_event_relation **relationp);
+extern int security_perf_event_relation_create_composite(
+	struct perf_event *event, unsigned int access,
+	struct perf_event *related_event, unsigned int related_access,
+	const struct bpf_prog *prog, const struct bpf_map *map, fmode_t map_fmode,
+	struct perf_event_relation **relationp);
+extern struct perf_event_relation *security_perf_event_relation_get(
+	struct perf_event_relation *relation);
+extern void security_perf_event_relation_put(
+	struct perf_event_relation *relation);
+/*
+ * The fast predicate can run from NMI, hard IRQ, or beneath raw spinlocks.
+ * LSM valid hooks must be atomic, bounded, allocation-free, and must not
+ * acquire sleeping locks.  Slow policy resolution belongs exclusively in
+ * perf_event_relation_revalidate(), dispatched asynchronously by the core.
+ */
+extern int security_perf_event_relation_valid(
+	struct perf_event_relation *relation);
+extern bool security_perf_event_relation_enabled(void);
 #else
 static inline int security_perf_event_open(int type)
 {
@@ -3280,7 +3335,93 @@ static inline int security_perf_event_relation(struct perf_event *event,
 {
 	return 0;
 }
+
+static inline int security_perf_event_relation_create(
+	struct perf_event *event, unsigned int access,
+	struct perf_event_relation **relationp)
+{
+	*relationp = NULL;
+	return 0;
+}
+
+static inline int security_perf_event_relation_create_composite(
+	struct perf_event *event, unsigned int access,
+	struct perf_event *related_event, unsigned int related_access,
+	const struct bpf_prog *prog, const struct bpf_map *map, fmode_t map_fmode,
+	struct perf_event_relation **relationp)
+{
+	*relationp = NULL;
+	return 0;
+}
+
+static inline struct perf_event_relation *security_perf_event_relation_get(
+	struct perf_event_relation *relation)
+{
+	return relation;
+}
+
+static inline void security_perf_event_relation_put(
+	struct perf_event_relation *relation)
+{
+}
+
+static inline int security_perf_event_relation_valid(
+	struct perf_event_relation *relation)
+{
+	return 0;
+}
+
+static inline bool security_perf_event_relation_enabled(void)
+{
+	return false;
+}
 #endif /* CONFIG_SECURITY */
+#else /* !CONFIG_PERF_EVENTS */
+static inline int security_perf_event_relation(struct perf_event *event,
+					       unsigned int access)
+{
+	return 0;
+}
+
+static inline int security_perf_event_relation_create(
+	struct perf_event *event, unsigned int access,
+	struct perf_event_relation **relationp)
+{
+	*relationp = NULL;
+	return -EOPNOTSUPP;
+}
+
+static inline int security_perf_event_relation_create_composite(
+	struct perf_event *event, unsigned int access,
+	struct perf_event *related_event, unsigned int related_access,
+	const struct bpf_prog *prog, const struct bpf_map *map, fmode_t map_fmode,
+	struct perf_event_relation **relationp)
+{
+	*relationp = NULL;
+	return -EOPNOTSUPP;
+}
+
+static inline struct perf_event_relation *security_perf_event_relation_get(
+	struct perf_event_relation *relation)
+{
+	return relation;
+}
+
+static inline void security_perf_event_relation_put(
+	struct perf_event_relation *relation)
+{
+}
+
+static inline int security_perf_event_relation_valid(
+	struct perf_event_relation *relation)
+{
+	return 0;
+}
+
+static inline bool security_perf_event_relation_enabled(void)
+{
+	return false;
+}
 #endif /* CONFIG_PERF_EVENTS */
 
 #ifdef CONFIG_IO_URING

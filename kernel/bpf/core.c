@@ -39,6 +39,7 @@
 #include <linux/nospec.h>
 #include <linux/bpf_mem_alloc.h>
 #include <linux/memcontrol.h>
+#include <linux/security.h>
 #include <linux/execmem.h>
 #include <crypto/sha2.h>
 
@@ -2770,11 +2771,28 @@ struct bpf_prog_array *bpf_prog_array_alloc(u32 prog_cnt, gfp_t flags)
 	return p;
 }
 
+static void bpf_prog_array_release_relations(struct bpf_prog_array *progs)
+{
+	struct bpf_prog_array_item *item;
+
+	for (item = progs->items; item->prog; item++)
+		security_perf_event_relation_put(item->perf_relation);
+}
+
+static void __bpf_prog_array_free_cb(struct rcu_head *rcu)
+{
+	struct bpf_prog_array *progs = container_of(
+		rcu, struct bpf_prog_array, rcu);
+
+	bpf_prog_array_release_relations(progs);
+	kfree(progs);
+}
+
 void bpf_prog_array_free(struct bpf_prog_array *progs)
 {
 	if (!progs || progs == &bpf_empty_prog_array)
 		return;
-	kfree_rcu(progs, rcu);
+	call_rcu(&progs->rcu, __bpf_prog_array_free_cb);
 }
 
 static void __bpf_prog_array_free_sleepable_cb(struct rcu_head *rcu)
@@ -2786,6 +2804,7 @@ static void __bpf_prog_array_free_sleepable_cb(struct rcu_head *rcu)
 	 * need to call kfree_rcu(), just call kfree() directly.
 	 */
 	progs = container_of(rcu, struct bpf_prog_array, rcu);
+	bpf_prog_array_release_relations(progs);
 	kfree(progs);
 }
 
@@ -2875,6 +2894,29 @@ void bpf_prog_array_delete_safe(struct bpf_prog_array *array,
 		}
 }
 
+struct perf_event_relation *
+bpf_prog_array_delete_safe_with_perf_relation(
+	struct bpf_prog_array *array, struct bpf_prog *old_prog)
+{
+	struct bpf_prog_array_item *item;
+
+	for (item = array->items; item->prog; item++) {
+		struct perf_event_relation *relation;
+
+		if (item->prog != old_prog)
+			continue;
+		/*
+		 * Withdraw authority first.  A reader which already loaded the
+		 * old program either also acquired the old relation before this
+		 * point, or observes required=true/NULL and fails closed.
+		 */
+		relation = xchg(&item->perf_relation, NULL);
+		WRITE_ONCE(item->prog, &dummy_bpf_prog.prog);
+		return relation;
+	}
+	return NULL;
+}
+
 /**
  * bpf_prog_array_delete_safe_at() - Replaces the program at the given
  *                                   index into the program array with
@@ -2930,11 +2972,11 @@ int bpf_prog_array_update_at(struct bpf_prog_array *array, int index,
 	return -ENOENT;
 }
 
-int bpf_prog_array_copy(struct bpf_prog_array *old_array,
-			struct bpf_prog *exclude_prog,
-			struct bpf_prog *include_prog,
-			u64 bpf_cookie,
-			struct bpf_prog_array **new_array)
+int bpf_prog_array_copy_with_perf_relation(
+	struct bpf_prog_array *old_array, struct bpf_prog *exclude_prog,
+	struct bpf_prog *include_prog, u64 bpf_cookie,
+	struct perf_event_relation *relation,
+	struct bpf_prog_array **new_array)
 {
 	int new_prog_cnt, carry_prog_cnt = 0;
 	struct bpf_prog_array_item *existing, *new;
@@ -2987,18 +3029,46 @@ int bpf_prog_array_copy(struct bpf_prog_array *old_array,
 				continue;
 
 			new->prog = existing->prog;
+			new->perf_relation = security_perf_event_relation_get(
+				existing->perf_relation);
+			new->perf_relation_required =
+				existing->perf_relation_required;
 			new->bpf_cookie = existing->bpf_cookie;
 			new++;
 		}
 	}
 	if (include_prog) {
 		new->prog = include_prog;
+		new->perf_relation = security_perf_event_relation_get(relation);
+		new->perf_relation_required = !!relation;
 		new->bpf_cookie = bpf_cookie;
 		new++;
 	}
 	new->prog = NULL;
 	*new_array = array;
 	return 0;
+}
+
+int bpf_prog_array_copy(struct bpf_prog_array *old_array,
+			struct bpf_prog *exclude_prog,
+			struct bpf_prog *include_prog,
+			u64 bpf_cookie,
+			struct bpf_prog_array **new_array)
+{
+	return bpf_prog_array_copy_with_perf_relation(
+		old_array, exclude_prog, include_prog, bpf_cookie, NULL,
+		new_array);
+}
+
+bool bpf_prog_array_item_relation_valid(
+	const struct bpf_prog_array_item *item)
+{
+	struct perf_event_relation *relation;
+
+	if (likely(!READ_ONCE(item->perf_relation_required)))
+		return true;
+	relation = READ_ONCE(item->perf_relation);
+	return relation && !security_perf_event_relation_valid(relation);
 }
 
 int bpf_prog_array_copy_info(struct bpf_prog_array *array,

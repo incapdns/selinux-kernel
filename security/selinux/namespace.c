@@ -379,6 +379,7 @@ static int selinux_ns_control_activate_locked(
 	struct selinux_ns_control *control, const struct selinux_state *actor)
 {
 	struct selinux_label_map *published;
+	bool update_started = false;
 	int rc;
 
 	lockdep_assert_held(&control->lock);
@@ -408,6 +409,10 @@ static int selinux_ns_control_activate_locked(
 	if (rc && rc != -EALREADY)
 		goto done;
 
+	rc = selinux_chain_update_begin(control->state);
+	if (rc)
+		goto done;
+	update_started = true;
 	rc = selinux_label_domain_publish_map(control->state->label_domain,
 					      control->map,
 					      actor->label_domain);
@@ -422,15 +427,19 @@ static int selinux_ns_control_activate_locked(
 
 		sha256_final(&digest, control->map_digest);
 		control->map_digest_valid = true;
-		selinux_chain_epoch_bump(control->state);
-		control->child_chain_epoch =
-			selinux_chain_epoch_read(control->state);
 		__ns_tree_add_raw(&control->ns, &selinux_ns_tree);
 		control->tree_published = true;
 		__ns_ref_active_get(&control->ns);
 		selinux_state_mark_active(control->state);
 	}
 done:
+	if (update_started) {
+		selinux_chain_update_end(control->state);
+		if (!rc) {
+			control->child_chain_epoch =
+				selinux_chain_epoch_read(control->state);
+		}
+	}
 	return rc;
 }
 

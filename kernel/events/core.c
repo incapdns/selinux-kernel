@@ -2348,6 +2348,8 @@ static void perf_promote_sibling_to_leader(struct perf_event *sibling,
 					   struct perf_event_context *ctx,
 					   int group_caps)
 {
+	struct perf_event_relation *relation;
+
 	/*
 	 * Events that have PERF_EV_CAP_SIBLING require being part of
 	 * a group and cannot exist on their own, schedule them out
@@ -2360,6 +2362,8 @@ static void perf_promote_sibling_to_leader(struct perf_event *sibling,
 
 	sibling->group_leader = sibling;
 	sibling->group_caps = group_caps;
+	relation = xchg(&sibling->group_relation, NULL);
+	security_perf_event_relation_put(relation);
 
 	if (sibling->attach_state & PERF_ATTACH_CONTEXT) {
 		add_event_to_groups(sibling, ctx);
@@ -2788,13 +2792,29 @@ static void perf_event_throttle(struct perf_event *event)
 		perf_log_throttle(event, 0);
 }
 
+static __always_inline int
+perf_event_group_relation_valid(const struct perf_event *event)
+{
+	if (event == event->group_leader)
+		return 0;
+	if (security_perf_event_relation_enabled() && !event->group_relation)
+		return -EACCES;
+	return security_perf_event_relation_valid(event->group_relation);
+}
+
 static void perf_event_unthrottle_group(struct perf_event *event, bool skip_start_event)
 {
 	struct perf_event *sibling, *leader = event->group_leader;
 
 	perf_event_unthrottle(leader, skip_start_event ? leader != event : true);
-	for_each_sibling_event(sibling, leader)
-		perf_event_unthrottle(sibling, skip_start_event ? sibling != event : true);
+	for_each_sibling_event(sibling, leader) {
+		if (unlikely(perf_event_group_relation_valid(sibling))) {
+			perf_event_disable_inatomic(sibling);
+			continue;
+		}
+		perf_event_unthrottle(sibling,
+				      skip_start_event ? sibling != event : true);
+	}
 }
 
 static void perf_event_throttle_group(struct perf_event *event)
@@ -2802,8 +2822,13 @@ static void perf_event_throttle_group(struct perf_event *event)
 	struct perf_event *sibling, *leader = event->group_leader;
 
 	perf_event_throttle(leader);
-	for_each_sibling_event(sibling, leader)
+	for_each_sibling_event(sibling, leader) {
+		if (unlikely(perf_event_group_relation_valid(sibling))) {
+			perf_event_disable_inatomic(sibling);
+			continue;
+		}
 		perf_event_throttle(sibling);
+	}
 }
 
 static int
@@ -2819,6 +2844,9 @@ event_sched_in(struct perf_event *event, struct perf_event_context *ctx)
 
 	if (event->state <= PERF_EVENT_STATE_OFF)
 		return 0;
+	/* A stale grouped authority may not be scheduled again. */
+	if (unlikely(perf_event_group_relation_valid(event)))
+		return -EAGAIN;
 
 	WRITE_ONCE(event->oncpu, smp_processor_id());
 	/*
@@ -5304,10 +5332,30 @@ static void put_pmu_ctx(struct perf_event_pmu_context *epc)
 
 static void perf_event_free_filter(struct perf_event *event);
 
+static void perf_output_relation_free_rcu(struct rcu_head *rcu)
+{
+	struct perf_event_output_relation *output = container_of(
+		rcu, struct perf_event_output_relation, rcu);
+	u8 i;
+
+	for (i = 0; i < output->nr_relations; i++)
+		security_perf_event_relation_put(output->relations[i]);
+	kfree(output);
+}
+
 static void free_event_rcu(struct rcu_head *head)
 {
 	struct perf_event *event = container_of(head, typeof(*event), rcu_head);
+	struct perf_event_output_relation *output =
+		rcu_access_pointer(event->output_relation);
+	u8 i;
 
+	security_perf_event_relation_put(event->group_relation);
+	if (output) {
+		for (i = 0; i < output->nr_relations; i++)
+			security_perf_event_relation_put(output->relations[i]);
+		kfree(output);
+	}
 	if (event->ns)
 		put_pid_ns(event->ns);
 	perf_event_free_filter(event);
@@ -5315,8 +5363,9 @@ static void free_event_rcu(struct rcu_head *head)
 	kmem_cache_free(perf_event_cache, event);
 }
 
-static void ring_buffer_attach(struct perf_event *event,
-			       struct perf_buffer *rb);
+static int ring_buffer_attach(struct perf_event *event,
+			      struct perf_buffer *rb,
+			      struct perf_event_output_relation *output);
 
 static void detach_sb_event(struct perf_event *event)
 {
@@ -5828,7 +5877,7 @@ static void _free_event(struct perf_event *event)
 		 * over us; possibly making our ring_buffer_put() the last.
 		 */
 		mutex_lock(&event->mmap_mutex);
-		ring_buffer_attach(event, NULL);
+		ring_buffer_attach(event, NULL, NULL);
 		mutex_unlock(&event->mmap_mutex);
 	}
 
@@ -6080,7 +6129,7 @@ u64 perf_event_read_value(struct perf_event *event, u64 *enabled, u64 *running)
 EXPORT_SYMBOL_GPL(perf_event_read_value);
 
 static int __perf_read_group_add(struct perf_event *leader,
-					u64 read_format, u64 *values)
+				 u64 read_format, u64 *values)
 {
 	struct perf_event_context *ctx = leader->ctx;
 	struct perf_event *sub, *parent;
@@ -6088,6 +6137,10 @@ static int __perf_read_group_add(struct perf_event *leader,
 	int n = 1; /* skip @nr */
 	int ret;
 
+	/* Authorization must precede every PMU read in this group operation. */
+	ret = perf_event_group_relations_valid(leader);
+	if (ret)
+		return ret;
 	ret = perf_event_read(leader, true);
 	if (ret)
 		return ret;
@@ -6145,6 +6198,10 @@ static int __perf_read_group_add(struct perf_event *leader,
 	if (read_format & PERF_FORMAT_LOST)
 		values[n++] = atomic64_read(&leader->lost_samples);
 
+	/* Reject a reload which raced the PMU read before publishing values. */
+	ret = perf_event_group_relations_valid(leader);
+	if (unlikely(ret))
+		goto unlock;
 	for_each_sibling_event(sub, leader) {
 		values[n++] += perf_event_count(sub, false);
 		if (read_format & PERF_FORMAT_ID)
@@ -6310,6 +6367,17 @@ static __poll_t perf_poll(struct file *file, poll_table *wait)
 	 */
 	mutex_lock(&event->mmap_mutex);
 	rb = event->rb;
+	if (rb && security_perf_event_relation_enabled()) {
+		struct perf_event_output_relation *output =
+			rcu_dereference_protected(event->output_relation,
+				lockdep_is_held(&event->mmap_mutex));
+
+		if (!output || output->rb != rb ||
+		    perf_event_output_relation_valid(output)) {
+			events = EPOLLERR;
+			rb = NULL;
+		}
+	}
 	if (rb)
 		events = atomic_xchg(&rb->poll, 0);
 	mutex_unlock(&event->mmap_mutex);
@@ -6508,6 +6576,21 @@ static void perf_event_for_each(struct perf_event *event,
 		perf_event_for_each_child(sibling, func);
 }
 
+int perf_event_group_relations_valid(struct perf_event *event)
+{
+	struct perf_event *sibling;
+	int ret = 0;
+
+	event = event->group_leader;
+	for_each_sibling_event(sibling, event) {
+		int rc = perf_event_group_relation_valid(sibling);
+
+		if (rc && !ret)
+			ret = rc;
+	}
+	return ret;
+}
+
 static void __perf_event_period(struct perf_event *event,
 				struct perf_cpu_context *cpuctx,
 				struct perf_event_context *ctx,
@@ -6600,7 +6683,8 @@ static int perf_copy_attr(struct perf_event_attr __user *uattr,
 			  struct perf_event_attr *attr);
 static int __perf_event_set_bpf_prog(struct perf_event *event,
 				     struct bpf_prog *prog,
-				     u64 bpf_cookie);
+				     u64 bpf_cookie,
+				     struct perf_event_relation *relation);
 
 static long _perf_ioctl(struct perf_event *event, unsigned int cmd, unsigned long arg)
 {
@@ -6657,36 +6741,31 @@ static long _perf_ioctl(struct perf_event *event, unsigned int cmd, unsigned lon
 	case PERF_EVENT_IOC_SET_FILTER:
 		return perf_event_set_filter(event, (void __user *)arg);
 
-	case PERF_EVENT_IOC_SET_BPF:
-	{
-		struct bpf_prog *prog;
-		int err;
-
-		prog = bpf_prog_get(arg);
-		if (IS_ERR(prog))
-			return PTR_ERR(prog);
-
-		err = __perf_event_set_bpf_prog(event, prog, 0);
-		if (err) {
-			bpf_prog_put(prog);
-			return err;
-		}
-
-		return 0;
-	}
-
 	case PERF_EVENT_IOC_PAUSE_OUTPUT: {
 		struct perf_buffer *rb;
+		int ret = 0;
 
-		rcu_read_lock();
-		rb = rcu_dereference(event->rb);
+		mutex_lock(&event->mmap_mutex);
+		rb = event->rb;
 		if (!rb || !rb->nr_pages) {
-			rcu_read_unlock();
-			return -EINVAL;
+			ret = -EINVAL;
+			goto pause_unlock;
+		}
+		if (security_perf_event_relation_enabled()) {
+			struct perf_event_output_relation *output =
+				rcu_dereference_protected(event->output_relation,
+					lockdep_is_held(&event->mmap_mutex));
+
+			if (!output || output->rb != rb ||
+			    perf_event_output_relation_valid(output)) {
+				ret = -EACCES;
+				goto pause_unlock;
+			}
 		}
 		rb_toggle_paused(rb, !!arg);
-		rcu_read_unlock();
-		return 0;
+pause_unlock:
+		mutex_unlock(&event->mmap_mutex);
+		return ret;
 	}
 
 	case PERF_EVENT_IOC_QUERY_BPF:
@@ -6706,10 +6785,15 @@ static long _perf_ioctl(struct perf_event *event, unsigned int cmd, unsigned lon
 		return -ENOTTY;
 	}
 
-	if (flags & PERF_IOC_FLAG_GROUP)
+	if (flags & PERF_IOC_FLAG_GROUP) {
+		int ret = perf_event_group_relations_valid(event);
+
+		if (ret)
+			return ret;
 		perf_event_for_each(event, func);
-	else
+	} else {
 		perf_event_for_each_child(event, func);
+	}
 
 	return 0;
 }
@@ -6724,6 +6808,21 @@ static long perf_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	ret = security_perf_event_write(event);
 	if (ret)
 		return ret;
+	/*
+	 * Relation creation may allocate and perform a slow LSM decision.
+	 * perf_event_set_bpf_prog() takes ctx->mutex exactly once around the
+	 * final publication, so keep it outside the generic locked ioctl path.
+	 */
+	if (cmd == PERF_EVENT_IOC_SET_BPF) {
+		struct bpf_prog *prog = bpf_prog_get(arg);
+
+		if (IS_ERR(prog))
+			return PTR_ERR(prog);
+		ret = perf_event_set_bpf_prog(event, prog, 0);
+		if (ret)
+			bpf_prog_put(prog);
+		return ret;
+	}
 
 	ctx = perf_event_ctx_lock(event);
 	ret = _perf_ioctl(event, cmd, arg);
@@ -6797,13 +6896,36 @@ static int perf_event_index(struct perf_event *event)
 	return event->pmu->event_idx(event);
 }
 
+/*
+ * Collect the immutable output guard and rb as one stable RCU snapshot.
+ * This is loop-free for NMI callers: a concurrent transition fails closed
+ * instead of spinning on a writer which the NMI may have interrupted.
+ */
+static struct perf_buffer *perf_event_guarded_rb(struct perf_event *event)
+{
+	struct perf_event_output_relation *output, *output_after;
+	struct perf_buffer *rb;
+
+	output = rcu_dereference(event->output_relation);
+	rb = rcu_dereference(event->rb);
+	output_after = rcu_dereference(event->output_relation);
+	if (!rb || output != output_after)
+		return NULL;
+	if (security_perf_event_relation_enabled() && !output)
+		return NULL;
+	if (output && (output->rb != rb ||
+			       perf_event_output_relation_valid(output)))
+		return NULL;
+	return rb;
+}
+
 static void perf_event_init_userpage(struct perf_event *event)
 {
 	struct perf_event_mmap_page *userpg;
 	struct perf_buffer *rb;
 
 	rcu_read_lock();
-	rb = rcu_dereference(event->rb);
+	rb = perf_event_guarded_rb(event);
 	if (!rb)
 		goto unlock;
 
@@ -6836,7 +6958,7 @@ void perf_event_update_userpage(struct perf_event *event)
 	u64 enabled, running, now;
 
 	rcu_read_lock();
-	rb = rcu_dereference(event->rb);
+	rb = perf_event_guarded_rb(event);
 	if (!rb)
 		goto unlock;
 
@@ -6880,13 +7002,21 @@ unlock:
 }
 EXPORT_SYMBOL_GPL(perf_event_update_userpage);
 
-static void ring_buffer_attach(struct perf_event *event,
-			       struct perf_buffer *rb)
+static int ring_buffer_attach(struct perf_event *event,
+			      struct perf_buffer *rb,
+			      struct perf_event_output_relation *output)
 {
+	struct perf_event_output_relation *old_output;
 	struct perf_buffer *old_rb = NULL;
 	unsigned long flags;
 
 	WARN_ON_ONCE(event->parent);
+	if (rb && !output && security_perf_event_relation_enabled()) {
+		output = kzalloc_obj(*output, GFP_KERNEL);
+		if (!output)
+			return -ENOMEM;
+		output->rb = rb;
+	}
 
 	if (event->rb) {
 		/*
@@ -6928,7 +7058,24 @@ static void ring_buffer_attach(struct perf_event *event,
 	if (has_aux(event))
 		perf_event_stop(event, 0);
 
-	rcu_assign_pointer(event->rb, rb);
+	old_output = rcu_dereference_protected(
+		event->output_relation,
+		lockdep_is_held(&event->mmap_mutex));
+	if (output) {
+		/* Publish the guard before the buffer it authorizes. */
+		rcu_assign_pointer(event->output_relation, output);
+		/* Pair with the guard/rb/guard reader snapshot. */
+		smp_wmb();
+		rcu_assign_pointer(event->rb, rb);
+	} else {
+		/* Withdraw the buffer before removing its guard. */
+		rcu_assign_pointer(event->rb, rb);
+		/* Pair with the guard/rb/guard reader snapshot. */
+		smp_wmb();
+		rcu_assign_pointer(event->output_relation, NULL);
+	}
+	if (old_output)
+		call_rcu(&old_output->rcu, perf_output_relation_free_rcu);
 
 	if (old_rb) {
 		ring_buffer_put(old_rb);
@@ -6939,6 +7086,7 @@ static void ring_buffer_attach(struct perf_event *event,
 		 */
 		wake_up_all(&event->waitq);
 	}
+	return 0;
 }
 
 static void ring_buffer_wakeup(struct perf_event *event)
@@ -7066,7 +7214,7 @@ static void perf_mmap_close(struct vm_area_struct *vma)
 	if (!refcount_dec_and_mutex_lock(&event->mmap_count, &event->mmap_mutex))
 		goto out_put;
 
-	ring_buffer_attach(event, NULL);
+	ring_buffer_attach(event, NULL, NULL);
 	mutex_unlock(&event->mmap_mutex);
 
 	/* If there's still other mmap()s of this buffer, we're done. */
@@ -7102,7 +7250,7 @@ again:
 		 * iterating the wrong list.
 		 */
 		if (event->rb == rb)
-			ring_buffer_attach(event, NULL);
+			ring_buffer_attach(event, NULL, NULL);
 
 		mutex_unlock(&event->mmap_mutex);
 		put_event(event);
@@ -7279,7 +7427,7 @@ static int perf_mmap_rb(struct vm_area_struct *vma, struct perf_event *event,
 {
 	long extra = 0, user_extra = nr_pages;
 	struct perf_buffer *rb;
-	int rb_flags = 0;
+	int ret, rb_flags = 0;
 
 	nr_pages -= 1;
 
@@ -7320,7 +7468,7 @@ static int perf_mmap_rb(struct vm_area_struct *vma, struct perf_event *event,
 		 * refcount_dec_and_mutex_lock() remove the
 		 * event and continue as if !event->rb
 		 */
-		ring_buffer_attach(event, NULL);
+		ring_buffer_attach(event, NULL, NULL);
 	}
 
 	if (!perf_mmap_calc_limits(vma, &user_extra, &extra))
@@ -7338,7 +7486,11 @@ static int perf_mmap_rb(struct vm_area_struct *vma, struct perf_event *event,
 
 	rb->mmap_locked = extra;
 
-	ring_buffer_attach(event, rb);
+	ret = ring_buffer_attach(event, rb, NULL);
+	if (ret) {
+		ring_buffer_put(rb);
+		return ret;
+	}
 
 	perf_event_update_time(event);
 	perf_event_init_userpage(event);
@@ -7466,10 +7618,23 @@ static int perf_mmap(struct file *file, struct vm_area_struct *vma)
 		if (event->state <= PERF_EVENT_STATE_REVOKED)
 			return -ENODEV;
 
-		if (vma->vm_pgoff == 0)
+		if (vma->vm_pgoff == 0) {
 			ret = perf_mmap_rb(vma, event, nr_pages);
-		else
+		} else {
+			if (security_perf_event_relation_enabled()) {
+				struct perf_event_output_relation *output =
+					rcu_dereference_protected(
+						event->output_relation,
+						lockdep_is_held(&event->mmap_mutex));
+
+				/* SET_OUTPUT grants no READ/AUX authority on its target. */
+				if (!output || output->rb != event->rb ||
+				    output->nr_relations ||
+				    perf_event_output_relation_valid(output))
+					return -EACCES;
+			}
 			ret = perf_mmap_aux(vma, event, nr_pages);
+		}
 		if (ret)
 			return ret;
 
@@ -7520,7 +7685,7 @@ static int perf_mmap(struct file *file, struct vm_area_struct *vma)
 			if (mapped)
 				mapped(event, vma->vm_mm);
 			perf_mmap_unaccount(vma, event->rb);
-			ring_buffer_attach(event, NULL);	/* drops last rb->refcount */
+			ring_buffer_attach(event, NULL, NULL); /* drops last rb->refcount */
 			refcount_set(&event->mmap_count, 0);
 			return ret;
 		}
@@ -8871,17 +9036,27 @@ __perf_event_output(struct perf_event *event,
 {
 	struct perf_output_handle handle;
 	struct perf_event_header header;
+	bool group_relation_guard;
 	int err;
 
 	/* protect the callchain buffers */
 	rcu_read_lock();
 
 	perf_prepare_sample(data, event, regs);
+	group_relation_guard = (data->type & PERF_SAMPLE_READ) &&
+		(event->attr.read_format & PERF_FORMAT_GROUP);
+	if (unlikely(group_relation_guard)) {
+		err = perf_event_group_relations_valid(event);
+		if (err)
+			goto exit;
+	}
 	perf_prepare_header(&header, data, event, regs);
 
 	err = output_begin(&handle, data, event, header.size);
 	if (err)
 		goto exit;
+	if (group_relation_guard)
+		perf_output_arm_group_relation_guard(&handle, event, header.size);
 
 	perf_output_sample(&handle, &header, data, event);
 
@@ -8945,9 +9120,15 @@ perf_event_read_event(struct perf_event *event,
 	int ret;
 
 	perf_event_header__init_id(&read_event.header, &sample, event);
+	if ((event->attr.read_format & PERF_FORMAT_GROUP) &&
+	    perf_event_group_relations_valid(event))
+		return;
 	ret = perf_output_begin(&handle, &sample, event, read_event.header.size);
 	if (ret)
 		return;
+	if (event->attr.read_format & PERF_FORMAT_GROUP)
+		perf_output_arm_group_relation_guard(&handle, event,
+					     read_event.header.size);
 
 	perf_output_put(&handle, read_event);
 	perf_output_read(&handle, event);
@@ -10666,14 +10847,19 @@ static int bpf_overflow_handler(struct perf_event *event,
 		.event = event,
 	};
 	struct bpf_prog *prog;
+	struct perf_event_relation *relation, *relation_after;
 	int ret = 0;
 
 	ctx.regs = perf_arch_bpf_user_pt_regs(regs);
 	if (unlikely(__this_cpu_inc_return(bpf_prog_active) != 1))
 		goto out;
 	rcu_read_lock();
+	relation = rcu_dereference(event->bpf_relation);
 	prog = READ_ONCE(event->prog);
-	if (prog) {
+	relation_after = rcu_dereference(event->bpf_relation);
+	if (prog && likely(relation == relation_after) &&
+	    likely((relation || !security_perf_event_relation_enabled()) &&
+		   !security_perf_event_relation_valid(relation))) {
 		perf_prepare_sample(data, event, regs);
 		ret = bpf_prog_run(prog, &ctx);
 	}
@@ -10686,7 +10872,8 @@ out:
 
 static inline int perf_event_set_bpf_handler(struct perf_event *event,
 					     struct bpf_prog *prog,
-					     u64 bpf_cookie)
+					     u64 bpf_cookie,
+					     struct perf_event_relation *relation)
 {
 	if (event->overflow_handler_context)
 		/* hw breakpoint or kernel counter */
@@ -10715,7 +10902,13 @@ static inline int perf_event_set_bpf_handler(struct perf_event *event,
 		return -EPROTO;
 	}
 
-	event->prog = prog;
+	if (security_perf_event_relation_enabled() && !relation)
+		return -EACCES;
+	rcu_assign_pointer(event->bpf_relation,
+			   security_perf_event_relation_get(relation));
+	/* Readers sample relation, program, relation under RCU. */
+	smp_wmb();
+	WRITE_ONCE(event->prog, prog);
 	event->bpf_cookie = bpf_cookie;
 	return 0;
 }
@@ -10723,11 +10916,17 @@ static inline int perf_event_set_bpf_handler(struct perf_event *event,
 static inline void perf_event_free_bpf_handler(struct perf_event *event)
 {
 	struct bpf_prog *prog = event->prog;
+	struct perf_event_relation *relation;
 
 	if (!prog)
 		return;
 
-	event->prog = NULL;
+	WRITE_ONCE(event->prog, NULL);
+	/* Withdraw executable code before releasing its authority carrier. */
+	smp_wmb();
+	relation = rcu_replace_pointer(event->bpf_relation, NULL, true);
+	synchronize_rcu();
+	security_perf_event_relation_put(relation);
 	bpf_prog_put(prog);
 }
 #else
@@ -10740,7 +10939,8 @@ static inline int bpf_overflow_handler(struct perf_event *event,
 
 static inline int perf_event_set_bpf_handler(struct perf_event *event,
 					     struct bpf_prog *prog,
-					     u64 bpf_cookie)
+					     u64 bpf_cookie,
+					     struct perf_event_relation *relation)
 {
 	return -EOPNOTSUPP;
 }
@@ -10767,11 +10967,23 @@ static int __perf_event_overflow(struct perf_event *event,
 	 */
 	if (unlikely(!is_sampling_event(event)))
 		return 0;
+	if (unlikely(perf_event_group_relation_valid(event))) {
+		perf_event_disable_inatomic(event);
+		event->pmu->stop(event, 0);
+		return 1;
+	}
 
 	ret = __perf_event_account_interrupt(event, throttle);
 
-	if (event->attr.aux_pause)
-		perf_event_aux_pause(event->aux_event, true);
+	if (event->attr.aux_pause) {
+		if (unlikely(!event->aux_event ||
+			     perf_event_group_relation_valid(event->aux_event))) {
+			if (event->aux_event)
+				perf_event_disable_inatomic(event->aux_event);
+		} else {
+			perf_event_aux_pause(event->aux_event, true);
+		}
+	}
 
 	if (event->prog && event->prog->type == BPF_PROG_TYPE_PERF_EVENT &&
 	    !bpf_overflow_handler(event, data, regs))
@@ -11693,7 +11905,8 @@ static inline bool perf_event_is_tracing(struct perf_event *event)
 
 static int __perf_event_set_bpf_prog(struct perf_event *event,
 				     struct bpf_prog *prog,
-				     u64 bpf_cookie)
+				     u64 bpf_cookie,
+				     struct perf_event_relation *relation)
 {
 	bool is_kprobe, is_uprobe, is_tracepoint, is_syscall_tp;
 
@@ -11701,7 +11914,8 @@ static int __perf_event_set_bpf_prog(struct perf_event *event,
 		return -ENODEV;
 
 	if (!perf_event_is_tracing(event))
-		return perf_event_set_bpf_handler(event, prog, bpf_cookie);
+		return perf_event_set_bpf_handler(event, prog, bpf_cookie,
+					  relation);
 
 	is_kprobe = event->tp_event->flags & TRACE_EVENT_FL_KPROBE;
 	is_uprobe = event->tp_event->flags & TRACE_EVENT_FL_UPROBE;
@@ -11744,7 +11958,7 @@ static int __perf_event_set_bpf_prog(struct perf_event *event,
 			return -EACCES;
 	}
 
-	return perf_event_attach_bpf_prog(event, prog, bpf_cookie);
+	return perf_event_attach_bpf_prog(event, prog, bpf_cookie, relation);
 }
 
 int perf_event_set_bpf_prog(struct perf_event *event,
@@ -11752,11 +11966,18 @@ int perf_event_set_bpf_prog(struct perf_event *event,
 			    u64 bpf_cookie)
 {
 	struct perf_event_context *ctx;
+	struct perf_event_relation *relation = NULL;
 	int ret;
 
+	ret = security_perf_event_relation_create_composite(
+		event, PERF_SECURITY_RELATION_WRITE, NULL, 0, prog, NULL, 0,
+		&relation);
+	if (ret)
+		return ret;
 	ctx = perf_event_ctx_lock(event);
-	ret = __perf_event_set_bpf_prog(event, prog, bpf_cookie);
+	ret = __perf_event_set_bpf_prog(event, prog, bpf_cookie, relation);
 	perf_event_ctx_unlock(event, ctx);
+	security_perf_event_relation_put(relation);
 
 	return ret;
 }
@@ -11785,7 +12006,8 @@ static void perf_event_free_filter(struct perf_event *event)
 
 static int __perf_event_set_bpf_prog(struct perf_event *event,
 				     struct bpf_prog *prog,
-				     u64 bpf_cookie)
+				     u64 bpf_cookie,
+				     struct perf_event_relation *relation)
 {
 	return -ENOENT;
 }
@@ -13419,8 +13641,11 @@ perf_event_alloc(struct perf_event_attr *attr, int cpu,
 
 	event->state		= PERF_EVENT_STATE_INACTIVE;
 
-	if (parent_event)
+	if (parent_event) {
 		event->event_caps = parent_event->event_caps;
+		event->group_relation = security_perf_event_relation_get(
+			parent_event->group_relation);
+	}
 
 	if (task) {
 		event->attach_state = PERF_ATTACH_TASK;
@@ -13440,11 +13665,31 @@ perf_event_alloc(struct perf_event_attr *attr, int cpu,
 		overflow_handler = parent_event->overflow_handler;
 		context = parent_event->overflow_handler_context;
 #if defined(CONFIG_BPF_SYSCALL) && defined(CONFIG_EVENT_TRACING)
-		if (parent_event->prog) {
-			struct bpf_prog *prog = parent_event->prog;
+		{
+			struct perf_event_relation *relation, *relation_after;
+			struct bpf_prog *prog;
 
-			bpf_prog_inc(prog);
-			event->prog = prog;
+			/*
+			 * Detach withdraws the program before the carrier and waits
+			 * for an RCU grace period before dropping either reference.
+			 * Capture the same coherent pair used by the NMI run path.
+			 */
+			rcu_read_lock();
+			relation = rcu_dereference(parent_event->bpf_relation);
+			prog = READ_ONCE(parent_event->prog);
+			relation_after =
+				rcu_dereference(parent_event->bpf_relation);
+			if (prog && relation == relation_after &&
+			    (relation ||
+			     !security_perf_event_relation_enabled())) {
+				bpf_prog_inc(prog);
+				relation =
+					security_perf_event_relation_get(relation);
+				RCU_INIT_POINTER(event->bpf_relation, relation);
+				WRITE_ONCE(event->prog, prog);
+				event->bpf_cookie = parent_event->bpf_cookie;
+			}
+			rcu_read_unlock();
 		}
 #endif
 	}
@@ -13725,17 +13970,33 @@ static void mutex_lock_double(struct mutex *a, struct mutex *b)
 static int
 perf_event_set_output(struct perf_event *event, struct perf_event *output_event)
 {
+	struct perf_event_output_relation *output = NULL;
+	struct perf_event_relation *relation = NULL;
+	struct perf_event_output_relation *target_output;
 	struct perf_buffer *rb = NULL;
+	u8 i;
 	int ret = -EINVAL;
 
 	if (!output_event) {
 		mutex_lock(&event->mmap_mutex);
 		goto set;
 	}
-	ret = security_perf_event_relation(
-		output_event, PERF_SECURITY_RELATION_WRITE);
+	/* Authorize source and target against one immutable policy snapshot. */
+	ret = security_perf_event_relation_create_composite(
+		event, PERF_SECURITY_RELATION_WRITE, output_event,
+		PERF_SECURITY_RELATION_WRITE, NULL, NULL, 0, &relation);
 	if (ret)
 		goto out;
+	/*
+	 * AUX hardware can keep writing after the policy epoch changes and the
+	 * mapped pages are visible before perf_aux_output_end().  Until AUX has
+	 * an active-revocation protocol, do not publish a durable redirected
+	 * relation that cannot be withdrawn fail-closed.
+	 */
+	if (relation && has_aux(event)) {
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
 
 	/* don't allow circular references */
 	if (event == output_event)
@@ -13789,6 +14050,20 @@ set:
 	if (output_event) {
 		if (output_event->state <= PERF_EVENT_STATE_REVOKED)
 			goto unlock;
+		target_output = rcu_dereference_protected(
+			output_event->output_relation,
+			lockdep_is_held(&output_event->mmap_mutex));
+		if (security_perf_event_relation_enabled() &&
+		    (!target_output || target_output->rb != output_event->rb ||
+		     perf_event_output_relation_valid(target_output))) {
+			ret = -EACCES;
+			goto unlock;
+		}
+		if (relation && target_output &&
+		    target_output->nr_relations >= PERF_OUTPUT_RELATION_MAX) {
+			ret = -E2BIG;
+			goto unlock;
+		}
 
 		/* get the rb we want to redirect to */
 		rb = ring_buffer_get(output_event);
@@ -13800,9 +14075,34 @@ set:
 			ring_buffer_put(rb);
 			goto unlock;
 		}
+
+		if (relation) {
+			output = kzalloc_obj(*output, GFP_KERNEL);
+			if (!output) {
+				ring_buffer_put(rb);
+				ret = -ENOMEM;
+				goto unlock;
+				}
+				output->rb = rb;
+				if (target_output) {
+					for (i = 0; i < target_output->nr_relations; i++)
+						output->relations[i] =
+							security_perf_event_relation_get(
+								target_output->relations[i]);
+					output->nr_relations = target_output->nr_relations;
+				}
+				output->relations[output->nr_relations++] = relation;
+				relation = NULL;
+		}
 	}
 
-	ring_buffer_attach(event, rb);
+	ret = ring_buffer_attach(event, rb, output);
+	if (ret) {
+		if (rb)
+			ring_buffer_put(rb);
+		goto unlock;
+	}
+	output = NULL;
 
 	ret = 0;
 unlock:
@@ -13811,6 +14111,12 @@ unlock:
 		mutex_unlock(&output_event->mmap_mutex);
 
 out:
+	if (output) {
+		for (i = 0; i < output->nr_relations; i++)
+			security_perf_event_relation_put(output->relations[i]);
+		kfree(output);
+	}
+	security_perf_event_relation_put(relation);
 	return ret;
 }
 
@@ -13896,6 +14202,7 @@ SYSCALL_DEFINE5(perf_event_open,
 		pid_t, pid, int, cpu, int, group_fd, unsigned long, flags)
 {
 	struct perf_event *group_leader = NULL, *output_event = NULL;
+	struct perf_event_relation *group_relation = NULL;
 	struct perf_event_pmu_context *pmu_ctx;
 	struct perf_event *event, *sibling;
 	struct perf_event_attr attr;
@@ -13992,8 +14299,9 @@ SYSCALL_DEFINE5(perf_event_open,
 		if (flags & PERF_FLAG_FD_NO_GROUP)
 			group_leader = NULL;
 		else {
-			err = security_perf_event_relation(
-				group_leader, PERF_SECURITY_RELATION_WRITE);
+			err = security_perf_event_relation_create(
+				group_leader, PERF_SECURITY_RELATION_WRITE,
+				&group_relation);
 			if (err)
 				goto err_fd;
 		}
@@ -14022,6 +14330,8 @@ SYSCALL_DEFINE5(perf_event_open,
 		err = PTR_ERR(event);
 		goto err_task;
 	}
+	event->group_relation = group_relation;
+	group_relation = NULL;
 
 	if (is_sampling_event(event)) {
 		if (event->pmu->capabilities & PERF_PMU_CAP_NO_INTERRUPT) {
@@ -14300,6 +14610,7 @@ err_task:
 	if (task)
 		put_task_struct(task);
 err_fd:
+	security_perf_event_relation_put(group_relation);
 	put_unused_fd(event_fd);
 	return err;
 }

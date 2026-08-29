@@ -230,7 +230,8 @@ LSM_HOOK(void, LSM_RET_VOID, inode_getlsmprop, struct inode *inode,
 LSM_HOOK(int, 0, inode_copy_up, const struct path *src,
 	 const struct vfsmount *dst_mnt, struct cred **new)
 LSM_HOOK(int, 0, inode_copy_up_post, const struct path *src,
-	 const struct vfsmount *dst_mnt, struct dentry *dst)
+	 const struct vfsmount *dst_mnt, struct dentry *dst,
+	 const struct cred *copy_up_cred)
 LSM_HOOK(int, -EOPNOTSUPP, inode_copy_up_xattr, struct dentry *src,
 	 const char *name)
 LSM_HOOK(int, 0, inode_setintegrity, const struct inode *inode,
@@ -245,6 +246,7 @@ LSM_HOOK(int, 0, file_permission, struct file *file, int mask)
 LSM_HOOK(int, 0, file_alloc_security, struct file *file)
 LSM_HOOK(int, 0, file_set_path, struct file *file)
 LSM_HOOK(int, 0, file_init_security_anon, struct file *file)
+LSM_HOOK(int, 0, file_kho_preserve, struct file *file)
 LSM_HOOK(void, LSM_RET_VOID, file_release, struct file *file)
 LSM_HOOK(void, LSM_RET_VOID, file_free_security, struct file *file)
 LSM_HOOK(int, 0, backing_file_alloc, struct file *backing_file,
@@ -510,6 +512,7 @@ LSM_HOOK(int, 0, ib_endport_manage_subnet, void *sec, const char *dev_name,
 	 u8 port_num)
 LSM_HOOK(int, 0, ib_alloc_security, void *sec)
 LSM_HOOK(void, LSM_RET_VOID, ib_free_security, void *sec)
+LSM_HOOK(int, 0, ib_policy_scopes, void *sec, u64 *scope_ids, u16 capacity)
 #endif /* CONFIG_SECURITY_INFINIBAND */
 
 #ifdef CONFIG_SECURITY_NETWORK_XFRM
@@ -600,7 +603,16 @@ LSM_HOOK(void, LSM_RET_VOID, perf_event_free, struct perf_event *event)
 LSM_HOOK(int, 0, perf_event_read, struct perf_event *event)
 LSM_HOOK(int, 0, perf_event_write, struct perf_event *event)
 LSM_HOOK(int, 0, perf_event_relation, struct perf_event *event,
-	 unsigned int access)
+	 unsigned int access, struct perf_event *related_event,
+	 unsigned int related_access, const struct bpf_prog *prog,
+	 const struct bpf_map *map, fmode_t map_fmode,
+	 struct perf_event_relation *relation)
+LSM_HOOK(void, LSM_RET_VOID, perf_event_relation_free,
+	 struct perf_event_relation *relation)
+LSM_HOOK(int, 0, perf_event_relation_valid,
+	 const struct perf_event_relation *relation)
+LSM_HOOK(int, 0, perf_event_relation_revalidate,
+	 struct perf_event_relation *relation)
 #endif /* CONFIG_PERF_EVENTS */
 
 #ifdef CONFIG_IO_URING

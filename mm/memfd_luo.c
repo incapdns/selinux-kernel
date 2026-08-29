@@ -80,6 +80,7 @@
 #include <linux/shmem_fs.h>
 #include <linux/vmalloc.h>
 #include <linux/memfd.h>
+#include <linux/security.h>
 #include <uapi/linux/memfd.h>
 
 #include "internal.h"
@@ -542,6 +543,9 @@ static int memfd_luo_retrieve(struct liveupdate_file_op_args *args)
 		err = PTR_ERR(file);
 		goto free_ser;
 	}
+	err = security_file_kho_preserve(file);
+	if (err)
+		goto put_file;
 
 	err = memfd_add_seals(file, ser->seals);
 	if (err) {
@@ -582,7 +586,8 @@ static bool memfd_luo_can_preserve(struct liveupdate_file_handler *handler,
 {
 	struct inode *inode = file_inode(file);
 
-	return shmem_file(file) && !inode->i_nlink;
+	return shmem_file(file) && !inode->i_nlink &&
+	       !security_file_kho_preserve(file);
 }
 
 static unsigned long memfd_luo_get_id(struct file *file)

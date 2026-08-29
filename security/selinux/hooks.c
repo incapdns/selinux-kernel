@@ -202,8 +202,11 @@ static int selinux_lsm_notifier_avc_callback(struct selinux_avc *avc,
 					     u32 event)
 {
 	if (event == AVC_CALLBACK_RESET && init_selinux_state &&
-	    avc == init_selinux_state->avc)
+	    avc == init_selinux_state->avc) {
+#ifndef CONFIG_SECURITY_SELINUX_NS
 		call_blocking_lsm_notifier(LSM_POLICY_CHANGE, NULL);
+#endif
+	}
 
 	return 0;
 }
@@ -539,6 +542,85 @@ static inline struct inode_security_struct *backing_inode_security(struct dentry
 }
 
 #ifdef CONFIG_SECURITY_SELINUX_NS
+struct selinux_inode_label_snapshot {
+	struct selinux_global_sid_handle *sid_handle;
+	struct selinux_label_ref *label;
+	u32 sid;
+	u16 sclass;
+	u8 source;
+};
+
+static void selinux_inode_label_snapshot_put(
+	struct selinux_inode_label_snapshot *snapshot)
+{
+	selinux_label_ref_put(snapshot->label);
+	global_sid_handle_put(snapshot->sid_handle);
+	memset(snapshot, 0, sizeof(*snapshot));
+}
+
+static int selinux_inode_label_snapshot_get(
+	struct inode_security_struct *isec,
+	struct selinux_inode_label_snapshot *snapshot)
+{
+	struct selinux_global_sid_handle *handle = NULL;
+	struct selinux_label_ref *label = NULL;
+	u32 sid;
+	int rc = 0;
+
+	memset(snapshot, 0, sizeof(*snapshot));
+	spin_lock(&isec->lock);
+	/*
+	 * An invalid or pending tuple is retained only as revalidation input; it
+	 * is never an identity that may be authorized.  Check the state under
+	 * the same lock as every other tuple member so readers either observe a
+	 * complete initialized identity or fail closed.
+	 */
+	if (isec->initialized != LABEL_INITIALIZED || !isec->sid_handle) {
+		rc = -ESTALE;
+		goto out_unlock;
+	}
+	handle = global_sid_handle_dup(isec->sid_handle);
+	if (IS_ERR(handle)) {
+		rc = PTR_ERR(handle);
+		handle = NULL;
+		goto out_unlock;
+	}
+	label = global_sid_handle_label_get(handle);
+	sid = global_sid_handle_sid(handle);
+	if (!label || !sid || sid != isec->sid || !isec->sclass ||
+	    label != rcu_dereference_protected(
+			     isec->label_ref, lockdep_is_held(&isec->lock))) {
+		rc = -ESTALE;
+		goto out_unlock;
+	}
+	snapshot->sid_handle = handle;
+	snapshot->label = label;
+	snapshot->sid = sid;
+	snapshot->sclass = isec->sclass;
+	snapshot->source = isec->label_source;
+	handle = NULL;
+	label = NULL;
+
+out_unlock:
+	spin_unlock(&isec->lock);
+	selinux_label_ref_put(label);
+	global_sid_handle_put(handle);
+	return rc;
+}
+
+static void selinux_copy_up_carrier_put(struct selinux_copy_up_carrier *carrier)
+{
+	if (!carrier)
+		return;
+	iput(carrier->src_inode);
+	selinux_label_view_put(carrier->dst_view);
+	selinux_label_view_put(carrier->src_view);
+	global_sid_handle_put(carrier->create_handle);
+	global_sid_handle_put(carrier->sid_handle);
+	selinux_label_ref_put(carrier->label);
+	kfree(carrier);
+}
+
 static int inode_security_take_task_sid_handle(
 	struct inode_security_struct *isec,
 	struct selinux_global_sid_handle *handle)
@@ -1177,6 +1259,72 @@ struct selinux_policy_chain_snapshot {
 };
 
 #ifdef CONFIG_SECURITY_SELINUX_NS
+#define SELINUX_FILE_TRANSFER_CHECKS_PER_POLICY 4
+#define SELINUX_FILE_TRANSFER_MAX_CHECKS \
+	(SELINUX_FILE_TRANSFER_CHECKS_PER_POLICY * \
+	 (SELINUX_LABEL_RESOLUTION_MAX_DEPTH + 1))
+
+static_assert(SELINUX_FILE_TRANSFER_MAX_CHECKS <=
+	      SELINUX_AVC_TRANSACTION_MAX_CHECKS);
+
+struct selinux_file_transfer_transaction {
+	struct selinux_policy_chain_snapshot chain;
+	struct selinux_avc_level levels[SELINUX_FILE_TRANSFER_MAX_CHECKS];
+	struct selinux_policy_snapshot snapshots[
+		SELINUX_FILE_TRANSFER_MAX_CHECKS];
+	struct selinux_avc_provenance provenance[
+		SELINUX_FILE_TRANSFER_CHECKS_PER_POLICY];
+	u16 count;
+	u8 provenance_count;
+};
+
+struct selinux_file_operation_check {
+	u32 requested;
+	u16 tclass;
+	u16 skip_policycap;
+	u8 decision_kind;
+	u8 driver;
+	u8 base_perm;
+	u8 xperm;
+};
+
+static int selinux_file_transfer_transaction_add(
+	struct selinux_file_transfer_transaction *transaction,
+	const struct selinux_avc_level *level,
+	const struct selinux_policy_snapshot *snapshot)
+{
+	u16 next;
+
+	if (check_add_overflow(transaction->count, (u16)1, &next) ||
+	    next > ARRAY_SIZE(transaction->levels))
+		return -E2BIG;
+	transaction->levels[transaction->count] = *level;
+	transaction->snapshots[transaction->count] = *snapshot;
+	transaction->count = next;
+	return 0;
+}
+
+static int selinux_file_transfer_transaction_provenance(
+	struct selinux_file_transfer_transaction *transaction,
+	const struct selinux_label_ref *label,
+	const struct selinux_label_view *view, u8 source,
+	const struct selinux_avc_provenance **provenance)
+{
+	struct selinux_avc_provenance *slot;
+
+	if (!label || !view || !provenance ||
+	    transaction->provenance_count >= ARRAY_SIZE(transaction->provenance))
+		return -E2BIG;
+	slot = &transaction->provenance[transaction->provenance_count++];
+	*slot = (struct selinux_avc_provenance) {
+		.label = label,
+		.view = view,
+		.source = source,
+	};
+	*provenance = slot;
+	return 0;
+}
+
 struct selinux_label_avc_scratch {
 	struct selinux_label_resolution resolution;
 	struct selinux_avc_level
@@ -4138,12 +4286,18 @@ static int inode_has_perm_view(const struct cred *cred, struct inode *inode,
 {
 	struct inode_security_struct *isec;
 	struct selinux_pathless_projection *projection;
-	struct selinux_label_ref *label;
+	struct selinux_inode_label_snapshot snapshot;
 	int rc;
 
 	if (unlikely(IS_PRIVATE(inode)))
 		return 0;
-	isec = selinux_inode(inode);
+	/*
+	 * Do not revalidate here: file_path_has_perm() can reach this helper
+	 * while holding tty->files_lock.  Sleepable path-based callers perform
+	 * revalidation before entry; all other callers fail closed below when
+	 * the atomic snapshot is not LABEL_INITIALIZED.
+	 */
+	isec = inode_security_novalidate(inode);
 	projection = selinux_inode_pathless_get(isec);
 	if (projection) {
 		/* The published projection is the inode's authoritative identity. */
@@ -4153,12 +4307,12 @@ static int inode_has_perm_view(const struct cred *cred, struct inode *inode,
 	}
 	if (!view)
 		return -EOPNOTSUPP;
-	label = selinux_label_ref_get_rcu(&isec->label_ref);
-	if (!label)
-		return -EIO;
-	rc = cred_label_has_perm(cred, isec->sid, label, view, isec->sclass,
-				 perms, adp);
-	selinux_label_ref_put(label);
+	rc = selinux_inode_label_snapshot_get(isec, &snapshot);
+	if (rc)
+		return rc;
+	rc = cred_label_has_perm(cred, snapshot.sid, snapshot.label, view,
+				 snapshot.sclass, perms, adp);
+	selinux_inode_label_snapshot_put(&snapshot);
 	return rc;
 }
 
@@ -4264,25 +4418,53 @@ static inline int file_path_has_perm(const struct cred *cred,
 }
 
 #ifdef CONFIG_BPF_SYSCALL
+#ifndef CONFIG_SECURITY_SELINUX_NS
 static int bpf_fd_pass(const struct file *file, const struct cred *cred);
+#else
+static int bpf_fd_pass_add(
+	const struct file *file, const struct cred *cred,
+	struct selinux_file_transfer_transaction *transaction);
+#endif
+static int selinux_bpf_link_access_cred(const struct cred *cred,
+					struct bpf_link *link, enum bpf_cmd cmd);
 static int selinux_bpf_link_access(struct bpf_link *link, enum bpf_cmd cmd);
+static u32 selinux_bpf_link_cmd_perm(enum bpf_cmd cmd);
+static int selinux_bpf_btf_cred(const struct cred *cred,
+				const struct btf *btf);
 static int selinux_bpf_btf(const struct btf *btf);
 #endif
 #if defined(CONFIG_PERF_EVENTS) && defined(CONFIG_SECURITY_SELINUX_NS)
-static int perf_fd_pass(const struct file *file, const struct cred *cred);
+static int perf_fd_pass_add(
+	const struct file *file, const struct cred *cred,
+	struct selinux_file_transfer_transaction *transaction);
+#endif
+#ifdef CONFIG_SECURITY_SELINUX_NS
+static int selinux_file_operation_has_perm(
+	const struct cred *cred, const struct file *file, const struct cred *opener,
+	struct inode *inode, const struct selinux_label_view *view,
+	const struct selinux_pathless_projection *pathless,
+	const struct selinux_file_operation_check *check, bool include_carriers,
+	struct common_audit_data *ad);
+static int selinux_file_transfer_has_perm(
+	const struct cred *cred, const struct file *file, const struct cred *opener,
+	struct inode *inode, const struct selinux_label_view *view,
+	const struct selinux_pathless_projection *pathless, u32 requested,
+	struct common_audit_data *ad);
 #endif
 
+#ifndef CONFIG_SECURITY_SELINUX_NS
 static int file_use_has_perm(const struct cred *cred, const struct file *file,
 			     struct common_audit_data *ad)
 {
-	const struct file_security_struct *fsec = selinux_file(file);
+	const struct cred *opener = file->f_cred;
 
-	if (!fsec->cred)
+	if (!opener)
 		return -EIO;
-	if (cred_sid_chain_equal(cred, fsec->cred))
+	if (cred_sid_chain_equal(cred, opener))
 		return 0;
-	return cred_other_has_perm(cred, fsec->cred, SECCLASS_FD, FD__USE, ad);
+	return cred_other_has_perm(cred, opener, SECCLASS_FD, FD__USE, ad);
 }
+#endif
 
 static int __file_has_perm(const struct cred *cred, const struct file *file,
 			   u32 av, bool bf_user_file)
@@ -4293,8 +4475,10 @@ static int __file_has_perm(const struct cred *cred, const struct file *file,
 	const struct cred *opener;
 #ifdef CONFIG_SECURITY_SELINUX_NS
 	const struct selinux_label_view *view;
-#endif
+	const struct selinux_pathless_projection *pathless;
+#else
 	int rc;
+#endif
 
 	if (bf_user_file) {
 		struct backing_file_security_struct *bfsec;
@@ -4309,17 +4493,21 @@ static int __file_has_perm(const struct cred *cred, const struct file *file,
 		inode = d_inode(path->dentry);
 #ifdef CONFIG_SECURITY_SELINUX_NS
 		view = bfsec->view;
+		pathless = bfsec->pathless;
 #endif
 
 		ad.type = LSM_AUDIT_DATA_PATH;
 		ad.u.path = *path;
 	} else {
+#ifdef CONFIG_SECURITY_SELINUX_NS
 		struct file_security_struct *fsec = selinux_file(file);
+#endif
 
-		opener = fsec->cred;
+		opener = file->f_cred;
 		inode = file_inode(file);
 #ifdef CONFIG_SECURITY_SELINUX_NS
 		view = fsec->view;
+		pathless = fsec->pathless;
 #endif
 
 		ad.type = LSM_AUDIT_DATA_FILE;
@@ -4328,6 +4516,10 @@ static int __file_has_perm(const struct cred *cred, const struct file *file,
 
 	if (!opener)
 		return -EIO;
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	return selinux_file_transfer_has_perm(
+		cred, file, opener, inode, view, pathless, av, &ad);
+#else
 	if (!cred_sid_chain_equal(cred, opener)) {
 		rc = cred_other_has_perm(cred, opener, SECCLASS_FD, FD__USE, &ad);
 		if (rc)
@@ -4340,22 +4532,13 @@ static int __file_has_perm(const struct cred *cred, const struct file *file,
 	if (rc)
 		return rc;
 #endif
-#if defined(CONFIG_PERF_EVENTS) && defined(CONFIG_SECURITY_SELINUX_NS)
-	rc = perf_fd_pass(file, cred);
-	if (rc)
-		return rc;
-#endif
 
 	/* av is zero if only checking access to the descriptor. */
-	if (av) {
-#ifdef CONFIG_SECURITY_SELINUX_NS
-		return inode_has_perm_view(cred, inode, view, av, &ad);
-#else
+	if (av)
 		return inode_has_perm(cred, inode, av, &ad);
-#endif
-	}
 
 	return 0;
+#endif
 }
 
 /* Check whether a task can use an open file descriptor to
@@ -5456,6 +5639,9 @@ static int selinux_binder_set_context_mgr(const struct cred *mgr)
 static int selinux_binder_transaction(const struct cred *from,
 				      const struct cred *to)
 {
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	return cred_binder_transaction_has_perm(current_cred(), from, to);
+#else
 	u32 mysid = current_sid();
 	u32 fromsid = cred_sid(from);
 	int rc;
@@ -5470,6 +5656,7 @@ static int selinux_binder_transaction(const struct cred *from,
 
 	return cred_other_has_perm(from, to, SECCLASS_BINDER, BINDER__CALL,
 				   NULL);
+#endif
 }
 
 static int selinux_binder_transfer_binder(const struct cred *from,
@@ -5478,6 +5665,277 @@ static int selinux_binder_transfer_binder(const struct cred *from,
 	return cred_other_has_perm(from, to, SECCLASS_BINDER,
 				   BINDER__TRANSFER, NULL);
 }
+
+#ifdef CONFIG_SECURITY_SELINUX_NS
+static int selinux_file_transfer_cred_advance(const struct cred **cursor)
+{
+	const struct cred_security_struct *current_sec, *parent_sec;
+	const struct cred *next;
+
+	if (!cursor || !*cursor)
+		return -EINVAL;
+	current_sec = selinux_cred(*cursor);
+	if (!current_sec->state || !current_sec->state->label_domain ||
+	    current_sec->state->depth != current_sec->state->label_domain->depth)
+		return -EXDEV;
+	next = current_sec->parent_cred;
+	if (!next) {
+		if (current_sec->state->parent ||
+		    current_sec->state->label_domain->parent ||
+		    current_sec->state->depth)
+			return -EXDEV;
+		*cursor = NULL;
+		return 0;
+	}
+	parent_sec = selinux_cred(next);
+	if (!parent_sec->state || !parent_sec->state->label_domain ||
+	    current_sec->state->parent != parent_sec->state ||
+	    current_sec->state->label_domain->parent !=
+		    parent_sec->state->label_domain ||
+	    current_sec->state->depth != parent_sec->state->depth + 1 ||
+	    current_sec->state->label_domain->depth !=
+		    parent_sec->state->label_domain->depth + 1)
+		return -EXDEV;
+	*cursor = next;
+	return 0;
+}
+
+static int selinux_file_transfer_cred_sid_for_state(
+	const struct cred **cursor, const struct selinux_state *state, u32 *sid)
+{
+	if (!cursor || !state || !state->label_domain || !sid ||
+	    state->depth != state->label_domain->depth)
+		return -EXDEV;
+
+	while (*cursor) {
+		const struct cred_security_struct *crsec = selinux_cred(*cursor);
+		int rc;
+
+		if (!crsec->state || !crsec->state->label_domain ||
+		    crsec->state->depth != crsec->state->label_domain->depth)
+			return -EXDEV;
+		if (crsec->state != state &&
+		    crsec->state->label_domain == state->label_domain)
+			return -EXDEV;
+		if (crsec->state == state) {
+			*sid = crsec->sid;
+			return selinux_file_transfer_cred_advance(cursor);
+		}
+		if (crsec->state->depth <= state->depth)
+			break;
+		rc = selinux_file_transfer_cred_advance(cursor);
+		if (rc)
+			return rc;
+	}
+	*sid = SECINITSID_UNLABELED;
+	return 0;
+}
+
+static int selinux_file_operation_has_perm(
+	const struct cred *cred, const struct file *file, const struct cred *opener,
+	struct inode *inode, const struct selinux_label_view *view,
+	const struct selinux_pathless_projection *pathless,
+	const struct selinux_file_operation_check *check, bool include_carriers,
+	struct common_audit_data *ad)
+{
+	struct selinux_avc_transaction_workspace *workspace;
+	struct selinux_file_transfer_transaction *transaction;
+	bool same_cred;
+	unsigned int retry;
+	int rc = -ESTALE;
+
+	if (!cred || !file || !opener || !inode)
+		return -EIO;
+	same_cred = cred_sid_chain_equal(cred, opener);
+	transaction = kzalloc_obj(*transaction, GFP_KERNEL);
+	if (!transaction)
+		return -ENOMEM;
+	workspace = selinux_avc_transaction_workspace_alloc(
+		SELINUX_FILE_TRANSFER_MAX_CHECKS, GFP_KERNEL);
+	if (!workspace) {
+		rc = -ENOMEM;
+		goto out_transaction;
+	}
+
+	for (retry = 0; retry < SELINUX_POLICY_OPERATION_RETRIES; retry++) {
+		struct selinux_inode_label_snapshot snapshot = {};
+		const struct selinux_pathless_projection *projection = pathless;
+		const struct selinux_avc_provenance *provenance;
+		struct selinux_label_resolution resolution;
+		const struct cred *opener_cursor = opener;
+		u16 i;
+
+		transaction->count = 0;
+		transaction->provenance_count = 0;
+		rc = selinux_policy_chain_snapshot_read(
+			cred, &transaction->chain);
+		if (rc == -EAGAIN || rc == -ESTALE)
+			continue;
+		if (rc)
+			break;
+
+		if (!same_cred) {
+			for (i = 0; i < transaction->chain.count; i++) {
+				const struct cred_security_struct *crsec =
+					selinux_cred(transaction->chain.cred[i]);
+				u32 opener_sid;
+
+				rc = selinux_file_transfer_cred_sid_for_state(
+					&opener_cursor, crsec->state, &opener_sid);
+				if (rc)
+					break;
+				rc = selinux_file_transfer_transaction_add(
+					transaction,
+					&(struct selinux_avc_level) {
+						.state = crsec->state,
+						.ssid = crsec->sid,
+						.tsid = opener_sid,
+						.tclass = SECCLASS_FD,
+						.requested = FD__USE,
+					},
+					&transaction->chain.policy[i]);
+				if (rc)
+					break;
+			}
+			if (rc)
+				goto release_identity;
+			if (opener_cursor) {
+				rc = -EXDEV;
+				goto release_identity;
+			}
+		}
+
+		if (include_carriers) {
+#ifdef CONFIG_BPF_SYSCALL
+			rc = bpf_fd_pass_add(file, cred, transaction);
+			if (rc)
+				goto release_identity;
+#endif
+#ifdef CONFIG_PERF_EVENTS
+			rc = perf_fd_pass_add(file, cred, transaction);
+			if (rc)
+				goto release_identity;
+#endif
+		}
+
+		if (!check || !check->requested || unlikely(IS_PRIVATE(inode)))
+			goto decide;
+		if (projection) {
+			if (view != projection->view) {
+				rc = -EXDEV;
+				goto release_identity;
+			}
+			rc = selinux_file_transfer_transaction_provenance(
+				transaction, projection->label, projection->view,
+				projection->source, &provenance);
+		} else if (!view) {
+			rc = -EOPNOTSUPP;
+		} else {
+			rc = selinux_inode_label_snapshot_get(
+				inode_security_novalidate(inode), &snapshot);
+			if (!rc)
+				rc = selinux_label_view_resolve_chain(
+					view, snapshot.label, snapshot.sid,
+					&resolution);
+			if (!rc)
+				rc = selinux_file_transfer_transaction_provenance(
+					transaction, snapshot.label, view,
+					snapshot.source, &provenance);
+		}
+		if (rc)
+			goto release_identity;
+
+		for (i = 0; i < transaction->chain.count; i++) {
+			const struct cred_security_struct *crsec =
+				selinux_cred(transaction->chain.cred[i]);
+			u32 policy_tsid;
+			u16 policy_tclass;
+
+			if (projection) {
+				struct selinux_pathless_resolution resolved;
+
+				rc = selinux_pathless_projection_resolve_sealed(
+					projection, crsec->state->label_domain,
+					&resolved);
+				if (rc)
+					break;
+				policy_tsid = resolved.sid;
+				policy_tclass = check->tclass ?: resolved.sclass;
+			} else {
+				u16 depth = crsec->state->label_domain->depth;
+
+				if (depth > resolution.max_depth ||
+				    resolution.domain_id[depth] !=
+					    crsec->state->label_domain->id ||
+				    !resolution.sid[depth]) {
+					rc = -EOPNOTSUPP;
+					break;
+				}
+				policy_tsid = resolution.sid[depth];
+				policy_tclass = check->tclass ?: snapshot.sclass;
+			}
+			rc = selinux_file_transfer_transaction_add(
+				transaction,
+				&(struct selinux_avc_level) {
+					.state = crsec->state,
+					.ssid = crsec->sid,
+					.tsid = policy_tsid,
+					.tclass = policy_tclass,
+					.requested = check->requested,
+					.skip_policycap = check->skip_policycap,
+					.decision_kind = check->decision_kind,
+					.driver = check->driver,
+					.base_perm = check->base_perm,
+					.xperm = check->xperm,
+					.provenance = provenance,
+				},
+				&transaction->chain.policy[i]);
+			if (rc)
+				break;
+		}
+		if (rc)
+			goto release_identity;
+
+decide:
+		if (!transaction->count) {
+			rc = selinux_policy_chain_snapshot_valid(
+				&transaction->chain) ? 0 : -ESTALE;
+		} else {
+			rc = selinux_avc_transaction_has_perm_composite_guarded_workspace(
+				transaction->levels, transaction->snapshots,
+				transaction->count, NULL, NULL, 0, 0, ad, workspace);
+		}
+
+release_identity:
+		selinux_inode_label_snapshot_put(&snapshot);
+		if (rc == -EAGAIN || rc == -ESTALE ||
+		    !selinux_policy_chain_snapshot_valid(&transaction->chain)) {
+			rc = -ESTALE;
+			continue;
+		}
+		break;
+	}
+
+	selinux_avc_transaction_workspace_free(workspace);
+out_transaction:
+	kfree(transaction);
+	return rc;
+}
+
+static int selinux_file_transfer_has_perm(
+	const struct cred *cred, const struct file *file, const struct cred *opener,
+	struct inode *inode, const struct selinux_label_view *view,
+	const struct selinux_pathless_projection *pathless, u32 requested,
+	struct common_audit_data *ad)
+{
+	const struct selinux_file_operation_check check = {
+		.requested = requested,
+	};
+
+	return selinux_file_operation_has_perm(
+		cred, file, opener, inode, view, pathless, &check, true, ad);
+}
+#endif
 
 static int selinux_binder_transfer_file(const struct cred *from,
 					const struct cred *to,
@@ -5488,11 +5946,18 @@ static int selinux_binder_transfer_file(const struct cred *from,
 #endif
 	struct dentry *dentry = file->f_path.dentry;
 	struct common_audit_data ad;
+#ifndef CONFIG_SECURITY_SELINUX_NS
 	int rc;
+#endif
 
 	ad.type = LSM_AUDIT_DATA_PATH;
 	ad.u.path = file->f_path;
 
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	return selinux_file_transfer_has_perm(
+		to, file, file->f_cred, d_backing_inode(dentry), fsec->view,
+		fsec->pathless, file_to_av(file), &ad);
+#else
 	rc = file_use_has_perm(to, file, &ad);
 	if (rc)
 		return rc;
@@ -5505,11 +5970,6 @@ static int selinux_binder_transfer_file(const struct cred *from,
 
 	if (unlikely(IS_PRIVATE(d_backing_inode(dentry))))
 		return 0;
-
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	return inode_has_perm_view(to, d_backing_inode(dentry), fsec->view,
-				   file_to_av(file), &ad);
-#else
 	return inode_has_perm(to, d_backing_inode(dentry), file_to_av(file),
 			      &ad);
 #endif
@@ -5724,6 +6184,7 @@ struct selinux_exec_file_label {
 	u32 leaf_sid;
 	u16 leaf_sclass;
 #ifdef CONFIG_SECURITY_SELINUX_NS
+	struct selinux_global_sid_handle *sid_handle;
 	struct selinux_label_ref *label;
 	const struct selinux_label_view *view;
 	struct selinux_pathless_projection *projection;
@@ -5733,7 +6194,7 @@ struct selinux_exec_file_label {
 static int selinux_exec_file_label_get(
 	struct file *file, struct selinux_exec_file_label *target)
 {
-	struct inode_security_struct *isec = inode_security(file_inode(file));
+	struct inode_security_struct *isec;
 
 	memset(target, 0, sizeof(*target));
 #ifdef CONFIG_SECURITY_SELINUX_NS
@@ -5741,6 +6202,7 @@ static int selinux_exec_file_label_get(
 		const struct file_security_struct *fsec = selinux_file(file);
 		struct selinux_pathless_resolution resolved;
 		struct selinux_label_resolution chain;
+		struct selinux_inode_label_snapshot snapshot;
 		const struct selinux_label_domain *leaf_domain =
 			selinux_cred(current_cred())->state->label_domain;
 		int rc;
@@ -5758,15 +6220,17 @@ static int selinux_exec_file_label_get(
 			return 0;
 		}
 
-		spin_lock(&isec->lock);
-		target->canonical_sid = isec->sid;
-		target->leaf_sclass = isec->sclass;
-		target->label = selinux_label_ref_get(
-			rcu_dereference_protected(isec->label_ref,
-						  lockdep_is_held(&isec->lock)));
-		spin_unlock(&isec->lock);
-		if (!target->label)
-			return -EIO;
+		isec = backing_inode_security(file->f_path.dentry);
+		rc = selinux_inode_label_snapshot_get(isec, &snapshot);
+		if (rc)
+			return rc;
+		target->canonical_sid = snapshot.sid;
+		target->leaf_sclass = snapshot.sclass;
+		target->sid_handle = snapshot.sid_handle;
+		target->label = snapshot.label;
+		snapshot.sid_handle = NULL;
+		snapshot.label = NULL;
+		selinux_inode_label_snapshot_put(&snapshot);
 		target->view = selinux_label_view_get(fsec->view);
 		if (!target->view)
 			return -EACCES;
@@ -5782,6 +6246,7 @@ static int selinux_exec_file_label_get(
 		return 0;
 	}
 #else
+	isec = inode_security(file_inode(file));
 	target->canonical_sid = isec->sid;
 	target->leaf_sid = isec->sid;
 	target->leaf_sclass = isec->sclass;
@@ -5795,6 +6260,7 @@ static void selinux_exec_file_label_put(struct selinux_exec_file_label *target)
 	selinux_pathless_projection_put(target->projection);
 	selinux_label_view_put(target->view);
 	selinux_label_ref_put(target->label);
+	global_sid_handle_put(target->sid_handle);
 #endif
 }
 
@@ -8175,6 +8641,22 @@ out_context:
 	selinux_pathless_projection_put(context);
 	return rc;
 }
+
+static int selinux_file_kho_preserve(struct file *file)
+{
+	struct file_security_struct *fsec = selinux_file(file);
+
+	/*
+	 * memfd-luo-v2 carries data, position and seals only. Recreating the
+	 * file would bind it to the restoring task and silently discard its
+	 * canonical creator domain and sealed policy-chain identity.
+	 */
+	if (!fsec->pathless ||
+	    fsec->pathless->kind != SELINUX_PATHLESS_KIND_MEMFD ||
+	    fsec->view != fsec->pathless->view)
+		return -EACCES;
+	return -EOPNOTSUPP;
+}
 #endif
 
 static int selinux_inode_create(const struct vfsmount *mnt, struct inode *dir,
@@ -8249,7 +8731,7 @@ static int selinux_inode_follow_link(const struct vfsmount *mnt,
 	struct inode_security_struct *isec;
 #ifdef CONFIG_SECURITY_SELINUX_NS
 	const struct selinux_label_view *view;
-	struct selinux_label_ref *label;
+	struct selinux_inode_label_snapshot snapshot;
 	int rc;
 #endif
 
@@ -8263,12 +8745,12 @@ static int selinux_inode_follow_link(const struct vfsmount *mnt,
 	view = selinux_mnt_label_view(mnt);
 	if (!view)
 		return -EOPNOTSUPP;
-	label = selinux_label_ref_get_rcu(&isec->label_ref);
-	if (!label)
-		return -EIO;
-	rc = cred_label_has_perm(current_cred(), isec->sid, label, view,
-				 isec->sclass, FILE__READ, &ad);
-	selinux_label_ref_put(label);
+	rc = selinux_inode_label_snapshot_get(isec, &snapshot);
+	if (rc)
+		return rcu && rc == -ESTALE ? -ECHILD : rc;
+	rc = cred_label_has_perm(current_cred(), snapshot.sid, snapshot.label,
+				 view, snapshot.sclass, FILE__READ, &ad);
+	selinux_inode_label_snapshot_put(&snapshot);
 	return rc;
 #else
 	return cred_tsid_has_perm(current_cred(), isec->sid, isec->sclass,
@@ -8412,7 +8894,7 @@ static int selinux_inode_permission(const struct vfsmount *mnt,
 	struct common_audit_data ad;
 	const struct selinux_label_view *view = NULL;
 	struct selinux_pathless_projection *projection;
-	struct selinux_label_ref *label = NULL;
+	struct selinux_inode_label_snapshot snapshot;
 #endif
 
 	if (mnt) {
@@ -8482,18 +8964,19 @@ static int selinux_inode_permission(const struct vfsmount *mnt,
 		return -ECHILD;
 	ad.type = LSM_AUDIT_DATA_INODE;
 	ad.u.inode = inode;
-	if (view) {
-		label = selinux_label_ref_get_rcu(&isec->label_ref);
-		if (!label)
-			return -EIO;
-		rc = cred_label_has_perm_policycap(
-			current_cred(), isec->sid, label, view, isec->sclass,
-			perms, 0, 0, READ_ONCE(isec->label_source), &ad);
-		selinux_label_ref_put(label);
+	rc = selinux_inode_label_snapshot_get(isec, &snapshot);
+	if (rc)
 		return rc;
+	if (view) {
+		rc = cred_label_has_perm_policycap(
+			current_cred(), snapshot.sid, snapshot.label, view,
+			snapshot.sclass, perms, 0, 0, snapshot.source, &ad);
+	} else {
+		rc = cred_tsid_has_perm(current_cred(), snapshot.sid,
+					snapshot.sclass, perms, &ad);
 	}
-	return cred_tsid_has_perm(current_cred(), isec->sid, isec->sclass,
-				 perms, &ad);
+	selinux_inode_label_snapshot_put(&snapshot);
+	return rc;
 #else
 	rc = task_avdcache_search(tsec, isec, &avdc);
 	if (likely(!rc)) {
@@ -8537,15 +9020,15 @@ static int selinux_inode_setattr(struct mnt_idmap *idmap,
 	struct selinux_state *state;
 #endif
 	struct common_audit_data ad;
-	u32 tsid, av;
+	u32 av;
 #ifndef CONFIG_SECURITY_SELINUX_NS
-	u32 ssid, requested;
-#endif
+	u32 tsid, ssid, requested;
 	u16 sclass;
+#endif
 	int rc;
 #ifdef CONFIG_SECURITY_SELINUX_NS
 	const struct selinux_label_view *view;
-	struct selinux_label_ref *label;
+	struct selinux_inode_label_snapshot snapshot;
 #endif
 
 	/* ATTR_FORCE is just used for ATTR_KILL_S[UG]ID. */
@@ -8572,25 +9055,25 @@ static int selinux_inode_setattr(struct mnt_idmap *idmap,
 	if (unlikely(IS_PRIVATE(inode)))
 		return 0;
 	isec = selinux_inode(inode);
-	tsid = isec->sid;
-	sclass = isec->sclass;
 	av = FILE__WRITE;
 #ifdef CONFIG_SECURITY_SELINUX_NS
 	view = selinux_mnt_label_view(mnt);
 	if (!view)
 		return -EOPNOTSUPP;
-	label = selinux_label_ref_get_rcu(&isec->label_ref);
-	if (!label)
-		return -EIO;
+	rc = selinux_inode_label_snapshot_get(isec, &snapshot);
+	if (rc)
+		return rc;
 	rc = cred_label_has_perm_policycap(
-		cred, tsid, label, view, sclass, av,
+		cred, snapshot.sid, snapshot.label, view, snapshot.sclass, av,
 		inode->i_sb->s_magic != SOCKFS_MAGIC &&
 			(ia_valid & ATTR_SIZE) && !(ia_valid & ATTR_FILE) ?
 			FILE__OPEN : 0,
-		POLICYDB_CAP_OPENPERM, READ_ONCE(isec->label_source), &ad);
-	selinux_label_ref_put(label);
+		POLICYDB_CAP_OPENPERM, snapshot.source, &ad);
+	selinux_inode_label_snapshot_put(&snapshot);
 	return rc;
 #else
+	tsid = isec->sid;
+	sclass = isec->sclass;
 	do {
 		crsec = selinux_cred(cred);
 		ssid = crsec->sid;
@@ -9920,8 +10403,7 @@ static int selinux_inode_getsecurity(struct mnt_idmap *idmap,
 	struct inode_security_struct *isec;
 #ifdef CONFIG_SECURITY_SELINUX_NS
 	const struct selinux_label_view *view = NULL;
-	struct selinux_label_ref *label;
-	u32 source_sid;
+	struct selinux_inode_label_snapshot snapshot;
 #endif
 
 	/*
@@ -9945,18 +10427,13 @@ static int selinux_inode_getsecurity(struct mnt_idmap *idmap,
 #ifdef CONFIG_SECURITY_SELINUX_NS
 	if (mnt)
 		view = selinux_mnt_label_view(mnt);
-	spin_lock(&isec->lock);
-	label = selinux_label_ref_get(
-		rcu_dereference_protected(isec->label_ref,
-					  lockdep_is_held(&isec->lock)));
-	source_sid = isec->sid;
-	spin_unlock(&isec->lock);
-	if (!label)
-		return -EIO;
+	error = selinux_inode_label_snapshot_get(isec, &snapshot);
+	if (error)
+		return error;
 	error = selinux_inode_xattr_sid_for_view(
-		view, mnt != NULL, observer_state->label_domain, label,
-		source_sid, &observer_sid);
-	selinux_label_ref_put(label);
+		view, !!mnt, observer_state->label_domain, snapshot.label,
+		snapshot.sid, &observer_sid);
+	selinux_inode_label_snapshot_put(&snapshot);
 	if (error)
 		return error;
 #else
@@ -10066,7 +10543,18 @@ static void selinux_inode_getlsmprop(struct inode *inode, struct lsm_prop *prop)
 {
 	struct inode_security_struct *isec = inode_security_novalidate(inode);
 
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	struct selinux_inode_label_snapshot snapshot;
+
+	if (selinux_inode_label_snapshot_get(isec, &snapshot)) {
+		prop->selinux.secid = SECSID_NULL;
+		return;
+	}
+	prop->selinux.secid = snapshot.sid;
+	selinux_inode_label_snapshot_put(&snapshot);
+#else
 	prop->selinux.secid = isec->sid;
+#endif
 }
 
 static int selinux_inode_copy_up(const struct path *src,
@@ -10076,21 +10564,28 @@ static int selinux_inode_copy_up(const struct path *src,
 	struct cred_security_struct *crsec;
 	struct cred *new_creds = *new;
 	struct inode_security_struct *isec;
+#ifndef CONFIG_SECURITY_SELINUX_NS
 	u32 create_sid;
+#endif
 #ifdef CONFIG_SECURITY_SELINUX_NS
 	const struct mount_security_struct *src_sec, *dst_sec;
 	const struct selinux_label_view *src_view, *dst_view, *view;
+	struct selinux_copy_up_carrier *carrier = NULL;
+	struct selinux_global_sid_handle *cred_handle = NULL;
 	struct selinux_global_sid_handle *create_handle = NULL;
-	struct selinux_label_ref *label;
+	struct selinux_inode_label_snapshot snapshot;
+	struct inode *src_inode;
+	u32 create_sid;
+	bool allocated_creds = false;
 	int rc;
 #endif
 
 	if (!src || !src->mnt || !src->dentry || !dst_mnt)
 		return -EINVAL;
-	isec = inode_security(d_inode(src->dentry));
-	create_sid = isec->sid;
+	isec = backing_inode_security(src->dentry);
 
 #ifdef CONFIG_SECURITY_SELINUX_NS
+	src_inode = d_backing_inode(src->dentry);
 	src_sec = selinux_mount_security(src->mnt);
 	dst_sec = selinux_mount_security(dst_mnt);
 	if (!src_sec || !dst_sec)
@@ -10112,26 +10607,23 @@ static int selinux_inode_copy_up(const struct path *src,
 	    current_selinux_state->label_domain)
 		return -EOPNOTSUPP;
 
-	spin_lock(&isec->lock);
-	label = rcu_dereference_protected(isec->label_ref,
-					  lockdep_is_held(&isec->lock));
-	label = selinux_label_ref_get(label);
-	create_sid = isec->sid;
-	spin_unlock(&isec->lock);
-	if (!label)
-		return -EIO;
-	if (!((label->domain->flags & SELINUX_LABEL_DOMAIN_KERNEL_GLOBAL) &&
+	rc = selinux_inode_label_snapshot_get(isec, &snapshot);
+	if (rc)
+		return rc;
+	create_sid = snapshot.sid;
+	if (!((snapshot.label->domain->flags &
+	       SELINUX_LABEL_DOMAIN_KERNEL_GLOBAL) &&
 	      create_sid <= SECINITSID_NUM) &&
-	    label->domain != src_view->origin_domain) {
+	    snapshot.label->domain != src_view->origin_domain) {
 		rc = -EINVAL;
-		goto out_label;
+		goto out_snapshot;
 	}
 	view = selinux_identity_view_alloc(dst_view->owner_userns,
-					   label->domain,
+					   snapshot.label->domain,
 					   dst_view->outer_domain);
 	if (IS_ERR(view)) {
 		rc = PTR_ERR(view);
-		goto out_label;
+		goto out_snapshot;
 	}
 	if (!selinux_mnt_views_share_snapshot(src_view, view) ||
 	    !selinux_mnt_views_share_snapshot(dst_view, view)) {
@@ -10139,7 +10631,7 @@ static int selinux_inode_copy_up(const struct path *src,
 		goto out_view;
 	}
 	rc = selinux_label_view_resolve(view,
-					current_selinux_state->label_domain, label,
+					current_selinux_state->label_domain, snapshot.label,
 					create_sid, &create_sid);
 	if (!rc) {
 		/* The live view still pins the exact map target at this point. */
@@ -10151,56 +10643,109 @@ static int selinux_inode_copy_up(const struct path *src,
 	}
 out_view:
 	selinux_label_view_put(view);
-out_label:
-	selinux_label_ref_put(label);
 	if (rc)
-		return rc;
+		goto out_snapshot;
+
+	carrier = kzalloc_obj(*carrier, GFP_KERNEL_ACCOUNT);
+	if (!carrier) {
+		rc = -ENOMEM;
+		goto out_create;
+	}
+	carrier->src_view = selinux_label_view_get(src_view);
+	carrier->dst_view = selinux_label_view_get(dst_view);
+	carrier->src_inode = igrab(src_inode);
+	if (!carrier->src_view || !carrier->dst_view || !carrier->src_inode) {
+		rc = -ESTALE;
+		goto out_carrier;
+	}
+	carrier->label = snapshot.label;
+	carrier->sid_handle = snapshot.sid_handle;
+	carrier->create_handle = create_handle;
+	carrier->sid = snapshot.sid;
+	carrier->sclass = snapshot.sclass;
+	carrier->source = snapshot.source;
+	snapshot.label = NULL;
+	snapshot.sid_handle = NULL;
+	create_handle = NULL;
 #endif
 
 	if (new_creds == NULL) {
 		new_creds = prepare_creds();
 		if (!new_creds) {
 #ifdef CONFIG_SECURITY_SELINUX_NS
-			global_sid_handle_put(create_handle);
+			rc = -ENOMEM;
+			goto out_carrier;
 #endif
 			return -ENOMEM;
 		}
+#ifdef CONFIG_SECURITY_SELINUX_NS
+		allocated_creds = true;
+#endif
 	}
 
 	crsec = selinux_cred(new_creds);
 #ifdef CONFIG_SECURITY_SELINUX_NS
-	rc = selinux_cred_sid_take_handle(
-		crsec, SELINUX_CRED_CREATE_SID, create_handle);
-	create_handle = NULL;
-	if (rc) {
-		if (!*new)
-			abort_creds(new_creds);
-		return rc;
+	if (crsec->copy_up) {
+		rc = -EEXIST;
+		goto out_creds;
 	}
+	cred_handle = global_sid_handle_dup(carrier->create_handle);
+	if (IS_ERR(cred_handle)) {
+		rc = PTR_ERR(cred_handle);
+		cred_handle = NULL;
+		goto out_creds;
+	}
+	rc = selinux_cred_sid_take_handle(crsec, SELINUX_CRED_CREATE_SID,
+					  cred_handle);
+	cred_handle = NULL;
+	if (rc) {
+		goto out_creds;
+	}
+	crsec->copy_up = carrier;
+	carrier = NULL;
 #else
+	create_sid = isec->sid;
 	crsec->create_sid = create_sid;
 #endif
 	*new = new_creds;
 	return 0;
+
+#ifdef CONFIG_SECURITY_SELINUX_NS
+out_creds:
+	global_sid_handle_put(cred_handle);
+	if (allocated_creds)
+		abort_creds(new_creds);
+out_carrier:
+	selinux_copy_up_carrier_put(carrier);
+out_create:
+	global_sid_handle_put(create_handle);
+out_snapshot:
+	selinux_inode_label_snapshot_put(&snapshot);
+	return rc;
+#endif
 }
 
 static int selinux_inode_copy_up_post(const struct path *src,
 				      const struct vfsmount *dst_mnt,
-				      struct dentry *dst)
+				      struct dentry *dst,
+				      const struct cred *copy_up_cred)
 {
 #ifdef CONFIG_SECURITY_SELINUX_NS
 	const struct mount_security_struct *src_sec, *dst_sec;
 	const struct selinux_label_view *src_view, *dst_view;
+	const struct selinux_copy_up_carrier *carrier;
 	struct selinux_copy_up_assertion *assertion;
 	struct inode_security_struct *src_isec, *dst_isec;
-	struct selinux_global_sid_handle *sid_handle;
-	struct selinux_label_ref *label;
+	struct selinux_inode_label_snapshot src_snapshot, dst_snapshot;
+	struct selinux_label_ref *dst_label;
 	int rc = 0;
-	u32 sid;
-	u8 source;
 
-	if (!src || !src->mnt || !src->dentry || !dst_mnt || !dst)
+	if (!src || !src->mnt || !src->dentry || !dst_mnt || !dst ||
+	    !copy_up_cred)
 		return -EINVAL;
+	carrier = selinux_cred(copy_up_cred)->copy_up;
+	if (!carrier)
+		return -ESTALE;
 	src_sec = selinux_mount_security(src->mnt);
 	dst_sec = selinux_mount_security(dst_mnt);
 	if (!src_sec || !dst_sec)
@@ -10212,63 +10757,92 @@ static int selinux_inode_copy_up_post(const struct path *src,
 	if ((src_view->flags | dst_view->flags) &
 	    SELINUX_LABEL_VIEW_ORIGIN_UNRESOLVED)
 		return -EOPNOTSUPP;
+	if (src_view != carrier->src_view || dst_view != carrier->dst_view ||
+	    d_backing_inode(src->dentry) != carrier->src_inode)
+		return -ESTALE;
 
-	src_isec = inode_security(d_inode(src->dentry));
-	dst_isec = inode_security(d_inode(dst));
-	spin_lock(&src_isec->lock);
-	sid_handle = global_sid_handle_dup(src_isec->sid_handle);
-	if (IS_ERR(sid_handle)) {
-		rc = PTR_ERR(sid_handle);
-		sid_handle = NULL;
-		label = NULL;
-		sid = SECSID_NULL;
-	} else {
-		label = global_sid_handle_label_get(sid_handle);
-		sid = global_sid_handle_sid(sid_handle);
-		if (!label || !sid || sid != src_isec->sid ||
-		    label != rcu_dereference_protected(
-				     src_isec->label_ref,
-				     lockdep_is_held(&src_isec->lock)))
-			rc = -ESTALE;
-	}
-	source = src_isec->label_source;
-	spin_unlock(&src_isec->lock);
-	if (rc) {
-		selinux_label_ref_put(label);
-		global_sid_handle_put(sid_handle);
+	src_isec = backing_inode_security(src->dentry);
+	dst_isec = backing_inode_security(dst);
+	rc = selinux_inode_label_snapshot_get(src_isec, &src_snapshot);
+	if (rc)
 		return rc;
+	if (src_snapshot.sid_handle != carrier->sid_handle ||
+	    src_snapshot.label != carrier->label ||
+	    src_snapshot.sid != carrier->sid ||
+	    src_snapshot.sclass != carrier->sclass ||
+	    src_snapshot.source != carrier->source) {
+		rc = -ESTALE;
+		goto out_src;
 	}
-	if (!((label->domain->flags & SELINUX_LABEL_DOMAIN_KERNEL_GLOBAL) &&
-	      sid <= SECINITSID_NUM) &&
-	    label->domain != src_view->origin_domain) {
-		selinux_label_ref_put(label);
-		global_sid_handle_put(sid_handle);
-		return -EINVAL;
+	rc = selinux_inode_label_snapshot_get(dst_isec, &dst_snapshot);
+	if (rc)
+		goto out_src;
+	dst_label = global_sid_handle_label_get(carrier->create_handle);
+	if (!dst_label || dst_snapshot.sid_handle != carrier->create_handle ||
+	    dst_snapshot.label != dst_label ||
+	    dst_snapshot.sid != global_sid_handle_sid(carrier->create_handle) ||
+	    dst_snapshot.sclass != carrier->sclass) {
+		rc = -ESTALE;
+		goto out_dst_label;
 	}
 
 	assertion = kzalloc_obj(*assertion, GFP_KERNEL_ACCOUNT);
 	if (!assertion) {
-		selinux_label_ref_put(label);
-		global_sid_handle_put(sid_handle);
-		return -ENOMEM;
+		rc = -ENOMEM;
+		goto out_dst_label;
 	}
-	assertion->label = label;
-	assertion->view = selinux_label_view_get(src_view);
-	assertion->sid_handle = sid_handle;
-	assertion->sid = sid;
-	assertion->source = source;
-
-	spin_lock(&dst_isec->lock);
-	if (dst_isec->copy_up) {
-		spin_unlock(&dst_isec->lock);
+	assertion->label = selinux_label_ref_get(carrier->label);
+	assertion->view = selinux_label_view_get(carrier->src_view);
+	assertion->sid_handle = global_sid_handle_dup(carrier->sid_handle);
+	assertion->sid = carrier->sid;
+	assertion->source = carrier->source;
+	if (!assertion->label || !assertion->view ||
+	    IS_ERR(assertion->sid_handle)) {
+		rc = IS_ERR(assertion->sid_handle) ?
+			PTR_ERR(assertion->sid_handle) : -ESTALE;
+		if (IS_ERR(assertion->sid_handle))
+			assertion->sid_handle = NULL;
 		selinux_label_view_put(assertion->view);
 		selinux_label_ref_put(assertion->label);
 		global_sid_handle_put(assertion->sid_handle);
 		kfree(assertion);
-		return -EEXIST;
+		goto out_dst_label;
 	}
-	dst_isec->copy_up = assertion;
-	spin_unlock(&dst_isec->lock);
+
+	spin_lock(&dst_isec->lock);
+	if (dst_isec->initialized != LABEL_INITIALIZED ||
+	    dst_isec->sid_handle != carrier->create_handle ||
+	    dst_isec->sid != dst_snapshot.sid ||
+	    dst_isec->sclass != dst_snapshot.sclass ||
+	    rcu_dereference_protected(dst_isec->label_ref,
+				      lockdep_is_held(&dst_isec->lock)) != dst_label) {
+		spin_unlock(&dst_isec->lock);
+		rc = -ESTALE;
+	} else if (dst_isec->copy_up) {
+		spin_unlock(&dst_isec->lock);
+		rc = -EEXIST;
+	} else {
+		dst_isec->copy_up = assertion;
+		spin_unlock(&dst_isec->lock);
+		assertion = NULL;
+	}
+	if (assertion) {
+		selinux_label_view_put(assertion->view);
+		selinux_label_ref_put(assertion->label);
+		global_sid_handle_put(assertion->sid_handle);
+		kfree(assertion);
+	}
+out_dst_label:
+	selinux_label_ref_put(dst_label);
+	selinux_inode_label_snapshot_put(&dst_snapshot);
+out_src:
+	selinux_inode_label_snapshot_put(&src_snapshot);
+	return rc;
+#else
+	(void)src;
+	(void)dst_mnt;
+	(void)dst;
+	(void)copy_up_cred;
 #endif
 	return 0;
 }
@@ -10650,6 +11224,10 @@ static int selinux_file_permission(struct file *file, int mask)
 	struct file_security_struct *fsec = selinux_file(file);
 	struct inode_security_struct *isec;
 	u32 sid = current_sid();
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	struct selinux_inode_label_snapshot snapshot;
+	int rc;
+#endif
 
 	if (!mask)
 		/* No permission to check.  Existence test. */
@@ -10657,17 +11235,25 @@ static int selinux_file_permission(struct file *file, int mask)
 
 	isec = inode_security(inode);
 #ifdef CONFIG_SECURITY_SELINUX_NS
-	if (!fsec->pathless &&
-	    selinux_file_permission_cache_valid(
-		    fsec, current_cred(), file->f_cred, sid, isec->sid,
-		    selinux_chain_epoch_read(current_selinux_state)))
+	if (!fsec->pathless) {
+		rc = selinux_inode_label_snapshot_get(isec, &snapshot);
+		if (rc)
+			return rc;
+		rc = selinux_file_permission_cache_valid(
+			fsec, current_cred(), file->f_cred, sid, snapshot.sid,
+			selinux_chain_epoch_read(current_selinux_state));
+		selinux_inode_label_snapshot_put(&snapshot);
+		if (rc)
+			/* No change since file_open check. */
+			return 0;
+	}
 #else
 	if (selinux_file_permission_cache_valid(
 		    fsec, current_cred(), file->f_cred, sid, isec->sid,
 		    selinux_chain_epoch_read(current_selinux_state)))
-#endif
 		/* No change since file_open check. */
 		return 0;
+#endif
 
 	return selinux_revalidate_file_permission(file, mask);
 }
@@ -10675,10 +11261,10 @@ static int selinux_file_permission(struct file *file, int mask)
 static int selinux_file_alloc_security(struct file *file)
 {
 	struct file_security_struct *fsec = selinux_file(file);
-	u32 sid = current_sid();
+	u32 sid = selinux_cred(file->f_cred)->sid;
 
 	fsec->sid = sid;
-	fsec->cred = get_cred(current_cred());
+	fsec->fowner_cred = NULL;
 
 	return 0;
 }
@@ -10689,16 +11275,30 @@ static int selinux_backing_file_alloc(struct file *backing_file,
 	struct backing_file_security_struct *bfsec;
 	const struct file_security_struct *ufsec = selinux_file(user_file);
 	const struct selinux_label_view *view;
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	struct selinux_pathless_projection *pathless;
+#endif
 
-	if (!ufsec->view || !ufsec->cred)
+	if (!ufsec->view || !user_file->f_cred)
 		return -EACCES;
 	view = selinux_label_view_get(ufsec->view);
 	if (!view)
 		return -EIO;
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	pathless = selinux_pathless_projection_get(ufsec->pathless);
+	if (pathless && pathless->view != view) {
+		selinux_pathless_projection_put(pathless);
+		selinux_label_view_put(view);
+		return -ESTALE;
+	}
+#endif
 
 	bfsec = selinux_backing_file(backing_file);
-	bfsec->cred = get_cred(ufsec->cred);
+	bfsec->cred = get_cred(user_file->f_cred);
 	bfsec->view = view;
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	bfsec->pathless = pathless;
+#endif
 
 	return 0;
 }
@@ -10710,6 +11310,10 @@ static void selinux_backing_file_free(struct file *backing_file)
 
 	put_cred(bfsec->cred);
 	bfsec->cred = NULL;
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	selinux_pathless_projection_put(bfsec->pathless);
+	bfsec->pathless = NULL;
+#endif
 	selinux_label_view_put(bfsec->view);
 	bfsec->view = NULL;
 }
@@ -10724,7 +11328,8 @@ static void selinux_file_free_security(struct file *file)
 #endif
 	selinux_label_view_put(fsec->view);
 	fsec->view = NULL;
-	put_cred(fsec->cred);
+	put_cred(fsec->fowner_cred);
+	fsec->fowner_cred = NULL;
 }
 
 /*
@@ -10735,53 +11340,43 @@ static int ioctl_has_perm(const struct cred *cred, struct file *file,
 		u32 requested, u16 cmd)
 {
 	struct common_audit_data ad;
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	struct file_security_struct *fsec = selinux_file(file);
-#endif
 	struct inode *inode = file_inode(file);
-	struct inode_security_struct *isec;
 	struct lsm_ioctlop_audit ioctl;
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	struct selinux_label_ref *label;
-#endif
-	int rc;
 	u8 driver = cmd >> 8;
 	u8 xperm = cmd & 0xff;
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	const struct file_security_struct *fsec = selinux_file(file);
+	const struct selinux_file_operation_check check = {
+		.requested = requested,
+		.decision_kind = SELINUX_AVC_DECISION_XPERM,
+		.driver = driver,
+		.base_perm = AVC_EXT_IOCTL,
+		.xperm = xperm,
+	};
+#else
+	struct inode_security_struct *isec;
+	int rc;
+#endif
 
 	ad.type = LSM_AUDIT_DATA_IOCTL_OP;
 	ad.u.op = &ioctl;
 	ad.u.op->cmd = cmd;
 	ad.u.op->path = file->f_path;
 
-	rc = file_use_has_perm(cred, file, &ad);
-	if (rc)
-		return rc;
-
-	if (unlikely(IS_PRIVATE(inode)))
-		return 0;
-
-	isec = inode_security(inode);
 #ifdef CONFIG_SECURITY_SELINUX_NS
-	if (fsec->pathless) {
-		if (fsec->view != fsec->pathless->view)
-			return -EXDEV;
-		return cred_pathless_has_extended_perms(
-			cred, fsec->pathless, requested, driver, AVC_EXT_IOCTL,
-			xperm, &ad);
-	}
-	label = selinux_label_ref_get_rcu(&isec->label_ref);
-	if (!label)
-		return -EIO;
-	rc = cred_label_has_extended_perms(cred, isec->sid, label, fsec->view,
-					   isec->sclass, requested, driver,
-					   AVC_EXT_IOCTL, xperm, &ad);
-	selinux_label_ref_put(label);
+	return selinux_file_operation_has_perm(
+		cred, file, file->f_cred, inode, fsec->view, fsec->pathless,
+		&check, false, &ad);
 #else
+	rc = file_use_has_perm(cred, file, &ad);
+	if (rc || unlikely(IS_PRIVATE(inode)))
+		return rc;
+	isec = inode_security(inode);
 	rc = cred_has_extended_perms(cred, isec->sid, isec->sclass,
 				     requested, driver, AVC_EXT_IOCTL,
 				     xperm, &ad);
-#endif
 	return rc;
+#endif
 }
 
 static int ioctl_has_perm_cloexec(const struct cred *cred, struct file *file,
@@ -10789,118 +11384,26 @@ static int ioctl_has_perm_cloexec(const struct cred *cred, struct file *file,
 {
 #ifdef CONFIG_SECURITY_SELINUX_NS
 	const struct file_security_struct *fsec = selinux_file(file);
-	const struct selinux_pathless_projection *projection = fsec->pathless;
-	struct selinux_label_avc_scratch *scratch __free(kfree) = NULL;
-	struct selinux_avc_provenance provenance = {};
 	struct inode *inode = file_inode(file);
-	struct inode_security_struct *isec;
-	struct selinux_label_ref *label = NULL;
+	const struct selinux_file_operation_check check = {
+		.requested = FILE__IOCTL,
+		.skip_policycap = POLICYDB_CAP_IOCTL_SKIP_CLOEXEC,
+		.decision_kind = SELINUX_AVC_DECISION_XPERM,
+		.driver = cmd >> 8,
+		.base_perm = AVC_EXT_IOCTL,
+		.xperm = cmd & 0xff,
+	};
 	struct common_audit_data ad;
 	struct lsm_ioctlop_audit ioctl;
-	const struct cred *level_cred;
-	u32 tsid;
-	u16 sclass;
-	u16 count = 0;
-	u8 source;
-	int rc;
 
 	ad.type = LSM_AUDIT_DATA_IOCTL_OP;
 	ad.u.op = &ioctl;
 	ad.u.op->cmd = cmd;
 	ad.u.op->path = file->f_path;
-	rc = file_use_has_perm(cred, file, &ad);
-	if (rc || IS_PRIVATE(inode))
-		return rc;
-	scratch = kzalloc_obj(*scratch, GFP_KERNEL);
-	if (!scratch)
-		return -ENOMEM;
-
-	isec = inode_security(inode);
-	spin_lock(&isec->lock);
-	tsid = isec->sid;
-	sclass = isec->sclass;
-	source = isec->label_source;
-	if (!projection)
-		label = selinux_label_ref_get(
-			rcu_dereference_protected(isec->label_ref,
-						  lockdep_is_held(&isec->lock)));
-	spin_unlock(&isec->lock);
-	if (projection) {
-		if (fsec->view != projection->view)
-			return -EXDEV;
-		provenance.label = projection->label;
-		provenance.view = projection->view;
-		provenance.source = projection->source;
-	} else {
-		if (!label)
-			return -EIO;
-		rc = selinux_label_view_resolve_chain(
-			fsec->view, label, tsid, &scratch->resolution);
-		if (rc)
-			goto out_label;
-		provenance.label = label;
-		provenance.view = fsec->view;
-		provenance.source = source;
-	}
-
-	level_cred = cred;
-	while (level_cred) {
-		const struct cred_security_struct *crsec =
-			selinux_cred(level_cred);
-		u32 policy_tsid;
-		u16 policy_sclass = sclass;
-
-		if (count >= ARRAY_SIZE(scratch->levels)) {
-			rc = -E2BIG;
-			goto out_label;
-		}
-		if (projection) {
-			struct selinux_pathless_resolution resolved;
-
-			rc = selinux_pathless_projection_resolve_sealed(
-				projection, crsec->state->label_domain, &resolved);
-			if (rc)
-				goto out_label;
-			policy_tsid = resolved.sid;
-			policy_sclass = resolved.sclass;
-		} else {
-			const struct selinux_label_domain *domain =
-				crsec->state->label_domain;
-			u16 depth;
-
-			if (!domain) {
-				rc = -EOPNOTSUPP;
-				goto out_label;
-			}
-			depth = domain->depth;
-			if (depth > scratch->resolution.max_depth ||
-			    scratch->resolution.domain_id[depth] != domain->id ||
-			    !scratch->resolution.sid[depth]) {
-				rc = -EOPNOTSUPP;
-				goto out_label;
-			}
-			policy_tsid = scratch->resolution.sid[depth];
-		}
-		scratch->levels[count] = (struct selinux_avc_level) {
-			.state = crsec->state,
-			.ssid = crsec->sid,
-			.tsid = policy_tsid,
-			.requested = FILE__IOCTL,
-			.tclass = policy_sclass,
-			.skip_policycap = POLICYDB_CAP_IOCTL_SKIP_CLOEXEC,
-			.provenance = &provenance,
-		};
-		count++;
-		level_cred = crsec->parent_cred;
-	}
-	rc = selinux_avc_levels_has_extended_perm(
-		scratch->levels, count, cmd >> 8, AVC_EXT_IOCTL, cmd & 0xff,
-		&ad);
-out_label:
-	selinux_label_ref_put(label);
-	return rc;
+	return selinux_file_operation_has_perm(
+		cred, file, file->f_cred, inode, fsec->view, fsec->pathless,
+		&check, false, &ad);
 #else
-	const struct file_security_struct *fsec = selinux_file(file);
 	struct inode *inode = file_inode(file);
 	struct inode_security_struct *isec;
 	struct selinux_policy_chain_snapshot *chain __free(kfree) = NULL;
@@ -10911,9 +11414,9 @@ out_label:
 	u8 driver = cmd >> 8;
 	u8 xperm = cmd & 0xff;
 
-	if (!fsec->cred)
+	if (!file->f_cred)
 		return -EIO;
-	same_cred = cred_sid_chain_equal(cred, fsec->cred);
+	same_cred = cred_sid_chain_equal(cred, file->f_cred);
 	ad.type = LSM_AUDIT_DATA_IOCTL_OP;
 	ad.u.op = &ioctl;
 	ad.u.op->cmd = cmd;
@@ -10983,7 +11486,7 @@ out_label:
 				u32 opener_sid;
 
 				rc = selinux_cred_sid_for_state_checked(
-					fsec->cred, crsec->state, &opener_sid);
+					file->f_cred, crsec->state, &opener_sid);
 				if (rc)
 					break;
 
@@ -11369,10 +11872,13 @@ static int selinux_file_fcntl(struct file *file, unsigned int cmd,
 static void selinux_file_set_fowner(struct file *file)
 {
 	struct file_security_struct *fsec;
+	const struct cred *old;
 
 	fsec = selinux_file(file);
-	put_cred(fsec->cred);
-	fsec->cred = get_cred(current_cred());
+	/* The VFS holds file->f_owner->lock for write across this hook. */
+	old = fsec->fowner_cred;
+	fsec->fowner_cred = get_cred(current_cred());
+	put_cred(old);
 }
 
 static int selinux_file_send_sigiotask(struct task_struct *tsk,
@@ -11381,18 +11887,23 @@ static int selinux_file_send_sigiotask(struct task_struct *tsk,
 	struct file *file;
 	u32 perm;
 	struct file_security_struct *fsec;
+	const struct cred *fowner_cred;
 
 	/* struct fown_struct is never outside the context of a struct file */
 	file = fown->file;
 
 	fsec = selinux_file(file);
+	/* The VFS holds fown->lock for read across this hook. */
+	fowner_cred = fsec->fowner_cred;
+	if (!fowner_cred)
+		return -EIO;
 
 	if (!signum)
 		perm = signal_to_av(SIGIO); /* as per send_sigio_to_task */
 	else
 		perm = signal_to_av(signum);
 
-	return cred_task_has_perm(fsec->cred, tsk, SECCLASS_PROCESS, perm,
+	return cred_task_has_perm(fowner_cred, tsk, SECCLASS_PROCESS, perm,
 				  NULL);
 }
 
@@ -11427,14 +11938,14 @@ static int selinux_file_open(struct file *file)
 	struct selinux_state *state;
 #endif
 	struct common_audit_data ad;
-	u32 tsid, av;
+	u32 av;
 #ifndef CONFIG_SECURITY_SELINUX_NS
-	u32 ssid, requested;
-#endif
+	u32 tsid, ssid, requested;
 	u16 sclass;
+#endif
 	int rc;
 #ifdef CONFIG_SECURITY_SELINUX_NS
-	struct selinux_label_ref *label;
+	struct selinux_inode_label_snapshot snapshot;
 #endif
 
 	rc = selinux_file_bind_view(file);
@@ -11448,7 +11959,9 @@ static int selinux_file_open(struct file *file)
 	 * Task label is already saved in the file security
 	 * struct as its SID.
 	 */
+#ifndef CONFIG_SECURITY_SELINUX_NS
 	fsec->isid = isec->sid;
+#endif
 	fsec->chain_epoch = selinux_chain_epoch_read(
 		cred_selinux_state(file->f_cred));
 	/*
@@ -11468,25 +11981,34 @@ static int selinux_file_open(struct file *file)
 	ad.type = LSM_AUDIT_DATA_FILE;
 	ad.u.file = file;
 	cred = file->f_cred;
-	if (unlikely(IS_PRIVATE(inode)))
+	if (unlikely(IS_PRIVATE(inode))) {
+#ifdef CONFIG_SECURITY_SELINUX_NS
+		fsec->isid = READ_ONCE(isec->sid);
+#endif
 		return 0;
-	tsid = isec->sid;
-	sclass = isec->sclass;
+	}
 	av = file_to_av(file);
 #ifdef CONFIG_SECURITY_SELINUX_NS
-	if (fsec->pathless)
+	if (fsec->pathless) {
+		fsec->isid = isec->sid;
 		return selinux_pathless_file_open_has_perm(
 			cred, fsec->pathless, inode, av, &ad);
-	label = selinux_label_ref_get_rcu(&isec->label_ref);
-	if (!label)
-		return -EIO;
+	}
+	if (!fsec->view)
+		return -EOPNOTSUPP;
+	rc = selinux_inode_label_snapshot_get(isec, &snapshot);
+	if (rc)
+		return rc;
+	fsec->isid = snapshot.sid;
 	rc = cred_label_has_perm_policycap(
-		cred, tsid, label, fsec->view, sclass, av,
+		cred, snapshot.sid, snapshot.label, fsec->view, snapshot.sclass, av,
 		inode->i_sb->s_magic != SOCKFS_MAGIC ? FILE__OPEN : 0,
-		POLICYDB_CAP_OPENPERM, READ_ONCE(isec->label_source), &ad);
-	selinux_label_ref_put(label);
+		POLICYDB_CAP_OPENPERM, snapshot.source, &ad);
+	selinux_inode_label_snapshot_put(&snapshot);
 	return rc;
 #else
+	tsid = isec->sid;
+	sclass = isec->sclass;
 	do {
 		crsec = selinux_cred(cred);
 		ssid = crsec->sid;
@@ -11544,6 +12066,8 @@ static void selinux_cred_free(struct cred *cred)
 	struct cred_security_struct *crsec = selinux_cred(cred);
 
 #ifdef CONFIG_SECURITY_SELINUX_NS
+	selinux_copy_up_carrier_put(crsec->copy_up);
+	crsec->copy_up = NULL;
 	selinux_cred_sid_handles_put(crsec);
 #endif
 	put_selinux_state(crsec->state);
@@ -11562,6 +12086,9 @@ static int selinux_cred_prepare(struct cred *new, const struct cred *old,
 
 
 	*crsec = *old_crsec;
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	crsec->copy_up = NULL;
+#endif
 	crsec->state = get_selinux_state(old_crsec->state);
 	if (old_crsec->parent_cred)
 		crsec->parent_cred = get_cred(old_crsec->parent_cred);
@@ -11581,6 +12108,9 @@ static void selinux_cred_transfer(struct cred *new, const struct cred *old)
 	struct cred_security_struct *crsec = selinux_cred(new);
 
 	*crsec = *old_crsec;
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	crsec->copy_up = NULL;
+#endif
 	crsec->state = get_selinux_state(old_crsec->state);
 	if (old_crsec->parent_cred)
 		crsec->parent_cred = get_cred(old_crsec->parent_cred);
@@ -11790,36 +12320,32 @@ static int selinux_prop_ref_capture(struct lsm_prop_ref *ref,
 	case LSM_PROP_REF_INODE_OBJ: {
 		struct inode_security_struct *isec =
 			inode_security_novalidate(source->inode);
+		struct selinux_inode_label_snapshot snapshot;
 		struct selinux_pathless_projection *projection;
-		struct selinux_global_sid_handle *handle;
 
-		spin_lock(&isec->lock);
-		sid = isec->sid;
-		projection = rcu_dereference_protected(
-			isec->pathless, lockdep_is_held(&isec->lock));
+		rc = selinux_inode_label_snapshot_get(isec, &snapshot);
+		if (rc)
+			return rc;
+		sid = snapshot.sid;
+		projection = selinux_inode_pathless_get(isec);
 		if (projection) {
 			if (projection->sid != sid ||
+			    projection->sid_handle != snapshot.sid_handle ||
+			    projection->label != snapshot.label ||
 			    global_sid_handle_sid(projection->sid_handle) != sid) {
-				spin_unlock(&isec->lock);
+				selinux_pathless_projection_put(projection);
+				selinux_inode_label_snapshot_put(&snapshot);
 				return -ESTALE;
 			}
-			rsec->projection =
-				selinux_pathless_projection_get(projection);
+			rsec->projection = projection;
 			rsec->kind = SELINUX_PROP_REF_PATHLESS;
-			spin_unlock(&isec->lock);
+			selinux_inode_label_snapshot_put(&snapshot);
 			break;
 		}
-		handle = isec->sid_handle;
-		if (!handle || global_sid_handle_sid(handle) != sid) {
-			spin_unlock(&isec->lock);
-			return -ESTALE;
-		}
-		handle = global_sid_handle_dup(handle);
-		spin_unlock(&isec->lock);
-		if (IS_ERR(handle))
-			return PTR_ERR(handle);
-		rsec->handle = handle;
+		rsec->handle = snapshot.sid_handle;
+		snapshot.sid_handle = NULL;
 		rsec->kind = SELINUX_PROP_REF_HANDLE;
+		selinux_inode_label_snapshot_put(&snapshot);
 		break;
 	}
 	case LSM_PROP_REF_IPC_OBJ: {
@@ -12174,19 +12700,65 @@ static int selinux_kernel_create_files_as(struct cred *new, struct inode *inode)
 	struct cred_security_struct *crsec = selinux_cred(new);
 	int ret;
 
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	const struct cred_security_struct *actor = selinux_cred(current_cred());
+	const struct selinux_label_view *view;
+	struct selinux_label_domain *origin;
+	struct selinux_global_sid_handle *create_handle;
+	struct selinux_inode_label_snapshot snapshot;
+	u32 create_sid;
+
+	ret = selinux_inode_label_snapshot_get(isec, &snapshot);
+	if (ret)
+		return ret;
+	if (!actor->state || !actor->state->label_domain ||
+	    crsec->state != actor->state) {
+		ret = -EXDEV;
+		goto out_snapshot;
+	}
+	origin = snapshot.label->domain->flags &
+			 SELINUX_LABEL_DOMAIN_KERNEL_GLOBAL ?
+		 actor->state->label_domain : snapshot.label->domain;
+	view = selinux_identity_view_alloc_gfp(
+		actor->state->label_domain->owner_userns, origin,
+		actor->state->label_domain, GFP_KERNEL);
+	if (IS_ERR(view)) {
+		ret = PTR_ERR(view);
+		goto out_snapshot;
+	}
+	ret = cred_label_has_perm_policycap(
+		current_cred(), snapshot.sid, snapshot.label, view,
+		SECCLASS_KERNEL_SERVICE, KERNEL_SERVICE__CREATE_FILES_AS,
+		0, 0, snapshot.source, NULL);
+	if (ret)
+		goto out_view;
+	ret = selinux_label_view_resolve(
+		view, crsec->state->label_domain, snapshot.label, snapshot.sid,
+		&create_sid);
+	if (ret)
+		goto out_view;
+	create_handle = global_sid_handle_get(create_sid);
+	if (IS_ERR(create_handle)) {
+		ret = PTR_ERR(create_handle);
+		goto out_view;
+	}
+	ret = selinux_cred_sid_take_handle(
+		crsec, SELINUX_CRED_CREATE_SID, create_handle);
+out_view:
+	selinux_label_view_put(view);
+out_snapshot:
+	selinux_inode_label_snapshot_put(&snapshot);
+	return ret;
+#else
 	ret = cred_tsid_has_perm(current_cred(), isec->sid,
 				SECCLASS_KERNEL_SERVICE,
 				KERNEL_SERVICE__CREATE_FILES_AS,
 				NULL);
 	if (ret == 0) {
-#ifdef CONFIG_SECURITY_SELINUX_NS
-		ret = selinux_cred_sid_set(
-			crsec, SELINUX_CRED_CREATE_SID, isec->sid);
-#else
 		crsec->create_sid = isec->sid;
-#endif
 	}
 	return ret;
+#endif
 }
 
 static int selinux_kernel_module_request(char *kmod_name)
@@ -12203,13 +12775,16 @@ static int selinux_kernel_module_request(char *kmod_name)
 static int selinux_kernel_load_from_file(struct file *file, u32 requested)
 {
 	struct common_audit_data ad;
-	struct inode_security_struct *isec;
 	const struct cred *cred = current_cred();
 #ifdef CONFIG_SECURITY_SELINUX_NS
-	struct file_security_struct *fsec;
-	struct selinux_label_ref *label;
-#endif
+	const struct selinux_file_operation_check check = {
+		.requested = requested,
+		.tclass = SECCLASS_SYSTEM,
+	};
+#else
+	struct inode_security_struct *isec;
 	int rc;
+#endif
 
 	if (file == NULL)
 		return cred_self_has_perm(cred, SECCLASS_SYSTEM, requested,
@@ -12218,27 +12793,17 @@ static int selinux_kernel_load_from_file(struct file *file, u32 requested)
 	ad.type = LSM_AUDIT_DATA_FILE;
 	ad.u.file = file;
 
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	const struct file_security_struct *fsec = selinux_file(file);
+
+	return selinux_file_operation_has_perm(
+		cred, file, file->f_cred, file_inode(file), fsec->view,
+		fsec->pathless, &check, false, &ad);
+#else
 	rc = file_use_has_perm(cred, file, &ad);
 	if (rc)
 		return rc;
-
 	isec = inode_security(file_inode(file));
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	fsec = selinux_file(file);
-	if (fsec->pathless) {
-		if (fsec->view != fsec->pathless->view)
-			return -EXDEV;
-		return cred_pathless_has_perm_class(
-			cred, fsec->pathless, SECCLASS_SYSTEM, requested, &ad);
-	}
-	label = selinux_label_ref_get_rcu(&isec->label_ref);
-	if (!label)
-		return -EIO;
-	rc = cred_label_has_perm(cred, isec->sid, label, fsec->view,
-				 SECCLASS_SYSTEM, requested, &ad);
-	selinux_label_ref_put(label);
-	return rc;
-#else
 	return cred_tsid_has_perm(cred, isec->sid, SECCLASS_SYSTEM, requested,
 				  &ad);
 #endif
@@ -12775,23 +13340,6 @@ static int selinux_peer_sources_sid(
 	return selinux_peer_sources_resolve(sources, state, NULL, NULL, sid);
 }
 
-#ifdef CONFIG_SECURITY_SELINUX_NS
-static struct selinux_global_sid_handle *
-selinux_peer_sources_handle(const struct selinux_peer_sources *sources,
-			    struct selinux_state *state, u32 *sid)
-{
-	u32 xfrm_sid, nlbl_sid;
-	int err;
-
-	err = selinux_peer_sources_resolve(sources, state, &nlbl_sid,
-					   &xfrm_sid, NULL);
-	if (err)
-		return ERR_PTR(err);
-	return security_net_peersid_resolve_handle(
-		state, nlbl_sid, sources->netlabel.type, xfrm_sid, sid);
-}
-#endif
-
 /**
  * selinux_skb_peerlbl_sid - Determine the peer label of a packet
  * @skb: the packet
@@ -13068,6 +13616,8 @@ static void selinux_sk_peer_provenance_replace(
 }
 
 #define SELINUX_NET_AVC_CHECKS_PER_POLICY 4
+/* SCTP may validate base, old peer, XFRM, new subject, and new peer carriers. */
+#define SELINUX_NET_AVC_PROVENANCE_CACHE_SIZE 5
 #define SELINUX_NET_AVC_MAX_CHECKS \
 	(SELINUX_NET_AVC_CHECKS_PER_POLICY * \
 	 (SELINUX_LABEL_RESOLUTION_MAX_DEPTH + 1))
@@ -13076,27 +13626,166 @@ static_assert(SELINUX_NET_AVC_MAX_CHECKS <=
 	      SELINUX_AVC_TRANSACTION_MAX_CHECKS);
 
 struct selinux_net_avc_transaction {
+	struct {
+		const struct selinux_net_provenance *carrier;
+		struct selinux_label_resolution resolution;
+	} resolved[SELINUX_NET_AVC_PROVENANCE_CACHE_SIZE];
 	struct selinux_avc_transaction_workspace *workspace;
+	struct selinux_avc_level *dynamic_levels;
+	struct selinux_policy_snapshot *dynamic_snapshots;
+	struct selinux_global_sid_handle **dynamic_handles;
+	struct selinux_label_ref **dynamic_labels;
+	struct selinux_avc_provenance *dynamic_provenance;
+	u16 dynamic_capacity;
 	struct selinux_avc_level levels[SELINUX_NET_AVC_MAX_CHECKS];
 	struct selinux_policy_snapshot snapshots[SELINUX_NET_AVC_MAX_CHECKS];
 	struct selinux_global_sid_handle *handles[SELINUX_NET_AVC_MAX_CHECKS];
 	struct selinux_label_ref *labels[SELINUX_NET_AVC_MAX_CHECKS];
 	struct selinux_avc_provenance provenance[SELINUX_NET_AVC_MAX_CHECKS];
+	u8 resolved_count;
 	u16 count;
 };
+
+static u16 selinux_net_avc_transaction_capacity(
+	const struct selinux_net_avc_transaction *transaction)
+{
+	return transaction->dynamic_capacity ?: ARRAY_SIZE(transaction->levels);
+}
+
+static struct selinux_avc_level *selinux_net_avc_transaction_levels(
+	struct selinux_net_avc_transaction *transaction)
+{
+	return transaction->dynamic_levels ?: transaction->levels;
+}
+
+static struct selinux_policy_snapshot *selinux_net_avc_transaction_snapshots(
+	struct selinux_net_avc_transaction *transaction)
+{
+	return transaction->dynamic_snapshots ?: transaction->snapshots;
+}
+
+static struct selinux_global_sid_handle **
+selinux_net_avc_transaction_handles(
+	struct selinux_net_avc_transaction *transaction)
+{
+	return transaction->dynamic_handles ?: transaction->handles;
+}
+
+static struct selinux_label_ref **selinux_net_avc_transaction_labels(
+	struct selinux_net_avc_transaction *transaction)
+{
+	return transaction->dynamic_labels ?: transaction->labels;
+}
+
+static struct selinux_avc_provenance *selinux_net_avc_transaction_provenance(
+	struct selinux_net_avc_transaction *transaction)
+{
+	return transaction->dynamic_provenance ?: transaction->provenance;
+}
 
 static void selinux_net_avc_transaction_reset(
 	struct selinux_net_avc_transaction *transaction)
 {
+	struct selinux_global_sid_handle **handles =
+		selinux_net_avc_transaction_handles(transaction);
+	struct selinux_label_ref **labels =
+		selinux_net_avc_transaction_labels(transaction);
 	u16 i;
 
 	for (i = 0; i < transaction->count; i++) {
-		selinux_label_ref_put(transaction->labels[i]);
-		global_sid_handle_put(transaction->handles[i]);
-		transaction->labels[i] = NULL;
-		transaction->handles[i] = NULL;
+		selinux_label_ref_put(labels[i]);
+		global_sid_handle_put(handles[i]);
+		labels[i] = NULL;
+		handles[i] = NULL;
 	}
+	transaction->resolved_count = 0;
 	transaction->count = 0;
+}
+
+/*
+ * A native network-policy handle already belongs to the policy which produced
+ * it.  Prove in O(1) that the policy domain is covered by the immutable view;
+ * translating that same native label through every boundary would both reject
+ * intermediate domains and turn a d-policy operation into Theta(d squared).
+ */
+static bool selinux_net_view_contains_domain(
+	const struct selinux_label_view *view,
+	const struct selinux_label_domain *domain)
+{
+	const struct selinux_label_domain *deepest;
+	const struct selinux_label_map *map;
+	u16 depth;
+
+	if (!view || !view->origin_domain || !view->outer_domain || !domain)
+		return false;
+	deepest = view->origin_domain;
+	if (view->outer_domain->depth > deepest->depth)
+		deepest = view->outer_domain;
+	depth = domain->depth;
+	if (deepest->depth != view->map_count || depth > deepest->depth)
+		return false;
+	if (domain == deepest)
+		return true;
+	if (!view->map_count)
+		return false;
+	if (!depth)
+		return view->maps[0] && view->maps[0]->parent == domain;
+	map = view->maps[depth - 1];
+	return map && map->child_domain_id == domain->id &&
+	       map->parent == domain->parent;
+}
+
+/* Resolve each immutable carrier once per whole network attempt. */
+static int selinux_net_avc_transaction_provenance_sid(
+	struct selinux_net_avc_transaction *transaction,
+	const struct selinux_net_provenance *provenance,
+	const struct selinux_label_domain *domain, u32 *sid)
+{
+	struct selinux_label_resolution *resolution = NULL;
+	struct selinux_label_ref *label;
+	u8 i;
+	int rc;
+
+	if (!transaction || !provenance || !provenance->subject ||
+	    !provenance->subject->label || !provenance->subject->sid_handle ||
+	    !provenance->view || !domain || !sid)
+		return -EOPNOTSUPP;
+	if (global_sid_handle_sid(provenance->subject->sid_handle) !=
+	    provenance->subject->sid)
+		return -ESTALE;
+	for (i = 0; i < transaction->resolved_count; i++) {
+		if (transaction->resolved[i].carrier == provenance) {
+			resolution = &transaction->resolved[i].resolution;
+			break;
+		}
+	}
+	if (!resolution) {
+		if (transaction->resolved_count >= ARRAY_SIZE(transaction->resolved))
+			return -E2BIG;
+		label = global_sid_handle_label_get(provenance->subject->sid_handle);
+		if (!label)
+			return -ESTALE;
+		if (label != provenance->subject->label) {
+			selinux_label_ref_put(label);
+			return -ESTALE;
+		}
+		selinux_label_ref_put(label);
+		resolution =
+			&transaction->resolved[transaction->resolved_count].resolution;
+		rc = selinux_label_view_resolve_chain(
+			provenance->view, provenance->subject->label,
+			provenance->subject->sid, resolution);
+		if (rc)
+			return rc;
+		transaction->resolved[transaction->resolved_count].carrier = provenance;
+		transaction->resolved_count++;
+	}
+	if (domain->depth > resolution->max_depth ||
+	    resolution->domain_id[domain->depth] != domain->id ||
+	    !resolution->sid[domain->depth])
+		return -EOPNOTSUPP;
+	*sid = resolution->sid[domain->depth];
+	return 0;
 }
 
 /* Consume @handle only after every overflow check has succeeded. */
@@ -13106,16 +13795,22 @@ static int selinux_net_avc_transaction_add(
 	const struct selinux_policy_snapshot *snapshot,
 	struct selinux_global_sid_handle *handle)
 {
+	struct selinux_global_sid_handle **handles =
+		selinux_net_avc_transaction_handles(transaction);
+	struct selinux_policy_snapshot *snapshots =
+		selinux_net_avc_transaction_snapshots(transaction);
+	struct selinux_avc_level *levels =
+		selinux_net_avc_transaction_levels(transaction);
 	u16 next;
 
 	if (check_add_overflow(transaction->count, (u16)1, &next) ||
-	    next > ARRAY_SIZE(transaction->levels)) {
+	    next > selinux_net_avc_transaction_capacity(transaction)) {
 		global_sid_handle_put(handle);
 		return -E2BIG;
 	}
-	transaction->levels[transaction->count] = *level;
-	transaction->snapshots[transaction->count] = *snapshot;
-	transaction->handles[transaction->count] = handle;
+	levels[transaction->count] = *level;
+	snapshots[transaction->count] = *snapshot;
+	handles[transaction->count] = handle;
 	transaction->count = next;
 	return 0;
 }
@@ -13127,9 +13822,12 @@ static int selinux_net_avc_transaction_add_handle(
 	struct selinux_global_sid_handle *handle,
 	const struct selinux_label_view *view, u8 source)
 {
+	struct selinux_avc_provenance *provenance =
+		selinux_net_avc_transaction_provenance(transaction);
+	struct selinux_label_ref **labels =
+		selinux_net_avc_transaction_labels(transaction);
 	struct selinux_label_ref *label;
 	struct selinux_avc_level canonical = *level;
-	u32 resolved_sid;
 	u16 index = transaction->count;
 	int rc;
 
@@ -13146,31 +13844,33 @@ static int selinux_net_avc_transaction_add_handle(
 		global_sid_handle_put(handle);
 		return -ESTALE;
 	}
-	rc = selinux_label_view_resolve(view, level->state->label_domain, label,
-					level->tsid, &resolved_sid);
-	if (rc || resolved_sid != level->tsid) {
+	if (((!(label->domain->flags & SELINUX_LABEL_DOMAIN_KERNEL_GLOBAL) ||
+	       level->tsid > SECINITSID_NUM) &&
+	      label->domain != level->state->label_domain) ||
+	    !selinux_net_view_contains_domain(view,
+					      level->state->label_domain)) {
 		selinux_label_ref_put(label);
 		global_sid_handle_put(handle);
-		return rc ?: -ESTALE;
+		return -EXDEV;
 	}
-	if (index >= ARRAY_SIZE(transaction->provenance)) {
+	if (index >= selinux_net_avc_transaction_capacity(transaction)) {
 		selinux_label_ref_put(label);
 		global_sid_handle_put(handle);
 		return -E2BIG;
 	}
-	transaction->provenance[index] = (struct selinux_avc_provenance) {
+	provenance[index] = (struct selinux_avc_provenance) {
 		.label = label,
 		.view = view,
 		.source = source,
 	};
-	canonical.provenance = &transaction->provenance[index];
+	canonical.provenance = &provenance[index];
 	rc = selinux_net_avc_transaction_add(
 		transaction, &canonical, snapshot, handle);
 	if (rc) {
 		selinux_label_ref_put(label);
 		return rc;
 	}
-	transaction->labels[index] = label;
+	labels[index] = label;
 	return 0;
 }
 
@@ -13180,6 +13880,10 @@ static int selinux_net_avc_transaction_add_provenance(
 	const struct selinux_policy_snapshot *snapshot,
 	const struct selinux_net_provenance *provenance)
 {
+	struct selinux_avc_provenance *audit_provenance =
+		selinux_net_avc_transaction_provenance(transaction);
+	struct selinux_label_ref **labels =
+		selinux_net_avc_transaction_labels(transaction);
 	struct selinux_global_sid_handle *handle;
 	struct selinux_label_ref *label;
 	struct selinux_avc_level canonical = *level;
@@ -13207,28 +13911,27 @@ static int selinux_net_avc_transaction_add_provenance(
 		rc = -ESTALE;
 		goto out_label;
 	}
-	rc = selinux_label_view_resolve(
-		provenance->view, level->state->label_domain, label,
-		provenance->subject->sid, &resolved_sid);
+	rc = selinux_net_avc_transaction_provenance_sid(
+		transaction, provenance, level->state->label_domain, &resolved_sid);
 	if (rc || resolved_sid != level->tsid) {
 		rc = rc ?: -ESTALE;
 		goto out_label;
 	}
-	if (index >= ARRAY_SIZE(transaction->provenance))
+	if (index >= selinux_net_avc_transaction_capacity(transaction))
 		goto out_too_big;
-	transaction->provenance[index] = (struct selinux_avc_provenance) {
+	audit_provenance[index] = (struct selinux_avc_provenance) {
 		.label = label,
 		.view = provenance->view,
 		.source = provenance->subject->source,
 	};
-	canonical.provenance = &transaction->provenance[index];
+	canonical.provenance = &audit_provenance[index];
 	rc = selinux_net_avc_transaction_add(
 		transaction, &canonical, snapshot, handle);
 	if (rc) {
 		selinux_label_ref_put(label);
 		return rc;
 	}
-	transaction->labels[index] = label;
+	labels[index] = label;
 	return 0;
 
 out_too_big:
@@ -13238,6 +13941,66 @@ out_label:
 out_handle:
 	global_sid_handle_put(handle);
 	return rc;
+}
+
+static int selinux_net_avc_transaction_peer_sources_resolve(
+	struct selinux_net_avc_transaction *transaction,
+	const struct selinux_peer_sources *sources, struct selinux_state *state,
+	u32 *netlabel_sid, u32 *xfrm_sid_out, u32 *peer_sid)
+{
+	u32 xfrm_sid = SECSID_NULL;
+	u32 nlbl_sid;
+	int rc;
+
+	if (!transaction || !sources || !state || !state->label_domain)
+		return -EOPNOTSUPP;
+	rc = selinux_netlbl_source_sid(state, &sources->netlabel, &nlbl_sid);
+	if (rc)
+		return rc;
+	if (sources->xfrm) {
+		rc = selinux_net_avc_transaction_provenance_sid(
+			transaction, sources->xfrm, state->label_domain, &xfrm_sid);
+		if (rc)
+			return rc;
+	}
+	if (peer_sid) {
+		rc = security_net_peersid_resolve(state, nlbl_sid,
+					  sources->netlabel.type, xfrm_sid,
+					  peer_sid);
+		if (rc)
+			return rc;
+	}
+	if (netlabel_sid)
+		*netlabel_sid = nlbl_sid;
+	if (xfrm_sid_out)
+		*xfrm_sid_out = xfrm_sid;
+	return 0;
+}
+
+static int selinux_net_avc_transaction_peer_sources_sid(
+	struct selinux_net_avc_transaction *transaction,
+	const struct selinux_peer_sources *sources, struct selinux_state *state,
+	u32 *sid)
+{
+	return selinux_net_avc_transaction_peer_sources_resolve(
+		transaction, sources, state, NULL, NULL, sid);
+}
+
+static struct selinux_global_sid_handle *
+selinux_net_avc_transaction_peer_sources_handle(
+	struct selinux_net_avc_transaction *transaction,
+	const struct selinux_peer_sources *sources, struct selinux_state *state,
+	u32 *sid)
+{
+	u32 xfrm_sid, nlbl_sid;
+	int rc;
+
+	rc = selinux_net_avc_transaction_peer_sources_resolve(
+		transaction, sources, state, &nlbl_sid, &xfrm_sid, NULL);
+	if (rc)
+		return ERR_PTR(rc);
+	return security_net_peersid_resolve_handle(
+		state, nlbl_sid, sources->netlabel.type, xfrm_sid, sid);
 }
 
 /* Keep a policy generation in the atomic validation set when it has no ACL. */
@@ -13263,8 +14026,37 @@ static int selinux_net_avc_transaction_decide(
 	if (!transaction->workspace)
 		return -ENOMEM;
 	return selinux_avc_transaction_has_perm_workspace(
-		transaction->levels, transaction->snapshots,
+		selinux_net_avc_transaction_levels(transaction),
+		selinux_net_avc_transaction_snapshots(transaction),
 		transaction->count, ad, transaction->workspace);
+}
+
+static int selinux_net_provenance_projection_matches(
+	struct selinux_net_avc_transaction *transaction,
+	const struct selinux_net_provenance *candidate,
+	const struct selinux_policy_state_chain_snapshot *chain,
+	const u32 *expected)
+{
+	u16 i;
+
+	for (i = 0; i < chain->count; i++) {
+		u32 resolved;
+		int rc;
+
+		if (!candidate) {
+			if (expected[i] != SECSID_NULL)
+				return -EACCES;
+			continue;
+		}
+		rc = selinux_net_avc_transaction_provenance_sid(
+			transaction, candidate, chain->state[i]->label_domain,
+			&resolved);
+		if (rc)
+			return rc;
+		if (resolved != expected[i])
+			return -EACCES;
+	}
+	return 0;
 }
 
 static int selinux_net_provenances_has_perm(
@@ -13379,7 +14171,9 @@ out:
 
 #ifdef CONFIG_SECURITY_SELINUX_NS
 static int selinux_skb_secmark_sid(const struct sk_buff *skb,
-				   struct selinux_state *state, u32 *sid)
+				   struct selinux_state *state,
+				   struct selinux_net_avc_transaction *transaction,
+				   u32 *sid)
 {
 	const struct selinux_net_provenance *provenance =
 		skb->secmark_provenance;
@@ -13395,9 +14189,8 @@ static int selinux_skb_secmark_sid(const struct sk_buff *skb,
 	    !provenance->view || !provenance->subject ||
 	    !provenance->subject->label)
 		return -EOPNOTSUPP;
-	return selinux_label_view_resolve(
-		provenance->view, state->label_domain, provenance->subject->label,
-		projected, sid);
+	return selinux_net_avc_transaction_provenance_sid(
+		transaction, provenance, state->label_domain, sid);
 }
 #endif
 
@@ -14005,110 +14798,12 @@ static int selinux_socket_socketpair(struct socket *socka,
    Need to determine whether we should perform a name_bind
    permission check between the socket and the port number. */
 
-static int cred_port_has_perm(const struct cred *cred, struct sock *sk,
-			      u32 socket_sid, u8 protocol, u16 port,
-			      u16 tclass, u32 requested,
+#ifndef CONFIG_SECURITY_SELINUX_NS
+static int cred_port_has_perm(const struct cred *cred,
+			      struct sock *sk, u32 socket_sid, u8 protocol,
+			      u16 port, u16 tclass, u32 requested,
 			      struct common_audit_data *ad)
 {
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	struct sk_security_struct *sksec = selinux_sock(sk);
-	struct {
-		struct selinux_policy_chain_snapshot chain;
-		struct selinux_net_avc_transaction transaction;
-	} *scratch __free(kfree) = NULL;
-	struct selinux_avc_transaction_workspace *workspace __free(kvfree) = NULL;
-	struct selinux_policy_chain_snapshot *chain;
-	struct selinux_label_resolution resolution;
-	struct selinux_net_provenance *provenance;
-	unsigned int retry;
-	int rc;
-
-	provenance = selinux_net_provenance_get_rcu(&sksec->provenance);
-	if (!provenance || provenance->state != sksec->state ||
-	    provenance->subject->sid != socket_sid) {
-		selinux_net_provenance_put(provenance);
-		return -EACCES;
-	}
-	rc = selinux_label_view_resolve_chain(
-		provenance->view, provenance->subject->label,
-		provenance->subject->sid, &resolution);
-	if (rc)
-		goto out_provenance;
-	scratch = kzalloc_obj(*scratch, GFP_KERNEL);
-	if (!scratch) {
-		rc = -ENOMEM;
-		goto out_provenance;
-	}
-	chain = &scratch->chain;
-	workspace = selinux_avc_transaction_workspace_alloc(
-		SELINUX_NET_AVC_MAX_CHECKS, GFP_KERNEL);
-	if (!workspace) {
-		rc = -ENOMEM;
-		goto out_provenance;
-	}
-	scratch->transaction.workspace = workspace;
-
-	for (retry = 0; retry < SELINUX_POLICY_OPERATION_RETRIES; retry++) {
-		u16 i;
-
-		selinux_net_avc_transaction_reset(&scratch->transaction);
-		rc = selinux_policy_chain_snapshot_read(cred, chain);
-		if (rc == -EAGAIN || rc == -ESTALE)
-			continue;
-		if (rc)
-			goto out_provenance;
-		for (i = 0; i < chain->count; i++) {
-			const struct cred_security_struct *crsec =
-				selinux_cred(chain->cred[i]);
-			const struct selinux_policy_snapshot *snapshot =
-				&chain->policy[i];
-			const struct selinux_label_domain *domain =
-				crsec->state->label_domain;
-			struct selinux_global_sid_handle *port_handle;
-			u32 port_sid;
-			u16 sclass;
-
-			if (!domain || domain->depth > resolution.max_depth ||
-			    resolution.domain_id[domain->depth] != domain->id ||
-			    !resolution.sid[domain->depth]) {
-				rc = -EOPNOTSUPP;
-				break;
-			}
-			port_handle = sel_netport_sid_snapshot_handle(
-				crsec->state, snapshot, protocol, port, &port_sid);
-			if (IS_ERR(port_handle)) {
-				rc = PTR_ERR(port_handle);
-				break;
-			}
-			sclass = socket_class_for_snapshot(
-				snapshot, sk->sk_family, sk->sk_type, sk->sk_protocol);
-			rc = selinux_net_avc_transaction_add_handle(
-				&scratch->transaction,
-				&(struct selinux_avc_level) {
-					.state = crsec->state,
-					.ssid = resolution.sid[domain->depth],
-					.tsid = port_sid,
-					.requested = requested,
-					.tclass = sclass,
-				}, snapshot, port_handle, provenance->view,
-				SELINUX_LABEL_SOURCE_SECURITY_CONTEXT);
-			if (rc)
-				break;
-		}
-		if (!rc)
-			rc = selinux_net_avc_transaction_decide(
-				&scratch->transaction, ad);
-		if (rc == -ESTALE)
-			continue;
-		goto out_provenance;
-	}
-	rc = -ESTALE;
-out_provenance:
-	if (scratch)
-		selinux_net_avc_transaction_reset(&scratch->transaction);
-	selinux_net_provenance_put(provenance);
-	return rc;
-#else
 	struct cred_security_struct *crsec;
 	struct selinux_state *state;
 	u32 port_sid;
@@ -14132,71 +14827,262 @@ out_provenance:
 	} while (cred);
 
 	return 0;
-#endif
 }
+#endif
 
 #ifdef CONFIG_SECURITY_SELINUX_NS
-static int selinux_socket_node_has_perm(const struct cred *cred, struct sock *sk,
-					const void *addr, u16 family,
-					u32 requested,
-					struct common_audit_data *ad)
+enum selinux_socket_address_operation {
+	SELINUX_SOCKET_ADDRESS_BIND,
+	SELINUX_SOCKET_ADDRESS_CONNECT,
+};
+
+struct selinux_socket_address_check {
+	struct sockaddr *address;
+	const void *node;
+	u16 family;
+	u16 port;
+	bool check_port;
+	bool check_node;
+};
+
+static int selinux_socket_address_prepare(
+	struct sock *sk, enum selinux_socket_address_operation operation,
+	struct sockaddr *address, int addrlen,
+	struct selinux_socket_address_check *check)
 {
+	struct sk_security_struct *sksec = selinux_sock(sk);
+	struct sockaddr_in *addr4;
+	struct sockaddr_in6 *addr6;
+	u16 family;
+
+	memset(check, 0, sizeof(*check));
+	check->address = address;
+	if (operation == SELINUX_SOCKET_ADDRESS_BIND &&
+	    sk->sk_family != PF_INET && sk->sk_family != PF_INET6)
+		return 0;
+	if (addrlen < offsetofend(struct sockaddr, sa_family))
+		return -EINVAL;
+	family = address->sa_family;
+	if (operation == SELINUX_SOCKET_ADDRESS_CONNECT &&
+	    family == AF_UNSPEC)
+		return 0;
+	if (operation == SELINUX_SOCKET_ADDRESS_CONNECT &&
+	    sksec->sclass != SECCLASS_TCP_SOCKET &&
+	    sksec->sclass != SECCLASS_SCTP_SOCKET)
+		return 0;
+
+	switch (family) {
+	case AF_UNSPEC:
+	case AF_INET:
+		if (addrlen < sizeof(*addr4))
+			return -EINVAL;
+		addr4 = (struct sockaddr_in *)address;
+		if (family == AF_UNSPEC) {
+			if (operation != SELINUX_SOCKET_ADDRESS_BIND)
+				return 0;
+			if (sk->sk_family == PF_INET6) {
+				if (addrlen < SIN6_LEN_RFC2133)
+					return -EINVAL;
+				goto err_af;
+			}
+			if (addr4->sin_addr.s_addr != htonl(INADDR_ANY))
+				goto err_af;
+			family = AF_INET;
+		}
+		check->port = ntohs(addr4->sin_port);
+		check->node = &addr4->sin_addr.s_addr;
+		break;
+	case AF_INET6:
+		if (addrlen < SIN6_LEN_RFC2133)
+			return -EINVAL;
+		addr6 = (struct sockaddr_in6 *)address;
+		check->port = ntohs(addr6->sin6_port);
+		check->node = &addr6->sin6_addr.s6_addr;
+		break;
+	default:
+		goto err_af;
+	}
+
+	check->family = family;
+	if (operation == SELINUX_SOCKET_ADDRESS_BIND) {
+		int low, high;
+
+		check->check_node = true;
+		if (!check->port)
+			return 0;
+		inet_get_local_port_range(sock_net(sk), &low, &high);
+		check->check_port =
+			inet_port_requires_bind_service(sock_net(sk), check->port) ||
+			check->port < low || check->port > high;
+	} else {
+		check->check_port = true;
+	}
+	return 0;
+
+err_af:
+	return sk->sk_protocol == IPPROTO_SCTP ? -EINVAL : -EAFNOSUPPORT;
+}
+
+static int selinux_cred_chain_count(const struct cred *cred, u16 *count)
+{
+	u16 nr = 0;
+
+	while (cred) {
+		if (nr >= SELINUX_LABEL_RESOLUTION_MAX_DEPTH + 1)
+			return -E2BIG;
+		nr++;
+		cred = selinux_cred(cred)->parent_cred;
+	}
+	if (!nr)
+		return -EINVAL;
+	*count = nr;
+	return 0;
+}
+
+/*
+ * Authorize the socket operation and every address-derived check as one AVC
+ * transaction.  All storage is allocated before the retry loop; an attempt
+ * therefore observes one policy-chain snapshot and emits one aggregate audit.
+ */
+static int selinux_socket_addresses_has_perm(
+	struct sock *sk, enum selinux_socket_address_operation operation,
+	struct selinux_socket_address_check *checks, u16 address_count,
+	u32 socket_perms, bool require_extsockclass)
+{
+	const struct cred *cred = current_cred();
 	struct sk_security_struct *sksec = selinux_sock(sk);
 	struct {
 		struct selinux_policy_chain_snapshot chain;
 		struct selinux_net_avc_transaction transaction;
 	} *scratch __free(kfree) = NULL;
 	struct selinux_avc_transaction_workspace *workspace __free(kvfree) = NULL;
-	struct selinux_policy_chain_snapshot *chain;
-	struct selinux_label_resolution resolution;
+	struct selinux_avc_level *levels __free(kvfree) = NULL;
+	struct selinux_policy_snapshot *snapshots __free(kvfree) = NULL;
+	struct selinux_global_sid_handle **handles __free(kvfree) = NULL;
+	struct selinux_label_ref **labels __free(kvfree) = NULL;
+	struct selinux_avc_provenance *provenance_slots __free(kvfree) = NULL;
 	struct selinux_net_provenance *provenance;
+	struct selinux_label_resolution resolution;
+	struct selinux_avc_provenance audit_provenance;
+	struct common_audit_data ad;
+	struct lsm_network_audit net;
+	size_t checks_per_policy, total_checks;
+	u16 chain_count, capacity;
 	unsigned int retry;
 	int rc;
 
+	if (!checks || !address_count)
+		return -EINVAL;
+	rc = selinux_cred_chain_count(cred, &chain_count);
+	if (rc)
+		return rc;
+	checks_per_policy = 1;
+	if (check_mul_overflow((size_t)address_count,
+				 operation == SELINUX_SOCKET_ADDRESS_BIND ? 2UL : 1UL,
+				 &total_checks) ||
+	    check_add_overflow(checks_per_policy, total_checks,
+			       &checks_per_policy) ||
+	    check_mul_overflow((size_t)chain_count, checks_per_policy,
+			       &total_checks) ||
+	    total_checks > U16_MAX)
+		return -E2BIG;
+	capacity = total_checks;
+
 	provenance = selinux_net_provenance_get_rcu(&sksec->provenance);
-	if (!provenance || provenance->state != sksec->state ||
-	    provenance->subject->sid != sksec->sid) {
-		selinux_net_provenance_put(provenance);
-		return -EACCES;
+	if (!provenance || !provenance->view || !provenance->subject ||
+	    !provenance->subject->label || !provenance->subject->sid_handle) {
+		rc = -EACCES;
+		goto out_provenance;
+	}
+	if (READ_ONCE(sksec->sid) != provenance->subject->sid ||
+	    sksec->state != provenance->state ||
+	    global_sid_handle_sid(provenance->subject->sid_handle) !=
+		    provenance->subject->sid) {
+		rc = -ESTALE;
+		goto out_provenance;
 	}
 	rc = selinux_label_view_resolve_chain(
 		provenance->view, provenance->subject->label,
 		provenance->subject->sid, &resolution);
 	if (rc)
 		goto out_provenance;
+
 	scratch = kzalloc_obj(*scratch, GFP_KERNEL);
-	if (!scratch) {
+	levels = kvcalloc(capacity, sizeof(*levels), GFP_KERNEL);
+	snapshots = kvcalloc(capacity, sizeof(*snapshots), GFP_KERNEL);
+	handles = kvcalloc(capacity, sizeof(*handles), GFP_KERNEL);
+	labels = kvcalloc(capacity, sizeof(*labels), GFP_KERNEL);
+	provenance_slots = kvcalloc(capacity, sizeof(*provenance_slots),
+				    GFP_KERNEL);
+	workspace = selinux_avc_transaction_workspace_alloc(capacity,
+							    GFP_KERNEL);
+	if (!scratch || !levels || !snapshots || !handles || !labels ||
+	    !provenance_slots || !workspace) {
 		rc = -ENOMEM;
 		goto out_provenance;
 	}
-	chain = &scratch->chain;
-	workspace = selinux_avc_transaction_workspace_alloc(
-		SELINUX_NET_AVC_MAX_CHECKS, GFP_KERNEL);
-	if (!workspace) {
-		rc = -ENOMEM;
-		goto out_provenance;
-	}
+	scratch->transaction.dynamic_levels = levels;
+	scratch->transaction.dynamic_snapshots = snapshots;
+	scratch->transaction.dynamic_handles = handles;
+	scratch->transaction.dynamic_labels = labels;
+	scratch->transaction.dynamic_provenance = provenance_slots;
+	scratch->transaction.dynamic_capacity = capacity;
 	scratch->transaction.workspace = workspace;
+	audit_provenance = (struct selinux_avc_provenance) {
+		.label = provenance->subject->label,
+		.view = provenance->view,
+		.source = provenance->subject->source,
+	};
+
+	ad_net_init_from_sk(&ad, &net, sk);
+	/* A multi-address audit must not attribute a denial to the wrong peer. */
+	if (address_count == 1 && checks[0].family) {
+		ad.u.net->family = checks[0].family;
+		if (operation == SELINUX_SOCKET_ADDRESS_BIND)
+			ad.u.net->sport = htons(checks[0].port);
+		else
+			ad.u.net->dport = htons(checks[0].port);
+		if (operation == SELINUX_SOCKET_ADDRESS_BIND && checks[0].node &&
+		    checks[0].family == AF_INET)
+			ad.u.net->v4info.saddr =
+				*(const __be32 *)checks[0].node;
+		else if (operation == SELINUX_SOCKET_ADDRESS_BIND &&
+			 checks[0].node && checks[0].family == AF_INET6)
+			ad.u.net->v6info.saddr =
+				*(const struct in6_addr *)checks[0].node;
+	}
 
 	for (retry = 0; retry < SELINUX_POLICY_OPERATION_RETRIES; retry++) {
-		u16 i;
+		u16 i, j;
 
 		selinux_net_avc_transaction_reset(&scratch->transaction);
-		rc = selinux_policy_chain_snapshot_read(cred, chain);
+		rc = selinux_policy_chain_snapshot_read(cred, &scratch->chain);
 		if (rc == -EAGAIN || rc == -ESTALE)
 			continue;
 		if (rc)
-			goto out_provenance;
-		for (i = 0; i < chain->count; i++) {
+			goto out_reset;
+		if (scratch->chain.count != chain_count) {
+			rc = -ESTALE;
+			continue;
+		}
+		if (require_extsockclass &&
+		    !selinux_policy_snapshot_has_cap(&scratch->chain.policy[0],
+						 POLICYDB_CAP_EXTSOCKCLASS)) {
+			rc = 0;
+			goto out_reset;
+		}
+
+		for (i = 0; i < scratch->chain.count; i++) {
 			const struct cred_security_struct *crsec =
-				selinux_cred(chain->cred[i]);
+				selinux_cred(scratch->chain.cred[i]);
 			const struct selinux_policy_snapshot *snapshot =
-				&chain->policy[i];
+				&scratch->chain.policy[i];
 			const struct selinux_label_domain *domain =
 				crsec->state->label_domain;
-			struct selinux_global_sid_handle *node_handle;
-			u32 node_sid;
+			u16 initial_count = scratch->transaction.count;
 			u16 sclass;
+			u32 policy_sid;
+			u32 address_perm;
 
 			if (!domain || domain->depth > resolution.max_depth ||
 			    resolution.domain_id[domain->depth] != domain->id ||
@@ -14204,38 +15090,118 @@ static int selinux_socket_node_has_perm(const struct cred *cred, struct sock *sk
 				rc = -EOPNOTSUPP;
 				break;
 			}
-			node_handle = sel_netnode_sid_snapshot_handle(
-				crsec->state, snapshot, addr, family, &node_sid);
-			if (IS_ERR(node_handle)) {
-				rc = PTR_ERR(node_handle);
-				break;
-			}
+			policy_sid = resolution.sid[domain->depth];
 			sclass = socket_class_for_snapshot(
-				snapshot, sk->sk_family, sk->sk_type, sk->sk_protocol);
-			rc = selinux_net_avc_transaction_add_handle(
-				&scratch->transaction,
-				&(struct selinux_avc_level) {
-					.state = crsec->state,
-					.ssid = resolution.sid[domain->depth],
-					.tsid = node_sid,
-					.requested = requested,
-					.tclass = sclass,
-				}, snapshot, node_handle, provenance->view,
-				SELINUX_LABEL_SOURCE_SECURITY_CONTEXT);
+				snapshot, sk->sk_family, sk->sk_type,
+				sk->sk_protocol);
+			if (!sock_skip_has_perm(snapshot, policy_sid)) {
+				rc = selinux_net_avc_transaction_add(
+					&scratch->transaction,
+					&(struct selinux_avc_level) {
+						.state = crsec->state,
+						.ssid = crsec->sid,
+						.tsid = policy_sid,
+						.requested = socket_perms,
+						.tclass = sclass,
+						.provenance = &audit_provenance,
+					}, snapshot, NULL);
+				if (rc)
+					break;
+			}
+
+			if (operation == SELINUX_SOCKET_ADDRESS_BIND) {
+				switch (sksec->sclass) {
+				case SECCLASS_TCP_SOCKET:
+					address_perm = TCP_SOCKET__NODE_BIND;
+					break;
+				case SECCLASS_UDP_SOCKET:
+					address_perm = UDP_SOCKET__NODE_BIND;
+					break;
+				case SECCLASS_SCTP_SOCKET:
+					address_perm = SCTP_SOCKET__NODE_BIND;
+					break;
+				default:
+					address_perm = RAWIP_SOCKET__NODE_BIND;
+					break;
+				}
+			} else if (sksec->sclass == SECCLASS_SCTP_SOCKET) {
+				address_perm = SCTP_SOCKET__NAME_CONNECT;
+			} else {
+				address_perm = TCP_SOCKET__NAME_CONNECT;
+			}
+
+			for (j = 0; j < address_count; j++) {
+				struct selinux_global_sid_handle *handle;
+				u32 sid;
+
+				if (checks[j].check_port) {
+					handle = sel_netport_sid_snapshot_handle(
+						crsec->state, snapshot,
+						sk->sk_protocol, checks[j].port,
+						&sid);
+					if (IS_ERR(handle)) {
+						rc = PTR_ERR(handle);
+						break;
+					}
+					rc = selinux_net_avc_transaction_add_handle(
+						&scratch->transaction,
+						&(struct selinux_avc_level) {
+							.state = crsec->state,
+							.ssid = policy_sid,
+							.tsid = sid,
+							.requested = operation ==
+								SELINUX_SOCKET_ADDRESS_BIND ?
+								SOCKET__NAME_BIND :
+								address_perm,
+							.tclass = sclass,
+						}, snapshot, handle,
+						provenance->view,
+						SELINUX_LABEL_SOURCE_SECURITY_CONTEXT);
+					if (rc)
+						break;
+				}
+				if (!checks[j].check_node)
+					continue;
+				handle = sel_netnode_sid_snapshot_handle(
+					crsec->state, snapshot, checks[j].node,
+					checks[j].family, &sid);
+				if (IS_ERR(handle)) {
+					rc = PTR_ERR(handle);
+					break;
+				}
+				rc = selinux_net_avc_transaction_add_handle(
+					&scratch->transaction,
+					&(struct selinux_avc_level) {
+						.state = crsec->state,
+						.ssid = policy_sid,
+						.tsid = sid,
+						.requested = address_perm,
+						.tclass = sclass,
+					}, snapshot, handle, provenance->view,
+					SELINUX_LABEL_SOURCE_SECURITY_CONTEXT);
+				if (rc)
+					break;
+			}
+			if (rc)
+				break;
+			rc = selinux_net_avc_transaction_add_guard(
+				&scratch->transaction, initial_count, crsec->state,
+				snapshot);
 			if (rc)
 				break;
 		}
 		if (!rc)
 			rc = selinux_net_avc_transaction_decide(
-				&scratch->transaction, ad);
+				&scratch->transaction, &ad);
 		if (rc == -ESTALE)
 			continue;
-		goto out_provenance;
+		goto out_reset;
 	}
 	rc = -ESTALE;
+
+out_reset:
+	selinux_net_avc_transaction_reset(&scratch->transaction);
 out_provenance:
-	if (scratch)
-		selinux_net_avc_transaction_reset(&scratch->transaction);
 	selinux_net_provenance_put(provenance);
 	return rc;
 }
@@ -14243,6 +15209,17 @@ out_provenance:
 
 static int __selinux_socket_bind(struct sock *sk, struct sockaddr *address, int addrlen)
 {
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	struct selinux_socket_address_check check;
+	int err;
+
+	err = selinux_socket_address_prepare(
+		sk, SELINUX_SOCKET_ADDRESS_BIND, address, addrlen, &check);
+	if (err)
+		return err;
+	return selinux_socket_addresses_has_perm(
+		sk, SELINUX_SOCKET_ADDRESS_BIND, &check, 1, SOCKET__BIND, false);
+#else
 	const struct cred *cred = current_cred();
 	struct sk_security_struct *sksec = selinux_sock(sk);
 	u16 family;
@@ -14263,9 +15240,7 @@ static int __selinux_socket_bind(struct sock *sk, struct sockaddr *address, int 
 		u16 family_sa;
 		unsigned short snum;
 		u32 node_perm;
-#ifndef CONFIG_SECURITY_SELINUX_NS
 		u32 sid;
-#endif
 
 		/*
 		 * sctp_bindx(3) calls via selinux_sctp_bind_connect()
@@ -14355,17 +15330,12 @@ static int __selinux_socket_bind(struct sock *sk, struct sockaddr *address, int 
 		else
 			ad.u.net->v6info.saddr = addr6->sin6_addr;
 
-#ifdef CONFIG_SECURITY_SELINUX_NS
-		err = selinux_socket_node_has_perm(cred, sk, addrp, family_sa,
-						   node_perm, &ad);
-#else
 		err = sel_netnode_sid(current_selinux_state, addrp, family_sa,
 				      &sid);
 		if (err)
 			goto out;
-		err = cred_ssid_has_perm(cred, sksec->sid, sid,
-					 sksec->sclass, node_perm, &ad);
-#endif
+		err = cred_ssid_has_perm(cred, sksec->sid, sid, sksec->sclass,
+					 node_perm, &ad);
 		if (err)
 			goto out;
 	}
@@ -14376,6 +15346,7 @@ err_af:
 	if (sk->sk_protocol == IPPROTO_SCTP)
 		return -EINVAL;
 	return -EAFNOSUPPORT;
+#endif
 }
 
 static int selinux_socket_bind(struct socket *sock, struct sockaddr *address, int addrlen)
@@ -14389,6 +15360,18 @@ static int selinux_socket_bind(struct socket *sock, struct sockaddr *address, in
 static int selinux_socket_connect_helper(struct sock *sk,
 					 struct sockaddr *address, int addrlen)
 {
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	struct selinux_socket_address_check check;
+	int err;
+
+	err = selinux_socket_address_prepare(
+		sk, SELINUX_SOCKET_ADDRESS_CONNECT, address, addrlen, &check);
+	if (err)
+		return err;
+	return selinux_socket_addresses_has_perm(
+		sk, SELINUX_SOCKET_ADDRESS_CONNECT, &check, 1,
+		SOCKET__CONNECT, false);
+#else
 	const struct cred *cred = current_cred();
 	struct sk_security_struct *sksec = selinux_sock(sk);
 	int err;
@@ -14466,6 +15449,7 @@ static int selinux_socket_connect_helper(struct sock *sk,
 	}
 
 	return 0;
+#endif
 }
 
 /* Supports connect(2), see comments in selinux_socket_connect_helper() */
@@ -14518,15 +15502,34 @@ static int selinux_socket_sendmsg(struct socket *sock, struct msghdr *msg,
 	struct sockaddr *const addr = msg->msg_name;
 	const int addrlen = msg->msg_namelen;
 
-	rc = sock_has_perm(sock->sk, SOCKET__WRITE);
-	if (rc)
-		return rc;
-
 	if (addr && (msg->msg_flags & MSG_FASTOPEN) &&
 	    (sk_is_tcp(sock->sk) ||
 	     (sk_is_inet(sock->sk) && sock->sk->sk_type == SOCK_STREAM &&
 	      sock->sk->sk_protocol == IPPROTO_MPTCP))) {
+#ifdef CONFIG_SECURITY_SELINUX_NS
+		struct selinux_socket_address_check check;
+
+		rc = selinux_socket_address_prepare(
+			sock->sk, SELINUX_SOCKET_ADDRESS_CONNECT, addr, addrlen,
+			&check);
+		if (rc)
+			return rc;
+		rc = selinux_socket_addresses_has_perm(
+			sock->sk, SELINUX_SOCKET_ADDRESS_CONNECT, &check, 1,
+			SOCKET__WRITE | SOCKET__CONNECT, false);
+		if (rc)
+			return rc;
+		rc = selinux_netlbl_socket_connect(sock->sk, addr);
+#else
+		rc = sock_has_perm(sock->sk, SOCKET__WRITE);
+		if (rc)
+			return rc;
 		rc = selinux_socket_connect(sock, addr, addrlen);
+#endif
+		if (rc)
+			return rc;
+	} else {
+		rc = sock_has_perm(sock->sk, SOCKET__WRITE);
 		if (rc)
 			return rc;
 	}
@@ -14589,50 +15592,164 @@ static int selinux_socket_unix_stream_connect(struct sock *sock,
 #ifdef CONFIG_SECURITY_SELINUX_NS
 	{
 		struct selinux_net_provenance *sock_provenance, *other_provenance;
-		struct selinux_net_provenance *child;
-		struct selinux_global_sid_handle *child_handle;
-		u32 child_sid, sock_sid_in_other;
+		struct selinux_net_provenance *child = NULL;
+		struct selinux_global_sid_handle *child_handle = NULL;
+		struct {
+			struct selinux_policy_chain_snapshot access_chain;
+			struct selinux_policy_state_chain_snapshot child_chain;
+			struct selinux_net_avc_transaction transaction;
+			u32 child_sid[SELINUX_LABEL_RESOLUTION_MAX_DEPTH + 1];
+		} *scratch __free(kfree) = NULL;
+		struct selinux_avc_transaction_workspace *workspace
+			__free(kvfree) = NULL;
+		unsigned int retry;
 
 		sock_provenance = selinux_net_provenance_get_rcu(
 			&sksec_sock->provenance);
 		other_provenance = selinux_net_provenance_get_rcu(
 			&sksec_other->provenance);
 		if (!sock_provenance || !other_provenance ||
+		    !sock_provenance->subject || !sock_provenance->view ||
+		    !other_provenance->subject || !other_provenance->view ||
+		    sock_provenance->state != sksec_sock->state ||
+		    other_provenance->state != sksec_other->state ||
 		    sock_provenance->subject->sid != sksec_sock->sid ||
 		    other_provenance->subject->sid != sksec_other->sid) {
 			err = -EXDEV;
 			goto out_unix_provenance;
 		}
-		err = selinux_net_provenances_has_perm(
-			cred, sock_provenance, other_provenance, other,
-			UNIX_STREAM_SOCKET__CONNECTTO, &ad);
-		if (err)
-			goto out_unix_provenance;
-		err = selinux_label_view_resolve(
-			sock_provenance->view, other_provenance->state->label_domain,
-			sock_provenance->subject->label,
-			sock_provenance->subject->sid, &sock_sid_in_other);
-		if (err)
-			goto out_unix_provenance;
-		child_handle = security_sid_mls_copy_handle(
-			other_provenance->state, other_provenance->subject->sid,
-			sock_sid_in_other, &child_sid);
-		if (IS_ERR(child_handle)) {
-			err = PTR_ERR(child_handle);
+		scratch = kzalloc_obj(*scratch, GFP_ATOMIC);
+		if (!scratch) {
+			err = -ENOMEM;
 			goto out_unix_provenance;
 		}
-		child = selinux_net_provenance_derive_handle(
-			other_provenance, child_handle, sksec_other->sclass,
-			SELINUX_NET_ASSERTION_SOURCE_SOCKET, GFP_ATOMIC);
-		if (IS_ERR(child)) {
-			err = PTR_ERR(child);
+		workspace = selinux_avc_transaction_workspace_alloc(
+			SELINUX_NET_AVC_MAX_CHECKS, GFP_ATOMIC | __GFP_NOWARN);
+		if (!workspace) {
+			err = -ENOMEM;
 			goto out_unix_provenance;
 		}
-		if (child->subject->sid != child_sid) {
+		scratch->transaction.workspace = workspace;
+		for (retry = 0; retry < SELINUX_POLICY_OPERATION_RETRIES; retry++) {
+			u16 i;
+
+			global_sid_handle_put(child_handle);
+			child_handle = NULL;
 			selinux_net_provenance_put(child);
-			err = -ESTALE;
-			goto out_unix_provenance;
+			child = NULL;
+			selinux_net_avc_transaction_reset(&scratch->transaction);
+			err = selinux_policy_chain_snapshot_read(
+				cred, &scratch->access_chain);
+			if (err == -EAGAIN || err == -ESTALE)
+				continue;
+			if (err)
+				break;
+			err = selinux_policy_state_chain_snapshot_read(
+				other_provenance->state, &scratch->child_chain);
+			if (err == -EAGAIN || err == -ESTALE)
+				continue;
+			if (err)
+				break;
+			for (i = 0; i < scratch->access_chain.count; i++) {
+				const struct cred_security_struct *crsec = selinux_cred(
+					scratch->access_chain.cred[i]);
+				const struct selinux_policy_snapshot *snapshot =
+					&scratch->access_chain.policy[i];
+				struct selinux_state *policy_state = crsec->state;
+				u32 client_sid, server_sid;
+				u16 sclass;
+
+				err = selinux_net_avc_transaction_provenance_sid(
+					&scratch->transaction, sock_provenance,
+					policy_state->label_domain, &client_sid);
+				if (err)
+					break;
+				err = selinux_net_avc_transaction_provenance_sid(
+					&scratch->transaction, other_provenance,
+					policy_state->label_domain, &server_sid);
+				if (err)
+					break;
+				sclass = socket_class_for_snapshot(
+					snapshot, other->sk_family, other->sk_type,
+					other->sk_protocol);
+				err = selinux_net_avc_transaction_add_provenance(
+					&scratch->transaction,
+					&(struct selinux_avc_level) {
+						.state = policy_state,
+						.ssid = client_sid,
+						.tsid = server_sid,
+						.requested =
+							UNIX_STREAM_SOCKET__CONNECTTO,
+						.tclass = sclass,
+					}, snapshot, other_provenance);
+				if (err)
+					break;
+			}
+			if (err)
+				goto retry_unix;
+			for (i = 0; i < scratch->child_chain.count; i++) {
+				struct selinux_state *policy_state =
+					scratch->child_chain.state[i];
+				u32 client_sid, server_sid;
+
+				err = selinux_net_avc_transaction_provenance_sid(
+					&scratch->transaction, sock_provenance,
+					policy_state->label_domain, &client_sid);
+				if (err)
+					break;
+				err = selinux_net_avc_transaction_provenance_sid(
+					&scratch->transaction, other_provenance,
+					policy_state->label_domain, &server_sid);
+				if (err)
+					break;
+				if (!i) {
+					child_handle = security_sid_mls_copy_handle(
+						policy_state, server_sid, client_sid,
+						&scratch->child_sid[i]);
+					if (IS_ERR(child_handle)) {
+						err = PTR_ERR(child_handle);
+						child_handle = NULL;
+						break;
+					}
+				} else {
+					err = selinux_conn_sid(
+						server_sid, client_sid, policy_state,
+						&scratch->child_sid[i]);
+					if (err)
+						break;
+				}
+			}
+			if (err)
+				goto retry_unix;
+			child = selinux_net_provenance_derive_handle(
+				other_provenance, child_handle, sksec_other->sclass,
+				SELINUX_NET_ASSERTION_SOURCE_SOCKET, GFP_ATOMIC);
+			child_handle = NULL;
+			if (IS_ERR(child)) {
+				err = PTR_ERR(child);
+				child = NULL;
+				break;
+			}
+			err = selinux_net_provenance_projection_matches(
+				&scratch->transaction, child, &scratch->child_chain,
+				scratch->child_sid);
+			if (!err)
+				err = selinux_net_avc_transaction_decide(
+					&scratch->transaction, &ad);
+			if (!err &&
+			    (!selinux_policy_chain_snapshot_valid(
+				     &scratch->access_chain) ||
+			     !selinux_policy_state_chain_snapshot_valid(
+				     &scratch->child_chain)))
+				err = -ESTALE;
+
+retry_unix:
+			if (err == -EAGAIN || err == -ESTALE)
+				continue;
+			break;
 		}
+		if (err)
+			goto out_unix_candidate;
 
 		selinux_sk_provenance_free(sksec_new);
 		RCU_INIT_POINTER(sksec_new->provenance, child);
@@ -14646,8 +15763,13 @@ static int selinux_socket_unix_stream_connect(struct sock *sock,
 		sksec_new->peer_sid = sock_provenance->subject->sid;
 		selinux_sk_peer_provenance_replace(
 			sksec_sock, selinux_net_provenance_get(child));
+		child = NULL;
 		err = 0;
 
+out_unix_candidate:
+		selinux_net_avc_transaction_reset(&scratch->transaction);
+		global_sid_handle_put(child_handle);
+		selinux_net_provenance_put(child);
 out_unix_provenance:
 		selinux_net_provenance_put(other_provenance);
 		selinux_net_provenance_put(sock_provenance);
@@ -14930,7 +16052,8 @@ static int selinux_socket_sock_rcv_skb_policy(
 	if (selinux_secmark_enabled(snapshot)) {
 		u32 secmark_sid;
 
-		err = selinux_skb_secmark_sid(skb, state, &secmark_sid);
+		err = selinux_skb_secmark_sid(skb, state, transaction,
+					     &secmark_sid);
 		if (err)
 			return err;
 		err = selinux_net_avc_transaction_add_provenance(
@@ -14952,8 +16075,8 @@ static int selinux_socket_sock_rcv_skb_policy(
 
 		if (!selinux_peerlbl_enabled(snapshot))
 			return 0;
-		peer_handle = selinux_peer_sources_handle(sources, state,
-							 &peer_sid);
+		peer_handle = selinux_net_avc_transaction_peer_sources_handle(
+			transaction, sources, state, &peer_sid);
 		if (IS_ERR(peer_handle))
 			return PTR_ERR(peer_handle);
 		err = selinux_inet_sys_rcv_skb_add(
@@ -14979,8 +16102,8 @@ static int selinux_socket_sock_rcv_skb_policy(
 	}
 
 	/* Legacy policies authorize the two native label sources separately. */
-	err = selinux_peer_sources_resolve(sources, state, &nlbl_sid,
-					   &xfrm_sid, NULL);
+	err = selinux_net_avc_transaction_peer_sources_resolve(
+		transaction, sources, state, &nlbl_sid, &xfrm_sid, NULL);
 	if (err)
 		return err;
 	if (netlbl_enabled()) {
@@ -16193,18 +17316,6 @@ static void selinux_sctp_candidate_put_provenance(
 	candidate->subject = NULL;
 }
 
-static int selinux_sctp_provenance_sid(
-	const struct selinux_net_provenance *provenance,
-	struct selinux_state *state, u32 *sid)
-{
-	if (!provenance || !provenance->view || !provenance->subject ||
-	    !provenance->subject->label || !state || !state->label_domain)
-		return -EACCES;
-	return selinux_label_view_resolve(
-		provenance->view, state->label_domain,
-		provenance->subject->label, provenance->subject->sid, sid);
-}
-
 /*
  * Capture once, authorize every policy in the socket's immutable state
  * lineage, and prepare all fallible objects before any association field is
@@ -16281,22 +17392,25 @@ static int selinux_sctp_prepare_candidate(
 			u16 initial_count = transaction->count;
 			u32 socket_sid, old_peer_sid;
 
-			err = selinux_sctp_provenance_sid(base, state,
-							 &socket_sid);
+			err = selinux_net_avc_transaction_provenance_sid(
+				transaction, base, state->label_domain, &socket_sid);
 			if (err)
 				break;
 			if (selinux_peerlbl_enabled(snapshot)) {
 				if (!i) {
-					peer_handle = selinux_peer_sources_handle(
-						&candidate->sources, state, &peer_sid[i]);
+					peer_handle =
+						selinux_net_avc_transaction_peer_sources_handle(
+							transaction, &candidate->sources, state,
+							&peer_sid[i]);
 					if (IS_ERR(peer_handle)) {
 						err = PTR_ERR(peer_handle);
 						peer_handle = NULL;
 						break;
 					}
 				} else {
-					err = selinux_peer_sources_sid(
-						&candidate->sources, state, &peer_sid[i]);
+					err = selinux_net_avc_transaction_peer_sources_sid(
+						transaction, &candidate->sources, state,
+						&peer_sid[i]);
 					if (err)
 						break;
 				}
@@ -16357,8 +17471,9 @@ static int selinux_sctp_prepare_candidate(
 				    snapshot, POLICYDB_CAP_EXTSOCKCLASS)) {
 				extsock_active = true;
 				if (existing_peer) {
-					err = selinux_sctp_provenance_sid(
-						existing_peer, state, &old_peer_sid);
+					err = selinux_net_avc_transaction_provenance_sid(
+						transaction, existing_peer,
+						state->label_domain, &old_peer_sid);
 					if (err)
 						break;
 				}
@@ -16423,15 +17538,17 @@ static int selinux_sctp_prepare_candidate(
 		for (i = 0, err = 0; i < chain->count; i++) {
 			u32 resolved;
 
-			err = selinux_sctp_provenance_sid(candidate->subject,
-							 chain->state[i], &resolved);
+			err = selinux_net_avc_transaction_provenance_sid(
+				transaction, candidate->subject,
+				chain->state[i]->label_domain, &resolved);
 			if (err || resolved != subject_sid[i]) {
 				if (!err)
 					err = -EACCES;
 				break;
 			}
-			err = selinux_sctp_provenance_sid(candidate->peer,
-							 chain->state[i], &resolved);
+			err = selinux_net_avc_transaction_provenance_sid(
+				transaction, candidate->peer,
+				chain->state[i]->label_domain, &resolved);
 			if (err || resolved != peer_sid[i]) {
 				if (!err)
 					err = -EACCES;
@@ -16581,11 +17698,93 @@ static int selinux_sctp_bind_connect(struct sock *sk, int optname,
 				     struct sockaddr *address,
 				     int addrlen)
 {
-	struct sk_security_struct *sksec = selinux_sock(sk);
-	struct selinux_policy_snapshot snapshot;
 	int len, err = 0, walk_size = 0;
 	void *addr_buf;
 	struct sockaddr *addr;
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	struct selinux_socket_address_check *checks __free(kvfree) = NULL;
+	enum selinux_socket_address_operation operation;
+	u32 count = 0;
+	u16 i;
+	bool apply_netlabel = false;
+
+	switch (optname) {
+	case SCTP_PRIMARY_ADDR:
+	case SCTP_SET_PEER_PRIMARY_ADDR:
+	case SCTP_SOCKOPT_BINDX_ADD:
+		operation = SELINUX_SOCKET_ADDRESS_BIND;
+		break;
+	case SCTP_SOCKOPT_CONNECTX:
+	case SCTP_PARAM_SET_PRIMARY:
+	case SCTP_PARAM_ADD_IP:
+	case SCTP_SENDMSG_CONNECT:
+		operation = SELINUX_SOCKET_ADDRESS_CONNECT;
+		apply_netlabel = true;
+		break;
+	default:
+		return addrlen > 0 ? -EINVAL : 0;
+	}
+	if (addrlen <= 0)
+		return 0;
+
+	/* Validate and count the complete packed vector before authorization. */
+	addr_buf = address;
+	while (walk_size < addrlen) {
+		if (walk_size + sizeof(sa_family_t) > addrlen)
+			return -EINVAL;
+		addr = addr_buf;
+		switch (addr->sa_family) {
+		case AF_UNSPEC:
+		case AF_INET:
+			len = sizeof(struct sockaddr_in);
+			break;
+		case AF_INET6:
+			len = sizeof(struct sockaddr_in6);
+			break;
+		default:
+			return -EINVAL;
+		}
+		if (walk_size + len > addrlen)
+			return -EINVAL;
+		if (++count > U16_MAX)
+			return -E2BIG;
+		addr_buf += len;
+		walk_size += len;
+	}
+	checks = kvcalloc(count, sizeof(*checks), GFP_KERNEL);
+	if (!checks)
+		return -ENOMEM;
+	addr_buf = address;
+	for (i = 0; i < count; i++) {
+		addr = addr_buf;
+		len = addr->sa_family == AF_INET6 ?
+			      sizeof(struct sockaddr_in6) :
+			      sizeof(struct sockaddr_in);
+		err = selinux_socket_address_prepare(
+			sk, operation, addr, len, &checks[i]);
+		if (err)
+			return err;
+		addr_buf += len;
+	}
+
+	err = selinux_socket_addresses_has_perm(
+		sk, operation, checks, count,
+		operation == SELINUX_SOCKET_ADDRESS_BIND ? SOCKET__BIND :
+							 SOCKET__CONNECT,
+		true);
+	if (err || !apply_netlabel)
+		return err;
+
+	/* No socket/NetLabel state changes until every address is authorized. */
+	for (i = 0; i < count; i++) {
+		err = selinux_netlbl_socket_connect_locked(sk, checks[i].address);
+		if (err)
+			return err;
+	}
+	return 0;
+#else
+	struct sk_security_struct *sksec = selinux_sock(sk);
+	struct selinux_policy_snapshot snapshot;
 
 	err = selinux_policy_snapshot_read(sksec->state, &snapshot);
 	if (err)
@@ -16657,6 +17856,7 @@ static int selinux_sctp_bind_connect(struct sock *sk, int optname,
 	}
 
 	return 0;
+#endif
 }
 
 /* Called whenever a new socket is created by accept(2) or sctp_peeloff(3). */
@@ -16755,6 +17955,166 @@ static int selinux_mptcp_add_subflow(struct sock *sk, struct sock *ssk)
 	return selinux_netlbl_socket_post_create(ssk, ssk->sk_family);
 }
 
+#ifdef CONFIG_SECURITY_SELINUX_NS
+struct selinux_inet_peer_candidate {
+	struct selinux_net_provenance *connection;
+	struct selinux_net_provenance *peer;
+	u32 connection_sid;
+	u32 peer_sid;
+};
+
+static void selinux_inet_peer_candidate_put(
+	struct selinux_inet_peer_candidate *candidate)
+{
+	selinux_net_provenance_put(candidate->peer);
+	selinux_net_provenance_put(candidate->connection);
+	memset(candidate, 0, sizeof(*candidate));
+}
+
+/* Resolve the packet and every derived label independently in each policy. */
+static int selinux_inet_peer_candidate_prepare(
+	struct selinux_net_provenance *base, struct sk_buff *skb, u16 family,
+	bool derive_connection, struct selinux_inet_peer_candidate *candidate,
+	struct selinux_policy_state_chain_snapshot *chain,
+	struct selinux_net_avc_transaction *transaction)
+{
+	struct selinux_global_sid_handle *connection_handle = NULL;
+	struct selinux_global_sid_handle *peer_handle = NULL;
+	struct selinux_peer_sources sources;
+	u32 connection_sid[SELINUX_LABEL_RESOLUTION_MAX_DEPTH + 1];
+	u32 peer_sid[SELINUX_LABEL_RESOLUTION_MAX_DEPTH + 1];
+	unsigned int retry;
+	int rc;
+
+	memset(candidate, 0, sizeof(*candidate));
+	rc = selinux_peer_sources_capture(
+		skb, family, base->state, base->view, &sources);
+	if (rc)
+		return rc;
+
+	for (retry = 0; retry < SELINUX_POLICY_OPERATION_RETRIES; retry++) {
+		u16 i;
+
+		global_sid_handle_put(peer_handle);
+		global_sid_handle_put(connection_handle);
+		peer_handle = NULL;
+		connection_handle = NULL;
+		selinux_inet_peer_candidate_put(candidate);
+		selinux_net_avc_transaction_reset(transaction);
+		rc = selinux_policy_state_chain_snapshot_read(base->state, chain);
+		if (rc == -EAGAIN || rc == -ESTALE)
+			continue;
+		if (rc)
+			break;
+
+		for (i = 0; i < chain->count; i++) {
+			struct selinux_state *state = chain->state[i];
+			u32 base_sid;
+
+			rc = selinux_net_avc_transaction_provenance_sid(
+				transaction, base, state->label_domain, &base_sid);
+			if (rc)
+				break;
+			if (!i) {
+				peer_handle =
+					selinux_net_avc_transaction_peer_sources_handle(
+						transaction, &sources, state,
+						&peer_sid[i]);
+				if (IS_ERR(peer_handle)) {
+					rc = PTR_ERR(peer_handle);
+					peer_handle = NULL;
+					break;
+				}
+			} else {
+				rc = selinux_net_avc_transaction_peer_sources_sid(
+					transaction, &sources, state, &peer_sid[i]);
+				if (rc)
+					break;
+			}
+			if (!derive_connection)
+				continue;
+			if (!i) {
+				if (peer_sid[i] == SECSID_NULL) {
+					connection_sid[i] = base_sid;
+					connection_handle = global_sid_handle_dup(
+						base->subject->sid_handle);
+				} else {
+					connection_handle = security_sid_mls_copy_handle(
+						state, base_sid, peer_sid[i],
+						&connection_sid[i]);
+				}
+				if (IS_ERR(connection_handle)) {
+					rc = PTR_ERR(connection_handle);
+					connection_handle = NULL;
+					break;
+				}
+			} else {
+				rc = selinux_conn_sid(base_sid, peer_sid[i], state,
+						      &connection_sid[i]);
+				if (rc)
+					break;
+			}
+		}
+		if (rc)
+			goto retry_or_out;
+
+		if (derive_connection) {
+			candidate->connection = selinux_net_provenance_derive_handle(
+				base, connection_handle,
+				base->subject->semantic_class,
+				SELINUX_NET_ASSERTION_SOURCE_SOCKET, GFP_ATOMIC);
+			connection_handle = NULL;
+			if (IS_ERR(candidate->connection)) {
+				rc = PTR_ERR(candidate->connection);
+				candidate->connection = NULL;
+				break;
+			}
+		}
+		if (peer_sid[0] != SECSID_NULL) {
+			candidate->peer = selinux_net_provenance_derive_handle(
+				base, peer_handle, SECCLASS_PEER,
+				SELINUX_NET_ASSERTION_SOURCE_PEER_RESOLVED,
+				GFP_ATOMIC);
+			peer_handle = NULL;
+			if (IS_ERR(candidate->peer)) {
+				rc = PTR_ERR(candidate->peer);
+				candidate->peer = NULL;
+				break;
+			}
+		}
+		rc = selinux_net_provenance_projection_matches(
+			transaction, candidate->peer, chain, peer_sid);
+		if (!rc && derive_connection)
+			rc = selinux_net_provenance_projection_matches(
+				transaction, candidate->connection, chain,
+				connection_sid);
+		if (!rc && !selinux_policy_state_chain_snapshot_valid(chain))
+			rc = -ESTALE;
+		if (!rc) {
+			candidate->peer_sid = peer_sid[0];
+			if (derive_connection)
+				candidate->connection_sid = connection_sid[0];
+			break;
+		}
+
+retry_or_out:
+		if (rc == -EAGAIN || rc == -ESTALE)
+			continue;
+		break;
+	}
+	if (retry == SELINUX_POLICY_OPERATION_RETRIES)
+		rc = -ESTALE;
+
+	selinux_net_avc_transaction_reset(transaction);
+	global_sid_handle_put(peer_handle);
+	global_sid_handle_put(connection_handle);
+	selinux_peer_sources_put(&sources);
+	if (rc)
+		selinux_inet_peer_candidate_put(candidate);
+	return rc;
+}
+#endif
+
 static int selinux_inet_conn_request(const struct sock *sk, struct sk_buff *skb,
 				     struct request_sock *req)
 {
@@ -16775,11 +18135,13 @@ static int selinux_inet_conn_request(const struct sock *sk, struct sk_buff *skb,
 #else
 	{
 		struct req_security_struct *reqsec = selinux_req(req);
-		struct selinux_net_provenance *base, *connection, *peer = NULL;
+		struct selinux_net_provenance *base;
 		struct selinux_net_provenance *old_connection, *old_peer;
-		struct selinux_global_sid_handle *connection_handle = NULL;
-		struct selinux_global_sid_handle *peer_handle = NULL;
-		struct selinux_peer_sources sources;
+		struct selinux_inet_peer_candidate candidate;
+		struct {
+			struct selinux_policy_state_chain_snapshot chain;
+			struct selinux_net_avc_transaction transaction;
+		} *scratch __free(kfree) = NULL;
 
 		base = selinux_net_provenance_get_rcu(&reqsec->provenance);
 		if (!base || base->state != state || !base->view || !base->subject ||
@@ -16788,80 +18150,43 @@ static int selinux_inet_conn_request(const struct sock *sk, struct sk_buff *skb,
 			err = -EACCES;
 			goto out_request_base;
 		}
-		err = selinux_peer_sources_capture(skb, family, state, base->view,
-						   &sources);
+		scratch = kzalloc_obj(*scratch, GFP_ATOMIC);
+		if (!scratch) {
+			err = -ENOMEM;
+			goto out_request_base;
+		}
+		err = selinux_inet_peer_candidate_prepare(
+			base, skb, family, true, &candidate, &scratch->chain,
+			&scratch->transaction);
 		if (err)
 			goto out_request_base;
-		peer_handle = selinux_peer_sources_handle(&sources, state, &peersid);
-		if (IS_ERR(peer_handle)) {
-			err = PTR_ERR(peer_handle);
-			peer_handle = NULL;
-			goto out_request_sources;
-		}
-		if (peersid != SECSID_NULL) {
-			connection_handle = security_sid_mls_copy_handle(
-				state, base->subject->sid, peersid, &connsid);
-			if (IS_ERR(connection_handle)) {
-				err = PTR_ERR(connection_handle);
-				connection_handle = NULL;
-				goto out_request_sources;
-			}
-		} else {
-			connsid = base->subject->sid;
-			connection_handle = global_sid_handle_dup(
-				base->subject->sid_handle);
-			if (IS_ERR(connection_handle)) {
-				err = PTR_ERR(connection_handle);
-				connection_handle = NULL;
-				goto out_request_sources;
-			}
-		}
-		connection = selinux_net_provenance_derive_handle(
-			base, connection_handle, base->subject->semantic_class,
-			SELINUX_NET_ASSERTION_SOURCE_SOCKET, GFP_ATOMIC);
-		connection_handle = NULL;
-		if (IS_ERR(connection)) {
-			err = PTR_ERR(connection);
-			goto out_request_sources;
-		}
-		if (connection->subject->sid != connsid) {
-			selinux_net_provenance_put(connection);
+		connsid = candidate.connection_sid;
+		peersid = candidate.peer_sid;
+		req->secid = connsid;
+		req->peer_secid = peersid;
+		if (!selinux_policy_state_chain_snapshot_valid(&scratch->chain)) {
 			err = -ESTALE;
-			goto out_request_sources;
+			goto out_request_candidate;
 		}
-		if (peersid != SECSID_NULL) {
-			peer = selinux_net_provenance_derive_handle(
-				base, peer_handle, SECCLASS_PEER,
-				SELINUX_NET_ASSERTION_SOURCE_PEER_RESOLVED,
-				GFP_ATOMIC);
-			peer_handle = NULL;
-			if (IS_ERR(peer)) {
-				err = PTR_ERR(peer);
-				peer = NULL;
-				selinux_net_provenance_put(connection);
-				goto out_request_sources;
-			}
-			if (peer->subject->sid != peersid) {
-				selinux_net_provenance_put(peer);
-				selinux_net_provenance_put(connection);
-				err = -ESTALE;
-				goto out_request_sources;
-			}
-		}
+		err = selinux_netlbl_inet_conn_request(req, family, state);
+		if (err)
+			goto out_request_candidate;
 		old_connection = rcu_replace_pointer(reqsec->provenance,
-						     connection, true);
-		old_peer = rcu_replace_pointer(reqsec->peer_provenance, peer, true);
+						     candidate.connection, true);
+		old_peer = rcu_replace_pointer(reqsec->peer_provenance,
+					       candidate.peer, true);
+		candidate.connection = NULL;
+		candidate.peer = NULL;
 		selinux_net_provenance_put(old_peer);
 		selinux_net_provenance_put(old_connection);
 		err = 0;
-out_request_sources:
-		global_sid_handle_put(connection_handle);
-		global_sid_handle_put(peer_handle);
-		selinux_peer_sources_put(&sources);
+out_request_candidate:
+		selinux_inet_peer_candidate_put(&candidate);
 out_request_base:
 		selinux_net_provenance_put(base);
 		if (err)
 			return err;
+		return 0;
 	}
 #endif
 	req->secid = connsid;
@@ -16919,52 +18244,39 @@ static void selinux_inet_conn_established(struct sock *sk, struct sk_buff *skb)
 
 #ifdef CONFIG_SECURITY_SELINUX_NS
 	{
-		struct selinux_net_provenance *base, *peer = NULL;
-		struct selinux_global_sid_handle *peer_handle = NULL;
-		struct selinux_peer_sources sources;
-		u32 peer_sid;
+		struct selinux_net_provenance *base;
+		struct selinux_inet_peer_candidate candidate;
+		struct {
+			struct selinux_policy_state_chain_snapshot chain;
+			struct selinux_net_avc_transaction transaction;
+		} *scratch __free(kfree) = NULL;
 		int err;
 
-		selinux_peer_sources_init(&sources);
 		base = selinux_net_provenance_get_rcu(&sksec->provenance);
 		if (!base || base->state != sksec->state || !base->view ||
 		    !base->subject || !base->subject->sid_handle ||
 		    base->subject->sid != READ_ONCE(sksec->sid))
 			goto fail_closed;
-		err = selinux_peer_sources_capture(skb, family, sksec->state,
-						   base->view, &sources);
+		scratch = kzalloc_obj(*scratch, GFP_ATOMIC);
+		if (!scratch)
+			goto fail_closed;
+		err = selinux_inet_peer_candidate_prepare(
+			base, skb, family, false, &candidate, &scratch->chain,
+			&scratch->transaction);
 		if (err)
 			goto fail_closed;
-		peer_handle = selinux_peer_sources_handle(
-			&sources, sksec->state, &peer_sid);
-		if (IS_ERR(peer_handle)) {
-			peer_handle = NULL;
+		if (!selinux_policy_state_chain_snapshot_valid(&scratch->chain)) {
+			selinux_inet_peer_candidate_put(&candidate);
 			goto fail_closed;
 		}
-		if (peer_sid != SECSID_NULL) {
-			peer = selinux_net_provenance_derive_handle(
-				base, peer_handle, SECCLASS_PEER,
-				SELINUX_NET_ASSERTION_SOURCE_PEER_RESOLVED,
-				GFP_ATOMIC);
-			peer_handle = NULL;
-			if (IS_ERR(peer)) {
-				peer = NULL;
-				goto fail_closed;
-			}
-			if (peer->subject->sid != peer_sid) {
-				selinux_net_provenance_put(peer);
-				peer = NULL;
-				goto fail_closed;
-			}
-		}
-		selinux_sk_peer_provenance_replace(sksec, peer);
+		selinux_sk_peer_provenance_replace(sksec, candidate.peer);
+		candidate.peer = NULL;
+		selinux_inet_peer_candidate_put(&candidate);
 		goto out_peer;
 
 fail_closed:
 		selinux_sk_peer_provenance_replace(sksec, NULL);
 out_peer:
-		global_sid_handle_put(peer_handle);
-		selinux_peer_sources_put(&sources);
 		selinux_net_provenance_put(base);
 	}
 #else
@@ -17530,7 +18842,8 @@ static int selinux_ip_forward_policy(
 		return 0;
 	}
 	family = hook_state->pf;
-	err = selinux_peer_sources_sid(sources, state, &peer_sid);
+	err = selinux_net_avc_transaction_peer_sources_sid(
+		transaction, sources, state, &peer_sid);
 	if (err)
 		return err;
 	*peer_sid_out = peer_sid;
@@ -17552,7 +18865,8 @@ static int selinux_ip_forward_policy(
 	if (selinux_secmark_enabled(snapshot)) {
 		u32 secmark_sid;
 
-		err = selinux_skb_secmark_sid(skb, state, &secmark_sid);
+		err = selinux_skb_secmark_sid(skb, state, transaction,
+					     &secmark_sid);
 		if (err)
 			return err;
 		return selinux_net_avc_transaction_add_provenance(
@@ -17989,7 +19303,7 @@ static int selinux_ip_postroute_initial_resolution(
 static int selinux_ip_postroute_compat_ns(
 	struct sk_buff *skb, struct selinux_state *state,
 	const struct selinux_policy_snapshot *snapshot, u32 socket_sid,
-	enum selinux_postroute_origin origin, u8 proto,
+	enum selinux_postroute_origin origin,
 	struct selinux_net_avc_transaction *transaction)
 {
 	struct selinux_net_provenance *xfrm = NULL;
@@ -18002,7 +19316,8 @@ static int selinux_ip_postroute_compat_ns(
 	if (selinux_secmark_enabled(snapshot)) {
 		u32 secmark_sid;
 
-		err = selinux_skb_secmark_sid(skb, state, &secmark_sid);
+		err = selinux_skb_secmark_sid(skb, state, transaction,
+					     &secmark_sid);
 		if (err)
 			return err;
 		err = selinux_net_avc_transaction_add_provenance(
@@ -18019,14 +19334,6 @@ static int selinux_ip_postroute_compat_ns(
 
 	if (!IS_ENABLED(CONFIG_SECURITY_NETWORK_XFRM))
 		return 0;
-	switch (proto) {
-	case IPPROTO_AH:
-	case IPPROTO_ESP:
-	case IPPROTO_COMP:
-		return 0;
-	default:
-		break;
-	}
 
 	err = selinux_xfrm_skb_provenance_egress(skb, &xfrm);
 	if (err)
@@ -18051,7 +19358,7 @@ static int selinux_ip_postroute_policy_ns(
 	const struct selinux_policy_snapshot *snapshot,
 	enum selinux_postroute_origin origin,
 	const struct selinux_label_resolution *subject_resolution,
-	const struct selinux_peer_sources *sources, bool xfrm_pending, u8 proto,
+	const struct selinux_peer_sources *sources, bool xfrm_pending,
 	char *addrp, const struct selinux_label_view *view,
 	struct selinux_net_avc_transaction *transaction)
 {
@@ -18068,7 +19375,7 @@ static int selinux_ip_postroute_policy_ns(
 
 	if (!selinux_policy_snapshot_has_cap(snapshot, POLICYDB_CAP_NETPEER))
 		return selinux_ip_postroute_compat_ns(
-			skb, state, snapshot, socket_sid, origin, proto,
+			skb, state, snapshot, socket_sid, origin,
 			transaction);
 
 	/* A later POSTROUTE pass sees the final transform and performs checks. */
@@ -18096,7 +19403,8 @@ static int selinux_ip_postroute_policy_ns(
 		if (selinux_ip_postroute_xfrm_transformed(skb, hook_state->pf) &&
 		    !sources->netlabel.cache && !sources->xfrm)
 			return -EOPNOTSUPP;
-		err = selinux_peer_sources_sid(sources, state, &peer_sid);
+		err = selinux_net_avc_transaction_peer_sources_sid(
+			transaction, sources, state, &peer_sid);
 		if (err)
 			return err;
 		err = selinux_conn_sid(socket_sid, peer_sid, state, &subject_sid);
@@ -18105,7 +19413,8 @@ static int selinux_ip_postroute_policy_ns(
 		break;
 	}
 	case SELINUX_POSTROUTE_FORWARDED:
-		err = selinux_peer_sources_sid(sources, state, &subject_sid);
+		err = selinux_net_avc_transaction_peer_sources_sid(
+			transaction, sources, state, &subject_sid);
 		if (err)
 			return err;
 		break;
@@ -18124,7 +19433,8 @@ static int selinux_ip_postroute_policy_ns(
 				 PACKET__FORWARD_OUT : PACKET__SEND;
 		u32 secmark_sid;
 
-		err = selinux_skb_secmark_sid(skb, state, &secmark_sid);
+		err = selinux_skb_secmark_sid(skb, state, transaction,
+					     &secmark_sid);
 		if (err)
 			return err;
 		err = selinux_net_avc_transaction_add_provenance(
@@ -18216,7 +19526,6 @@ static unsigned int selinux_ip_postroute(void *priv, struct sk_buff *skb,
 	bool xfrm_pending = false;
 	unsigned int retry;
 	char *addrp = NULL;
-	u8 proto = 0;
 	int err;
 
 	(void)priv;
@@ -18307,7 +19616,7 @@ static unsigned int selinux_ip_postroute(void *priv, struct sk_buff *skb,
 		if (needs_parse && !parsed) {
 			ad_net_init_from_iif(&ad, &net, hook_state->out->ifindex,
 					     hook_state->pf);
-			err = selinux_parse_skb(skb, &ad, &addrp, 0, &proto);
+			err = selinux_parse_skb(skb, &ad, &addrp, 0, NULL);
 			if (err)
 				break;
 			parsed = true;
@@ -18320,7 +19629,7 @@ static unsigned int selinux_ip_postroute(void *priv, struct sk_buff *skb,
 				&scratch->chain.policy[i],
 				origin, &subject_resolution,
 				sources_captured ? &sources : NULL, xfrm_pending,
-				proto, addrp, view, &scratch->transaction);
+				addrp, view, &scratch->transaction);
 			if (err)
 				break;
 			err = selinux_net_avc_transaction_add_guard(
@@ -18415,10 +19724,10 @@ static int selinux_netlink_batch_add(
 	struct selinux_netlink_batch *batch,
 	const struct selinux_avc_level *level,
 	const struct selinux_policy_snapshot *snapshot,
-	const struct selinux_net_provenance *provenance)
+	const struct selinux_net_provenance *provenance,
+	const struct selinux_label_resolution *resolution)
 {
 	struct selinux_label_ref *label;
-	u32 resolved_sid;
 	u16 next, index;
 	int rc;
 
@@ -18436,7 +19745,7 @@ static int selinux_netlink_batch_add(
 	}
 	if (!provenance || !provenance->subject ||
 	    !provenance->subject->sid_handle || !provenance->subject->label ||
-	    !provenance->view || !level->state->label_domain)
+	    !provenance->view || !resolution || !level->state->label_domain)
 		return -EOPNOTSUPP;
 	if (global_sid_handle_sid(provenance->subject->sid_handle) !=
 	    provenance->subject->sid)
@@ -18448,11 +19757,11 @@ static int selinux_netlink_batch_add(
 		rc = -ESTALE;
 		goto out_label;
 	}
-	rc = selinux_label_view_resolve(
-		provenance->view, level->state->label_domain, label,
-		provenance->subject->sid, &resolved_sid);
-	if (rc || resolved_sid != level->tsid) {
-		rc = rc ?: -ESTALE;
+	if (level->state->label_domain->depth > resolution->max_depth ||
+	    resolution->domain_id[level->state->label_domain->depth] !=
+		    level->state->label_domain->id ||
+	    resolution->sid[level->state->label_domain->depth] != level->tsid) {
+		rc = -ESTALE;
 		goto out_label;
 	}
 	batch->provenance[index] = (struct selinux_avc_provenance) {
@@ -18552,7 +19861,7 @@ static int selinux_netlink_msg_has_perm(
 						.driver = driver,
 						.base_perm = AVC_EXT_NLMSG,
 						.xperm = xperm,
-					}, snapshot, provenance);
+					}, snapshot, provenance, resolution);
 #else
 				if (selinux_policycap_netlink_xperm(snapshot))
 					rc = avc_has_extended_perms_snapshot(
@@ -18572,7 +19881,7 @@ static int selinux_netlink_msg_has_perm(
 						.state = state,
 						.decision_kind =
 							SELINUX_AVC_DECISION_GUARD,
-					}, snapshot, NULL);
+					}, snapshot, NULL, NULL);
 #endif
 			}
 		} else if (rc == -EINVAL) {
@@ -18596,7 +19905,7 @@ static int selinux_netlink_msg_has_perm(
 						enforcing_enabled(state) &&
 						!security_get_allow_unknown(state) ?
 						-EINVAL : 0,
-				}, snapshot, NULL);
+				}, snapshot, NULL, NULL);
 #else
 			pr_warn_ratelimited(
 				"SELinux: unrecognized netlink message: protocol=%u nlmsg_type=%u sclass=%s pid=%d comm=%s\n",
@@ -18618,7 +19927,7 @@ static int selinux_netlink_msg_has_perm(
 					.state = state,
 					.decision_kind =
 						SELINUX_AVC_DECISION_GUARD,
-				}, snapshot, NULL);
+				}, snapshot, NULL, NULL);
 #else
 			rc = 0;
 #endif
@@ -18942,93 +20251,257 @@ static int selinux_msg_queue_msgctl(struct kern_ipc_perm *msq, int cmd)
 }
 
 #ifdef CONFIG_SECURITY_SELINUX_NS
-static int selinux_msg_projection_build(
+/* Build a candidate using the caller's already-captured operation snapshot. */
+static int selinux_msg_projection_build_snapshot(
+	const struct selinux_pathless_projection *queue_projection,
+	struct selinux_pathless_build_scratch *scratch,
+	struct selinux_pathless_projection **projectionp, u32 *sidp)
+{
+	u16 i;
+	int rc;
+
+	*projectionp = NULL;
+	if (!queue_projection)
+		return -EOPNOTSUPP;
+	rc = selinux_pathless_chain_validate(scratch);
+	if (rc)
+		return rc;
+	for (i = 0; i < scratch->chain.count; i++) {
+		const struct cred_security_struct *crsec =
+			selinux_cred(scratch->chain.cred[i]);
+		struct selinux_pathless_expect *expect =
+			&scratch->expects[crsec->state->label_domain->depth];
+		struct selinux_pathless_resolution queue;
+		u16 depth = crsec->state->label_domain->depth;
+
+		rc = selinux_pathless_projection_resolve_sealed(
+			queue_projection, crsec->state->label_domain, &queue);
+		if (rc)
+			return rc;
+		if (queue.sclass != SECCLASS_MSGQ)
+			return -EOPNOTSUPP;
+		expect->sclass = SECCLASS_MSG;
+		expect->model = SELINUX_PATHLESS_MODEL_TRANSITION;
+		scratch->producer_handles[depth] = security_transition_sid_handle(
+			crsec->state, crsec->sid, queue.sid, SECCLASS_MSG, NULL,
+			&expect->sid);
+		if (IS_ERR(scratch->producer_handles[depth])) {
+			rc = PTR_ERR(scratch->producer_handles[depth]);
+			scratch->producer_handles[depth] = NULL;
+			return rc;
+		}
+	}
+	*sidp = scratch->expects[selinux_cred(scratch->chain.cred[0])->
+					 state->label_domain->depth].sid;
+	return selinux_pathless_build_sealed(
+		scratch, SELINUX_PATHLESS_KIND_MSG,
+		SELINUX_LABEL_SOURCE_TRANSITION, *sidp, NULL, GFP_ATOMIC,
+		projectionp);
+}
+
+#define SELINUX_MSG_AVC_CHECKS_PER_POLICY 3
+#define SELINUX_MSG_AVC_MAX_CHECKS \
+	(SELINUX_MSG_AVC_CHECKS_PER_POLICY * \
+	 (SELINUX_LABEL_RESOLUTION_MAX_DEPTH + 1))
+
+static_assert(SELINUX_MSG_AVC_MAX_CHECKS <=
+	      SELINUX_AVC_TRANSACTION_MAX_CHECKS);
+
+struct selinux_msg_avc_transaction {
+	struct selinux_policy_chain_snapshot chain;
+	struct selinux_avc_level levels[SELINUX_MSG_AVC_MAX_CHECKS];
+	struct selinux_policy_snapshot snapshots[SELINUX_MSG_AVC_MAX_CHECKS];
+	struct selinux_avc_provenance queue_provenance;
+	struct selinux_avc_provenance message_provenance;
+	u16 count;
+};
+
+static int selinux_msg_avc_transaction_add(
+	struct selinux_msg_avc_transaction *transaction,
+	const struct selinux_avc_level *level,
+	const struct selinux_policy_snapshot *snapshot)
+{
+	u16 next;
+
+	if (check_add_overflow(transaction->count, (u16)1, &next) ||
+	    next > ARRAY_SIZE(transaction->levels))
+		return -E2BIG;
+	transaction->levels[transaction->count] = *level;
+	transaction->snapshots[transaction->count] = *snapshot;
+	transaction->count = next;
+	return 0;
+}
+
+/*
+ * A send/receive is one authorization event even though SELinux models it as
+ * several permissions.  Capture the policy chain once and decide every part
+ * against that exact generation; otherwise a concurrent reload could allow
+ * different parts under mutually incompatible policies.
+ */
+static int selinux_msg_queue_has_perm_transaction(
 	const struct cred *cred,
 	const struct selinux_pathless_projection *queue_projection,
-	struct msg_security_struct *msec)
+	struct msg_security_struct *msec, bool send,
+	struct common_audit_data *ad)
 {
-	struct selinux_pathless_build_scratch *scratch;
+	struct selinux_pathless_build_scratch *build;
+	struct selinux_avc_transaction_workspace *workspace;
+	struct selinux_msg_avc_transaction *transaction;
 	unsigned int retry;
 	int rc = -ESTALE;
 
-	if (!queue_projection)
-		return -EOPNOTSUPP;
-	scratch = kzalloc_obj(*scratch, GFP_ATOMIC);
-	if (!scratch)
-		return -ENOMEM;
+	if (!queue_projection ||
+	    queue_projection->kind != SELINUX_PATHLESS_KIND_IPC ||
+	    !msec)
+		return -EACCES;
 
+	transaction = kzalloc_obj(*transaction, GFP_ATOMIC | __GFP_NOWARN);
+	if (!transaction)
+		return -ENOMEM;
+	build = kzalloc_obj(*build, GFP_ATOMIC | __GFP_NOWARN);
+	if (!build) {
+		rc = -ENOMEM;
+		goto out;
+	}
+	workspace = selinux_avc_transaction_workspace_alloc(
+		SELINUX_MSG_AVC_MAX_CHECKS, GFP_ATOMIC | __GFP_NOWARN);
+	if (!workspace) {
+		rc = -ENOMEM;
+		goto out_build;
+	}
+
+	transaction->queue_provenance = (struct selinux_avc_provenance) {
+		.label = queue_projection->label,
+		.view = queue_projection->view,
+		.source = queue_projection->source,
+	};
 	for (retry = 0; retry < SELINUX_POLICY_OPERATION_RETRIES; retry++) {
-		struct selinux_pathless_projection *projection = NULL;
+		const struct selinux_pathless_projection *message_projection;
+		struct selinux_pathless_projection *candidate = NULL;
+		u32 candidate_sid = 0;
 		u16 i;
 
-		selinux_pathless_producer_handles_put(scratch);
-		memset(scratch, 0, sizeof(*scratch));
-		rc = selinux_policy_chain_snapshot_read(cred, &scratch->chain);
+		transaction->count = 0;
+		selinux_pathless_producer_handles_put(build);
+		memset(build, 0, sizeof(*build));
+		rc = selinux_policy_chain_snapshot_read(cred, &transaction->chain);
 		if (rc == -EAGAIN || rc == -ESTALE)
 			continue;
 		if (rc)
 			break;
-		rc = selinux_pathless_chain_validate(scratch);
-		if (rc)
-			break;
+		build->chain = transaction->chain;
+		message_projection = READ_ONCE(msec->projection);
+		if (!message_projection && send &&
+		    READ_ONCE(msec->sid) == SECINITSID_UNLABELED) {
+			rc = selinux_msg_projection_build_snapshot(
+				queue_projection, build, &candidate, &candidate_sid);
+			if (rc)
+				goto retry_or_out;
+			message_projection = candidate;
+		}
+		if (!message_projection ||
+		    message_projection->kind != SELINUX_PATHLESS_KIND_MSG) {
+			rc = -EACCES;
+			goto retry_or_out;
+		}
+		transaction->message_provenance =
+			(struct selinux_avc_provenance) {
+				.label = message_projection->label,
+				.view = message_projection->view,
+				.source = message_projection->source,
+			};
 
-		for (i = 0; i < scratch->chain.count; i++) {
+		for (i = 0; i < transaction->chain.count; i++) {
 			const struct cred_security_struct *crsec =
-				selinux_cred(scratch->chain.cred[i]);
-			struct selinux_pathless_expect *expect =
-				&scratch->expects[crsec->state->label_domain->depth];
+				selinux_cred(transaction->chain.cred[i]);
+			const struct selinux_policy_snapshot *snapshot =
+				&transaction->chain.policy[i];
 			struct selinux_pathless_resolution queue;
-			u16 depth = crsec->state->label_domain->depth;
+			struct selinux_pathless_resolution message;
 
 			rc = selinux_pathless_projection_resolve_sealed(
 				queue_projection, crsec->state->label_domain, &queue);
 			if (rc)
 				break;
-			if (queue.sclass != SECCLASS_MSGQ) {
+			rc = selinux_pathless_projection_resolve_sealed(
+				message_projection, crsec->state->label_domain,
+				&message);
+			if (rc)
+				break;
+			if (queue.sclass != SECCLASS_MSGQ ||
+			    message.sclass != SECCLASS_MSG) {
 				rc = -EOPNOTSUPP;
 				break;
 			}
-			expect->sclass = SECCLASS_MSG;
-			expect->model = SELINUX_PATHLESS_MODEL_TRANSITION;
-			scratch->producer_handles[depth] =
-				security_transition_sid_handle(
-				crsec->state, crsec->sid, queue.sid, SECCLASS_MSG,
-				NULL, &expect->sid);
-			if (IS_ERR(scratch->producer_handles[depth])) {
-				rc = PTR_ERR(scratch->producer_handles[depth]);
-				scratch->producer_handles[depth] = NULL;
+
+			rc = selinux_msg_avc_transaction_add(
+				transaction,
+				&(struct selinux_avc_level) {
+					.state = crsec->state,
+					.ssid = crsec->sid,
+					.tsid = queue.sid,
+					.requested = send ? MSGQ__WRITE : MSGQ__READ,
+					.tclass = SECCLASS_MSGQ,
+					.provenance =
+						&transaction->queue_provenance,
+				}, snapshot);
+			if (rc)
 				break;
-			}
+			rc = selinux_msg_avc_transaction_add(
+				transaction,
+				&(struct selinux_avc_level) {
+					.state = crsec->state,
+					.ssid = crsec->sid,
+					.tsid = message.sid,
+					.requested = send ? MSG__SEND : MSG__RECEIVE,
+					.tclass = SECCLASS_MSG,
+					.provenance =
+						&transaction->message_provenance,
+				}, snapshot);
+			if (rc)
+				break;
+			if (!send)
+				continue;
+			rc = selinux_msg_avc_transaction_add(
+				transaction,
+				&(struct selinux_avc_level) {
+					.state = crsec->state,
+					.ssid = message.sid,
+					.tsid = queue.sid,
+					.requested = MSGQ__ENQUEUE,
+					.tclass = SECCLASS_MSGQ,
+					.provenance =
+						&transaction->queue_provenance,
+				}, snapshot);
+			if (rc)
+				break;
 		}
 		if (rc)
-			goto next_retry;
+			goto retry_or_out;
 
-		rc = selinux_pathless_build_sealed(
-			scratch, SELINUX_PATHLESS_KIND_MSG,
-			SELINUX_LABEL_SOURCE_TRANSITION,
-			scratch->expects[selinux_cred(scratch->chain.cred[0])->
-					 state->label_domain->depth].sid,
-			NULL, GFP_ATOMIC, &projection);
-		if (rc)
-			goto next_retry;
-		if (!selinux_policy_chain_snapshot_valid(&scratch->chain)) {
+		rc = selinux_avc_transaction_has_perm_workspace(
+			transaction->levels, transaction->snapshots,
+			transaction->count, ad, workspace);
+		if (!rc && !selinux_policy_chain_snapshot_valid(&transaction->chain))
 			rc = -ESTALE;
-			goto next_retry;
+		if (!rc && candidate) {
+			WRITE_ONCE(msec->projection, candidate);
+			/* Publish canonical provenance before its numeric projection. */
+			smp_store_release(&msec->sid, candidate_sid);
+			candidate = NULL;
 		}
-
-		msec->sid = scratch->expects[
-			selinux_cred(scratch->chain.cred[0])->
-				state->label_domain->depth].sid;
-		msec->projection = projection;
-		rc = 0;
-		break;
-next_retry:
-		selinux_pathless_projection_put(projection);
+retry_or_out:
+		selinux_pathless_projection_put(candidate);
 		if (rc != -EAGAIN && rc != -ESTALE)
 			break;
 	}
-	selinux_pathless_producer_handles_put(scratch);
-	kfree(scratch);
+
+	selinux_pathless_producer_handles_put(build);
+	selinux_avc_transaction_workspace_free(workspace);
+out_build:
+	kfree(build);
+out:
+	kfree(transaction);
 	return rc;
 }
 #endif
@@ -19056,7 +20529,8 @@ static int selinux_msg_queue_msgsnd(struct kern_ipc_perm *msq, struct msg_msg *m
 		 * message queue this message will be stored in
 		 */
 #ifdef CONFIG_SECURITY_SELINUX_NS
-		rc = selinux_msg_projection_build(cred, isec->projection, msec);
+		/* The transition candidate is derived and committed by the send. */
+		rc = 0;
 #else
 		rc = security_transition_sid(current_selinux_state, sid,
 					     isec->sid, SECCLASS_MSG, NULL,
@@ -19072,19 +20546,8 @@ static int selinux_msg_queue_msgsnd(struct kern_ipc_perm *msq, struct msg_msg *m
 	/* Can this process write to the queue? */
 
 #ifdef CONFIG_SECURITY_SELINUX_NS
-	if (!msec->projection ||
-	    msec->projection->kind != SELINUX_PATHLESS_KIND_MSG ||
-	    !isec->projection ||
-	    isec->projection->kind != SELINUX_PATHLESS_KIND_IPC)
-		return -EACCES;
-	rc = cred_pathless_has_perm(cred, isec->projection, MSGQ__WRITE, &ad);
-	if (!rc)
-		rc = cred_pathless_has_perm(cred, msec->projection, MSG__SEND,
-					      &ad);
-	if (!rc)
-		rc = cred_pathless_relation_has_perm(
-			cred, msec->projection, isec->projection, SECCLASS_MSG,
-			SECCLASS_MSGQ, MSGQ__ENQUEUE, &ad);
+	rc = selinux_msg_queue_has_perm_transaction(
+		cred, isec->projection, msec, true, &ad);
 #else
 	rc = cred_tsid_has_perm(cred, isec->sid, SECCLASS_MSGQ, MSGQ__WRITE,
 				&ad);
@@ -19122,17 +20585,8 @@ static int selinux_msg_queue_msgrcv(struct kern_ipc_perm *msq, struct msg_msg *m
 	{
 		const struct cred *target_cred = get_task_cred(target);
 
-		if (!msec->projection ||
-		    msec->projection->kind != SELINUX_PATHLESS_KIND_MSG ||
-		    !isec->projection ||
-		    isec->projection->kind != SELINUX_PATHLESS_KIND_IPC)
-			rc = -EACCES;
-		else
-			rc = cred_pathless_has_perm(target_cred, isec->projection,
-						    MSGQ__READ, &ad);
-		if (!rc)
-			rc = cred_pathless_has_perm(target_cred, msec->projection,
-						    MSG__RECEIVE, &ad);
+		rc = selinux_msg_queue_has_perm_transaction(
+			target_cred, isec->projection, msec, false, &ad);
 		put_cred(target_cred);
 	}
 #else
@@ -19860,12 +21314,129 @@ static void selinux_inode_invalidate_secctx(struct inode *inode)
 /*
  *	called with inode->i_mutex locked
  */
+#ifdef CONFIG_SECURITY_SELINUX_NS
+static int selinux_inode_notifysecctx_anchored(struct inode *inode,
+					       const void *ctx, u32 ctxlen)
+{
+	struct superblock_security_struct *sbsec = selinux_superblock(inode->i_sb);
+	struct inode_security_struct *isec = selinux_inode(inode);
+	struct selinux_label_domain *anchor_domain = NULL;
+	struct selinux_state *anchor_state = NULL;
+	struct selinux_policy_snapshot snapshot;
+	u16 sclass = inode_mode_to_security_class(inode->i_mode);
+	unsigned int retry;
+	int rc = -ESTALE;
+
+	if (!ctx || !ctxlen) {
+		rc = -EACCES;
+		goto out;
+	}
+	if (!selinux_is_sblabel_mnt(inode->i_sb)) {
+		rc = -EOPNOTSUPP;
+		goto out;
+	}
+
+	/* This is an intrinsic filesystem assertion, not an actor relabel request. */
+	mutex_lock(&sbsec->lock);
+	if (!sbsec->anchor_state || !sbsec->anchor_domain ||
+	    sbsec->anchor_state->label_domain != sbsec->anchor_domain ||
+	    !selinux_state_active(sbsec->anchor_state)) {
+		rc = -EACCES;
+	} else {
+		anchor_state = get_selinux_state(sbsec->anchor_state);
+		anchor_domain = selinux_label_domain_get(sbsec->anchor_domain);
+		rc = 0;
+	}
+	mutex_unlock(&sbsec->lock);
+	if (rc)
+		goto out;
+
+	for (retry = 0; retry < SELINUX_POLICY_OPERATION_RETRIES; retry++) {
+		struct selinux_global_sid_handle *handle;
+		struct selinux_label_ref *label;
+		u32 sid;
+
+		rc = selinux_policy_snapshot_read(anchor_state, &snapshot);
+		if (rc == -EAGAIN || rc == -ESTALE)
+			continue;
+		if (rc)
+			break;
+
+		handle = security_context_to_global_handle(
+			anchor_state, ctx, ctxlen, &sid, GFP_NOFS);
+		if (IS_ERR(handle)) {
+			rc = PTR_ERR(handle);
+			if (rc == -EAGAIN || rc == -ESTALE)
+				continue;
+			break;
+		}
+		if (!selinux_policy_snapshot_valid(anchor_state, &snapshot)) {
+			global_sid_handle_put(handle);
+			rc = -ESTALE;
+			continue;
+		}
+
+		label = global_sid_handle_label_get(handle);
+		if (!label || !sid || global_sid_handle_sid(handle) != sid) {
+			rc = -ESTALE;
+		} else if (label->domain != anchor_domain &&
+			   !((label->domain->flags &
+			      SELINUX_LABEL_DOMAIN_KERNEL_GLOBAL) &&
+			     sid <= SECINITSID_NUM)) {
+			rc = -EXDEV;
+		} else {
+			rc = 0;
+		}
+		selinux_label_ref_put(label);
+		if (rc) {
+			global_sid_handle_put(handle);
+			break;
+		}
+		if (!selinux_policy_snapshot_valid(anchor_state, &snapshot)) {
+			global_sid_handle_put(handle);
+			rc = -ESTALE;
+			continue;
+		}
+
+		/* Consumes @handle and publishes the complete inode label tuple. */
+		rc = selinux_inode_security_take_sid_handle(
+			isec, handle, &sclass, SELINUX_LABEL_SOURCE_SECURITY_CONTEXT,
+			LABEL_INITIALIZED);
+		if (rc) {
+			if (rc == -EAGAIN || rc == -ESTALE)
+				continue;
+			break;
+		}
+		if (!selinux_policy_snapshot_valid(anchor_state, &snapshot)) {
+			selinux_inode_security_invalidate(inode);
+			rc = -ESTALE;
+			continue;
+		}
+		break;
+	}
+
+out:
+	if (anchor_state)
+		put_selinux_state(anchor_state);
+	if (anchor_domain)
+		selinux_label_domain_put(anchor_domain);
+	/* A rejected server label must not leave the previous tuple usable. */
+	if (rc)
+		selinux_inode_invalidate_secctx(inode);
+	return rc;
+}
+#endif
+
 static int selinux_inode_notifysecctx(struct inode *inode, void *ctx, u32 ctxlen)
 {
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	return selinux_inode_notifysecctx_anchored(inode, ctx, ctxlen);
+#else
 	int rc = selinux_inode_setsecurity(inode, XATTR_SELINUX_SUFFIX,
 					   ctx, ctxlen, 0);
 	/* Do not return error when suppressing label. */
 	return rc == -EOPNOTSUPP ? 0 : rc;
+#endif
 }
 
 /*
@@ -20102,6 +21673,9 @@ static int selinux_ib_pkey_access(void *ib_sec, u64 subnet_prefix, u16 pkey_val)
 	struct ib_security_struct *sec = selinux_ib(ib_sec);
 	struct lsm_ibpkey_audit ibpkey;
 #ifdef CONFIG_SECURITY_SELINUX_NS
+	const struct selinux_pathless_projection *projection;
+	const struct cred *cred;
+	struct selinux_net_avc_transaction *transaction __free(kfree) = NULL;
 	struct selinux_policy_chain_snapshot *chain __free(kfree) = NULL;
 #endif
 
@@ -20110,22 +21684,35 @@ static int selinux_ib_pkey_access(void *ib_sec, u64 subnet_prefix, u16 pkey_val)
 	ibpkey.pkey = pkey_val;
 	ad.u.ibpkey = &ibpkey;
 #ifdef CONFIG_SECURITY_SELINUX_NS
+	cred = READ_ONCE(sec->cred);
+	projection = READ_ONCE(sec->projection);
+	if (!cred || !projection ||
+	    projection->kind != SELINUX_PATHLESS_KIND_INFINIBAND)
+		return -EACCES;
 	chain = kzalloc_obj(*chain, GFP_ATOMIC);
-	if (!chain)
+	transaction = kzalloc_obj(*transaction, GFP_ATOMIC | __GFP_NOWARN);
+	if (!chain || !transaction)
+		return -ENOMEM;
+	transaction->workspace = selinux_avc_transaction_workspace_alloc(
+		SELINUX_NET_AVC_MAX_CHECKS, GFP_ATOMIC | __GFP_NOWARN);
+	if (!transaction->workspace)
 		return -ENOMEM;
 	{
 		unsigned int retry;
+		int result = -ESTALE;
 
 		for (retry = 0; retry < SELINUX_POLICY_OPERATION_RETRIES; retry++) {
 			u16 i;
 			int rc;
 
-			rc = selinux_policy_chain_snapshot_read(current_cred(),
-								chain);
+			selinux_net_avc_transaction_reset(transaction);
+			rc = selinux_policy_chain_snapshot_read(cred, chain);
 			if (rc == -EAGAIN || rc == -ESTALE)
 				continue;
-			if (rc)
-				return rc;
+			if (rc) {
+				result = rc;
+				break;
+			}
 			for (i = 0; i < chain->count; i++) {
 				const struct cred_security_struct *crsec =
 					selinux_cred(chain->cred[i]);
@@ -20134,10 +21721,9 @@ static int selinux_ib_pkey_access(void *ib_sec, u64 subnet_prefix, u16 pkey_val)
 				u32 pkey_sid;
 
 				rc = selinux_pathless_projection_resolve_sealed(
-					sec->projection,
+					projection,
 					crsec->state->label_domain, &resolved);
-				if (rc || sec->projection->kind !=
-					  SELINUX_PATHLESS_KIND_INFINIBAND)
+				if (rc)
 					break;
 				if (resolved.sclass != SECCLASS_PROCESS) {
 					rc = -EOPNOTSUPP;
@@ -20150,20 +21736,30 @@ static int selinux_ib_pkey_access(void *ib_sec, u64 subnet_prefix, u16 pkey_val)
 					rc = PTR_ERR(pkey_handle);
 					break;
 				}
-				rc = avc_has_perm_snapshot(
-					crsec->state, &chain->policy[i], resolved.sid,
-					pkey_sid, SECCLASS_INFINIBAND_PKEY,
-					INFINIBAND_PKEY__ACCESS, &ad);
-				global_sid_handle_put(pkey_handle);
+				rc = selinux_net_avc_transaction_add_handle(
+					transaction,
+					&(struct selinux_avc_level) {
+						.state = crsec->state,
+						.ssid = resolved.sid,
+						.tsid = pkey_sid,
+						.tclass = SECCLASS_INFINIBAND_PKEY,
+						.requested = INFINIBAND_PKEY__ACCESS,
+					}, &chain->policy[i], pkey_handle,
+					projection->view, projection->source);
 				if (rc)
 					break;
 			}
+			if (!rc)
+				rc = selinux_net_avc_transaction_decide(transaction, &ad);
 			if (rc == -ESTALE ||
 			    !selinux_policy_chain_snapshot_valid(chain))
 				continue;
-			return rc;
+			result = rc;
+			break;
 		}
-		return -ESTALE;
+		selinux_net_avc_transaction_reset(transaction);
+		selinux_avc_transaction_workspace_free(transaction->workspace);
+		return result;
 	}
 #else
 	return selinux_state_pkey_has_perm(current_selinux_state, sec->sid,
@@ -20180,6 +21776,9 @@ static int selinux_ib_endport_manage_subnet(void *ib_sec, const char *dev_name,
 	struct ib_security_struct *sec = selinux_ib(ib_sec);
 	struct lsm_ibendport_audit ibendport;
 #ifdef CONFIG_SECURITY_SELINUX_NS
+	const struct selinux_pathless_projection *projection;
+	const struct cred *cred;
+	struct selinux_net_avc_transaction *transaction __free(kfree) = NULL;
 	struct selinux_policy_chain_snapshot *chain __free(kfree) = NULL;
 #endif
 
@@ -20188,21 +21787,34 @@ static int selinux_ib_endport_manage_subnet(void *ib_sec, const char *dev_name,
 	ibendport.port = port_num;
 	ad.u.ibendport = &ibendport;
 #ifdef CONFIG_SECURITY_SELINUX_NS
+	cred = READ_ONCE(sec->cred);
+	projection = READ_ONCE(sec->projection);
+	if (!cred || !projection ||
+	    projection->kind != SELINUX_PATHLESS_KIND_INFINIBAND)
+		return -EACCES;
 	chain = kzalloc_obj(*chain, GFP_ATOMIC);
-	if (!chain)
+	transaction = kzalloc_obj(*transaction, GFP_ATOMIC | __GFP_NOWARN);
+	if (!chain || !transaction)
+		return -ENOMEM;
+	transaction->workspace = selinux_avc_transaction_workspace_alloc(
+		SELINUX_NET_AVC_MAX_CHECKS, GFP_ATOMIC | __GFP_NOWARN);
+	if (!transaction->workspace)
 		return -ENOMEM;
 	{
 		unsigned int retry;
+		int result = -ESTALE;
 
 		for (retry = 0; retry < SELINUX_POLICY_OPERATION_RETRIES; retry++) {
 			u16 i;
 
-			err = selinux_policy_chain_snapshot_read(current_cred(),
-								 chain);
+			selinux_net_avc_transaction_reset(transaction);
+			err = selinux_policy_chain_snapshot_read(cred, chain);
 			if (err == -EAGAIN || err == -ESTALE)
 				continue;
-			if (err)
-				return err;
+			if (err) {
+				result = err;
+				break;
+			}
 			for (i = 0; i < chain->count; i++) {
 				const struct cred_security_struct *crsec =
 					selinux_cred(chain->cred[i]);
@@ -20210,10 +21822,9 @@ static int selinux_ib_endport_manage_subnet(void *ib_sec, const char *dev_name,
 				struct selinux_pathless_resolution resolved;
 
 				err = selinux_pathless_projection_resolve_sealed(
-					sec->projection,
+					projection,
 					crsec->state->label_domain, &resolved);
-				if (err || sec->projection->kind !=
-					   SELINUX_PATHLESS_KIND_INFINIBAND)
+				if (err)
 					break;
 				if (resolved.sclass != SECCLASS_PROCESS) {
 					err = -EOPNOTSUPP;
@@ -20225,20 +21836,31 @@ static int selinux_ib_endport_manage_subnet(void *ib_sec, const char *dev_name,
 					err = PTR_ERR(endport_handle);
 					break;
 				}
-				err = avc_has_perm_snapshot(
-					crsec->state, &chain->policy[i], resolved.sid,
-					sid, SECCLASS_INFINIBAND_ENDPORT,
-					INFINIBAND_ENDPORT__MANAGE_SUBNET, &ad);
-				global_sid_handle_put(endport_handle);
+				err = selinux_net_avc_transaction_add_handle(
+					transaction,
+					&(struct selinux_avc_level) {
+						.state = crsec->state,
+						.ssid = resolved.sid,
+						.tsid = sid,
+						.tclass = SECCLASS_INFINIBAND_ENDPORT,
+						.requested =
+							INFINIBAND_ENDPORT__MANAGE_SUBNET,
+					}, &chain->policy[i], endport_handle,
+					projection->view, projection->source);
 				if (err)
 					break;
 			}
+			if (!err)
+				err = selinux_net_avc_transaction_decide(transaction, &ad);
 			if (err == -ESTALE ||
 			    !selinux_policy_chain_snapshot_valid(chain))
 				continue;
-			return err;
+			result = err;
+			break;
 		}
-		return -ESTALE;
+		selinux_net_avc_transaction_reset(transaction);
+		selinux_avc_transaction_workspace_free(transaction->workspace);
+		return result;
 	}
 #else
 	err = security_ib_endport_sid(current_selinux_state, dev_name, port_num,
@@ -20257,13 +21879,44 @@ static int selinux_ib_alloc_security(void *ib_sec)
 	struct ib_security_struct *sec = selinux_ib(ib_sec);
 
 #ifdef CONFIG_SECURITY_SELINUX_NS
+	const struct cred *cred = get_cred(current_cred());
+	int rc;
+
 	/* The concrete IB operation selects the target class dynamically. */
-	return selinux_creator_projection_build(
-		current_cred(), SELINUX_PATHLESS_KIND_INFINIBAND,
+	rc = selinux_creator_projection_build(
+		cred, SELINUX_PATHLESS_KIND_INFINIBAND,
 		SECCLASS_PROCESS, false, 0, NULL, NULL, &sec->sid,
 		&sec->projection);
+	if (rc) {
+		put_cred(cred);
+		return rc;
+	}
+	WRITE_ONCE(sec->cred, cred);
+	return 0;
 #else
 	sec->sid = current_sid();
+	return 0;
+#endif
+}
+
+static int selinux_ib_policy_scopes(void *ib_sec, u64 *scope_ids, u16 capacity)
+{
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	struct ib_security_struct *sec = selinux_ib(ib_sec);
+	const struct cred *cred = READ_ONCE(sec->cred);
+	u16 count = 0;
+
+	while (cred) {
+		const struct cred_security_struct *crsec = selinux_cred(cred);
+
+		if (count == capacity || !crsec->state ||
+		    !crsec->state->label_domain)
+			return -E2BIG;
+		scope_ids[count++] = crsec->state->label_domain->id;
+		cred = crsec->parent_cred;
+	}
+	return count;
+#else
 	return 0;
 #endif
 }
@@ -20272,9 +21925,13 @@ static void selinux_ib_free_security(void *ib_sec)
 {
 #ifdef CONFIG_SECURITY_SELINUX_NS
 	struct ib_security_struct *sec = selinux_ib(ib_sec);
+	struct selinux_pathless_projection *projection;
+	const struct cred *cred;
 
-	selinux_pathless_projection_put(sec->projection);
-	sec->projection = NULL;
+	projection = xchg(&sec->projection, NULL);
+	cred = xchg(&sec->cred, NULL);
+	selinux_pathless_projection_put(projection);
+	put_cred(cred);
 #endif
 }
 #endif
@@ -20620,6 +22277,7 @@ static int selinux_bpf_chain_target_has_perm(
 	}
 	return rc;
 }
+
 #endif /* CONFIG_SECURITY_SELINUX_NS */
 
 /* This function will check the file pass through unix socket or binder to see
@@ -20630,7 +22288,174 @@ static int selinux_bpf_chain_target_has_perm(
  * access the bpf object and that's why we have to add this additional check in
  * selinux_file_receive and selinux_binder_transfer_files.
  */
-static int bpf_fd_pass(const struct file *file, const struct cred *cred)
+#ifdef CONFIG_SECURITY_SELINUX_NS
+static int selinux_file_transfer_bpf_add(
+	struct selinux_file_transfer_transaction *transaction,
+	const struct selinux_pathless_projection *projection, u32 requested,
+	bool object_cap_only)
+{
+	const struct selinux_avc_provenance *provenance;
+	u16 i;
+	int rc;
+
+	if (!projection || projection->kind != SELINUX_PATHLESS_KIND_BPF ||
+	    !requested)
+		return -EACCES;
+	rc = selinux_file_transfer_transaction_provenance(
+		transaction, projection->label, projection->view,
+		projection->source, &provenance);
+	if (rc)
+		return rc;
+	for (i = 0; i < transaction->chain.count; i++) {
+		const struct cred_security_struct *crsec =
+			selinux_cred(transaction->chain.cred[i]);
+		u32 tsid;
+
+		if (object_cap_only &&
+		    !selinux_policycap_bpf_object_perms(
+			    &transaction->chain.policy[i]))
+			continue;
+		rc = selinux_bpf_projection_resolve(
+			projection, crsec->state->label_domain, &tsid);
+		if (rc)
+			return rc;
+		rc = selinux_file_transfer_transaction_add(
+			transaction,
+			&(struct selinux_avc_level) {
+				.state = crsec->state,
+				.ssid = crsec->sid,
+				.tsid = tsid,
+				.tclass = SECCLASS_BPF,
+				.requested = requested,
+				.provenance = provenance,
+			}, &transaction->chain.policy[i]);
+		if (rc)
+			return rc;
+	}
+	return 0;
+}
+
+static int bpf_fd_pass_add(
+	const struct file *file, const struct cred *cred,
+	struct selinux_file_transfer_transaction *transaction)
+{
+	const struct selinux_pathless_projection *projection;
+
+	if (!transaction->chain.count || transaction->chain.cred[0] != cred)
+		return -EXDEV;
+	if (file->f_op == &bpf_map_fops) {
+		projection = READ_ONCE(selinux_bpf_map_security(
+			file->private_data)->object);
+		return selinux_file_transfer_bpf_add(
+			transaction, projection, bpf_map_fmode_to_av(file->f_mode),
+			false);
+	}
+	if (file->f_op == &bpf_prog_fops) {
+		projection = READ_ONCE(selinux_bpf_prog_security(
+			file->private_data)->object);
+		return selinux_file_transfer_bpf_add(
+			transaction, projection, BPF__PROG_RUN, false);
+	}
+	if (file->f_op == &bpf_link_fops || file->f_op == &bpf_link_fops_poll) {
+		projection = READ_ONCE(selinux_bpf_link_security(
+			file->private_data)->object);
+		return selinux_file_transfer_bpf_add(
+			transaction, projection,
+			selinux_bpf_link_cmd_perm(BPF_OBJ_GET), true);
+	}
+	if (file->f_op == &btf_fops) {
+		projection = READ_ONCE(selinux_bpf_btf_security(
+			file->private_data)->object);
+		return selinux_file_transfer_bpf_add(
+			transaction, projection, BPF__BTF_READ, true);
+	}
+	if (file->f_op == &bpf_token_fops) {
+		const struct bpf_security_struct *bpfsec =
+			selinux_bpf_token_security(file->private_data);
+		const struct selinux_pathless_projection *object =
+			READ_ONCE(bpfsec->object);
+		const struct selinux_pathless_projection *grantor =
+			READ_ONCE(bpfsec->grantor);
+		const struct selinux_avc_provenance *object_provenance;
+		const struct selinux_avc_provenance *grantor_provenance;
+		u32 object_requested = READ_ONCE(bpfsec->perms);
+		u32 grantor_requested = 0;
+		u16 i;
+		int rc;
+
+		if (!object || object->kind != SELINUX_PATHLESS_KIND_BPF ||
+		    !grantor || grantor->kind != SELINUX_PATHLESS_KIND_BPF ||
+		    object_requested & ~(BPF__MAP_CREATE | BPF__PROG_LOAD |
+				 BPF__BTF_LOAD))
+			return -EACCES;
+		if (object_requested & BPF__MAP_CREATE)
+			grantor_requested |= BPF__MAP_CREATE_AS;
+		if (object_requested & BPF__PROG_LOAD)
+			grantor_requested |= BPF__PROG_LOAD_AS;
+		rc = selinux_file_transfer_transaction_provenance(
+			transaction, object->label, object->view, object->source,
+			&object_provenance);
+		if (rc)
+			return rc;
+		rc = selinux_file_transfer_transaction_provenance(
+			transaction, grantor->label, grantor->view, grantor->source,
+			&grantor_provenance);
+		if (rc)
+			return rc;
+		for (i = 0; i < transaction->chain.count; i++) {
+			const struct cred_security_struct *crsec =
+				selinux_cred(transaction->chain.cred[i]);
+			u32 policy_requested = object_requested;
+			u32 object_sid, grantor_sid;
+
+			if (!selinux_policycap_bpf_object_perms(
+				    &transaction->chain.policy[i]))
+				policy_requested &= ~BPF__BTF_LOAD;
+			rc = selinux_bpf_projection_resolve(
+				object, crsec->state->label_domain, &object_sid);
+			if (rc)
+				return rc;
+			rc = selinux_bpf_projection_resolve(
+				grantor, crsec->state->label_domain, &grantor_sid);
+			if (rc)
+				return rc;
+			if (policy_requested) {
+				rc = selinux_file_transfer_transaction_add(
+					transaction,
+					&(struct selinux_avc_level) {
+						.state = crsec->state,
+						.ssid = crsec->sid,
+						.tsid = object_sid,
+						.tclass = SECCLASS_BPF,
+						.requested = policy_requested,
+						.provenance = object_provenance,
+					}, &transaction->chain.policy[i]);
+				if (rc)
+					return rc;
+			}
+			if (grantor_requested) {
+				rc = selinux_file_transfer_transaction_add(
+					transaction,
+					&(struct selinux_avc_level) {
+						.state = crsec->state,
+						.ssid = crsec->sid,
+						.tsid = grantor_sid,
+						.tclass = SECCLASS_BPF,
+						.requested = grantor_requested,
+						.provenance = grantor_provenance,
+					}, &transaction->chain.policy[i]);
+				if (rc)
+					return rc;
+			}
+		}
+	}
+	return 0;
+}
+#endif
+
+#ifndef CONFIG_SECURITY_SELINUX_NS
+static int __maybe_unused bpf_fd_pass(const struct file *file,
+				      const struct cred *cred)
 {
 	struct bpf_security_struct *bpfsec;
 	struct bpf_prog *prog;
@@ -20665,16 +22490,24 @@ static int bpf_fd_pass(const struct file *file, const struct cred *cred)
 			return ret;
 	} else if (file->f_op == &bpf_link_fops ||
 		   file->f_op == &bpf_link_fops_poll) {
-		ret = selinux_bpf_link_access(file->private_data, BPF_OBJ_GET);
+		ret = selinux_bpf_link_access_cred(
+			cred, file->private_data, BPF_OBJ_GET);
 		if (ret)
 			return ret;
 	} else if (file->f_op == &btf_fops) {
-		ret = selinux_bpf_btf(file->private_data);
+		ret = selinux_bpf_btf_cred(cred, file->private_data);
 		if (ret)
 			return ret;
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	} else if (file->f_op == &bpf_token_fops) {
+		ret = selinux_bpf_token_fd_pass(cred, file->private_data);
+		if (ret)
+			return ret;
+#endif
 	}
 	return 0;
 }
+#endif
 
 static int selinux_bpf_map(struct bpf_map *map, fmode_t fmode)
 {
@@ -21663,7 +23496,8 @@ next_retry:
 	return rc;
 }
 
-static int selinux_bpf_link_access(struct bpf_link *link, enum bpf_cmd cmd)
+static int selinux_bpf_link_access_cred(const struct cred *cred,
+					struct bpf_link *link, enum bpf_cmd cmd)
 {
 	struct bpf_security_struct *bpfsec = selinux_bpf_link_security(link);
 	struct selinux_policy_chain_snapshot *chain __free(kfree) = NULL;
@@ -21679,7 +23513,7 @@ static int selinux_bpf_link_access(struct bpf_link *link, enum bpf_cmd cmd)
 		u16 i;
 		int rc = 0;
 
-		rc = selinux_policy_chain_snapshot_read(current_cred(), chain);
+		rc = selinux_policy_chain_snapshot_read(cred, chain);
 		if (rc == -EAGAIN || rc == -ESTALE)
 			continue;
 		if (rc)
@@ -21707,6 +23541,11 @@ static int selinux_bpf_link_access(struct bpf_link *link, enum bpf_cmd cmd)
 		return rc;
 	}
 	return -ESTALE;
+}
+
+static int selinux_bpf_link_access(struct bpf_link *link, enum bpf_cmd cmd)
+{
+	return selinux_bpf_link_access_cred(current_cred(), link, cmd);
 }
 
 static int selinux_bpf_link_update(struct bpf_link *link,
@@ -21897,7 +23736,8 @@ next_retry:
 	return rc;
 }
 
-static int selinux_bpf_btf(const struct btf *btf)
+static int selinux_bpf_btf_cred(const struct cred *cred,
+				const struct btf *btf)
 {
 	struct bpf_security_struct *bpfsec =
 		selinux_bpf_btf_security((struct btf *)btf);
@@ -21913,7 +23753,7 @@ static int selinux_bpf_btf(const struct btf *btf)
 		u16 i;
 		int rc = 0;
 
-		rc = selinux_policy_chain_snapshot_read(current_cred(), chain);
+		rc = selinux_policy_chain_snapshot_read(cred, chain);
 		if (rc == -EAGAIN || rc == -ESTALE)
 			continue;
 		if (rc)
@@ -21941,6 +23781,11 @@ static int selinux_bpf_btf(const struct btf *btf)
 		return rc;
 	}
 	return -ESTALE;
+}
+
+static int selinux_bpf_btf(const struct btf *btf)
+{
+	return selinux_bpf_btf_cred(current_cred(), btf);
 }
 
 static void selinux_bpf_btf_free(struct btf *btf)
@@ -21974,7 +23819,8 @@ static int selinux_bpf_link_create(struct bpf_link *link,
 	return rc;
 }
 
-static int selinux_bpf_link_access(struct bpf_link *link, enum bpf_cmd cmd)
+static int selinux_bpf_link_access_cred(const struct cred *cred,
+					struct bpf_link *link, enum bpf_cmd cmd)
 {
 	u32 requested = selinux_bpf_link_cmd_perm(cmd);
 
@@ -21983,9 +23829,14 @@ static int selinux_bpf_link_access(struct bpf_link *link, enum bpf_cmd cmd)
 	if (!selinux_policycap_enabled(current_selinux_state,
 				      POLICYDB_CAP_BPF_OBJECT_PERMS))
 		return 0;
-	return cred_tsid_has_perm(current_cred(),
+	return cred_tsid_has_perm(cred,
 				selinux_bpf_link_security(link)->sid,
 				SECCLASS_BPF, requested, NULL);
+}
+
+static int selinux_bpf_link_access(struct bpf_link *link, enum bpf_cmd cmd)
+{
+	return selinux_bpf_link_access_cred(current_cred(), link, cmd);
 }
 
 static int selinux_bpf_link_update(struct bpf_link *link,
@@ -22051,15 +23902,21 @@ static int selinux_bpf_btf_load(struct btf *btf,
 				 SECCLASS_BPF, BPF__BTF_LOAD, NULL);
 }
 
-static int selinux_bpf_btf(const struct btf *btf)
+static int selinux_bpf_btf_cred(const struct cred *cred,
+				const struct btf *btf)
 {
 	if (!selinux_policycap_enabled(current_selinux_state,
 				      POLICYDB_CAP_BPF_OBJECT_PERMS))
 		return 0;
 	return cred_tsid_has_perm(
-		current_cred(),
+		cred,
 		selinux_bpf_btf_security((struct btf *)btf)->sid,
 		SECCLASS_BPF, BPF__BTF_READ, NULL);
+}
+
+static int selinux_bpf_btf(const struct btf *btf)
+{
+	return selinux_bpf_btf_cred(current_cred(), btf);
 }
 
 static void selinux_bpf_btf_free(struct btf *btf)
@@ -22104,14 +23961,21 @@ static void selinux_bpf_token_free(struct bpf_token *token)
 
 #ifdef CONFIG_PERF_EVENTS
 #ifdef CONFIG_SECURITY_SELINUX_NS
-static int perf_fd_pass(const struct file *file, const struct cred *cred)
+static int perf_fd_pass_add(
+	const struct file *file, const struct cred *cred,
+	struct selinux_file_transfer_transaction *transaction)
 {
 	const struct perf_event *event = perf_get_event((struct file *)file);
+	const struct selinux_avc_provenance *provenance;
 	struct perf_event_security_struct *perfsec;
 	u32 requested = 0;
+	u16 i;
+	int rc;
 
 	if (IS_ERR(event))
 		return 0;
+	if (!transaction->chain.count || transaction->chain.cred[0] != cred)
+		return -EXDEV;
 	perfsec = selinux_perf_event(event->security);
 	if (!perfsec->projection ||
 	    perfsec->projection->kind != SELINUX_PATHLESS_KIND_PERF_EVENT)
@@ -22120,10 +23984,40 @@ static int perf_fd_pass(const struct file *file, const struct cred *cred)
 		requested |= PERF_EVENT__READ;
 	if (file->f_mode & FMODE_WRITE)
 		requested |= PERF_EVENT__WRITE;
-	return requested ?
-		cred_pathless_has_perm(cred, perfsec->projection, requested, NULL) :
-		0;
+	if (!requested)
+		return 0;
+	rc = selinux_file_transfer_transaction_provenance(
+		transaction, perfsec->projection->label, perfsec->projection->view,
+		perfsec->projection->source, &provenance);
+	if (rc)
+		return rc;
+	for (i = 0; i < transaction->chain.count; i++) {
+		const struct cred_security_struct *crsec =
+			selinux_cred(transaction->chain.cred[i]);
+		struct selinux_pathless_resolution resolved;
+
+		rc = selinux_pathless_projection_resolve_sealed(
+			perfsec->projection, crsec->state->label_domain, &resolved);
+		if (rc)
+			return rc;
+		if (resolved.sclass != SECCLASS_PERF_EVENT)
+			return -EOPNOTSUPP;
+		rc = selinux_file_transfer_transaction_add(
+			transaction,
+			&(struct selinux_avc_level) {
+				.state = crsec->state,
+				.ssid = crsec->sid,
+				.tsid = resolved.sid,
+				.tclass = SECCLASS_PERF_EVENT,
+				.requested = requested,
+				.provenance = provenance,
+			}, &transaction->chain.policy[i]);
+		if (rc)
+			return rc;
+	}
+	return 0;
 }
+
 #endif
 
 static int selinux_perf_event_open(int type)
@@ -22237,13 +24131,131 @@ static int selinux_perf_event_write(struct perf_event *event)
 #endif
 }
 
+#ifdef CONFIG_SECURITY_SELINUX_NS
+static u32 selinux_perf_relation_requested(unsigned int access)
+{
+	u32 requested = 0;
+
+	if (access & PERF_SECURITY_RELATION_READ)
+		requested |= PERF_EVENT__READ;
+	if (access & PERF_SECURITY_RELATION_WRITE)
+		requested |= PERF_EVENT__WRITE;
+	return requested;
+}
+
+static int selinux_perf_relation_decide(
+	const struct perf_event_relation_security_struct *relation,
+	u64 *epochp)
+{
+	struct selinux_policy_chain_snapshot *chain __free(kfree) = NULL;
+	unsigned int retry;
+
+	if (!relation->cred || !relation->component_count ||
+	    relation->component_count > SELINUX_PERF_RELATION_MAX_COMPONENTS)
+		return -EACCES;
+	chain = kzalloc_obj(*chain, GFP_KERNEL);
+	if (!chain)
+		return -ENOMEM;
+	for (retry = 0; retry < SELINUX_POLICY_OPERATION_RETRIES; retry++) {
+		u16 i, j;
+		int rc = selinux_policy_chain_snapshot_read(relation->cred, chain);
+
+		if (rc == -EAGAIN || rc == -ESTALE)
+			continue;
+		if (rc)
+			return rc;
+		for (i = 0; i < chain->count && !rc; i++) {
+			const struct cred_security_struct *crsec =
+				selinux_cred(chain->cred[i]);
+
+			for (j = 0; j < relation->component_count; j++) {
+				const struct perf_event_relation_component *component =
+					&relation->component[j];
+				u32 tsid;
+
+				if (!component->projection || !component->requested ||
+				    !component->sclass) {
+					rc = -EACCES;
+					break;
+				}
+				if (component->sclass == SECCLASS_BPF) {
+#ifdef CONFIG_BPF_SYSCALL
+					rc = selinux_bpf_projection_resolve(
+						component->projection,
+						crsec->state->label_domain, &tsid);
+#else
+					rc = -EOPNOTSUPP;
+#endif
+				} else {
+					struct selinux_pathless_resolution resolved;
+
+					rc = selinux_pathless_projection_resolve_sealed(
+						component->projection,
+						crsec->state->label_domain, &resolved);
+					if (!rc && resolved.sclass != component->sclass)
+						rc = -EOPNOTSUPP;
+					tsid = resolved.sid;
+				}
+				if (rc)
+					break;
+				rc = avc_has_perm_snapshot(
+					crsec->state, &chain->policy[i], crsec->sid,
+					tsid, component->sclass,
+					component->requested, NULL);
+				if (rc)
+					break;
+			}
+		}
+		if (rc == -EAGAIN || rc == -ESTALE ||
+		    !selinux_policy_chain_snapshot_valid(chain))
+			continue;
+		if (rc)
+			return rc;
+		if (!chain->count || !chain->policy[0].chain_epoch)
+			return -ESTALE;
+		*epochp = chain->policy[0].chain_epoch;
+		return rc;
+	}
+	return -ESTALE;
+}
+
+static int selinux_perf_relation_add(
+	struct perf_event_relation_security_struct *relation,
+	struct selinux_pathless_projection *projection, u16 sclass, u32 requested)
+{
+	struct perf_event_relation_component *component;
+
+	if (!projection || !sclass || !requested)
+		return -EACCES;
+	if (relation->component_count >= SELINUX_PERF_RELATION_MAX_COMPONENTS)
+		return -E2BIG;
+	component = &relation->component[relation->component_count];
+	component->projection = selinux_pathless_projection_get(projection);
+	if (!component->projection)
+		return -EACCES;
+	component->sclass = sclass;
+	component->requested = requested;
+	relation->component_count++;
+	return 0;
+}
+#endif
+
 static int selinux_perf_event_relation(struct perf_event *event,
-				       unsigned int access)
+				       unsigned int access,
+				       struct perf_event *related_event,
+				       unsigned int related_access,
+				       const struct bpf_prog *prog,
+				       const struct bpf_map *map,
+				       fmode_t map_fmode,
+				       struct perf_event_relation *carrier)
 {
 #ifdef CONFIG_SECURITY_SELINUX_NS
 	struct perf_event_security_struct *perfsec =
 		selinux_perf_event(event->security);
-	u32 requested = 0;
+	struct perf_event_relation_security_struct *relation;
+	u32 requested;
+	u64 epoch = 0;
+	int rc;
 
 	if (!access || access & ~(PERF_SECURITY_RELATION_READ |
 				 PERF_SECURITY_RELATION_WRITE))
@@ -22251,16 +24263,141 @@ static int selinux_perf_event_relation(struct perf_event *event,
 	if (!perfsec->projection ||
 	    perfsec->projection->kind != SELINUX_PATHLESS_KIND_PERF_EVENT)
 		return -EACCES;
-	if (access & PERF_SECURITY_RELATION_READ)
-		requested |= PERF_EVENT__READ;
-	if (access & PERF_SECURITY_RELATION_WRITE)
-		requested |= PERF_EVENT__WRITE;
-	return cred_pathless_has_perm(current_cred(), perfsec->projection,
-				      requested, NULL);
+	requested = selinux_perf_relation_requested(access);
+	if (!carrier)
+		return cred_pathless_has_perm(
+			current_cred(), perfsec->projection, requested, NULL);
+
+	relation = selinux_perf_relation(carrier);
+	if (relation->cred || relation->component_count)
+		return -EEXIST;
+	relation->cred = get_cred(current_cred());
+	rc = selinux_perf_relation_add(relation, perfsec->projection,
+				       SECCLASS_PERF_EVENT, requested);
+	if (rc)
+		return rc;
+	if (related_event) {
+		struct perf_event_security_struct *related =
+			selinux_perf_event(related_event->security);
+
+		if (!related_access ||
+		    related_access & ~(PERF_SECURITY_RELATION_READ |
+				       PERF_SECURITY_RELATION_WRITE))
+			return -EINVAL;
+		rc = selinux_perf_relation_add(
+			relation, related->projection, SECCLASS_PERF_EVENT,
+			selinux_perf_relation_requested(related_access));
+		if (rc)
+			return rc;
+	}
+#ifdef CONFIG_BPF_SYSCALL
+	if (prog) {
+		struct bpf_security_struct *bpfsec = selinux_bpf_prog_security(
+			(struct bpf_prog *)prog);
+
+		rc = selinux_perf_relation_add(
+			relation, READ_ONCE(bpfsec->object), SECCLASS_BPF,
+			BPF__PROG_RUN);
+		if (rc)
+			return rc;
+	}
+	if (map) {
+		struct bpf_security_struct *bpfsec = selinux_bpf_map_security(
+			(struct bpf_map *)map);
+		u32 map_requested = bpf_map_fmode_to_av(map_fmode);
+
+		if (!map_requested)
+			return -EINVAL;
+		rc = selinux_perf_relation_add(
+			relation, READ_ONCE(bpfsec->object), SECCLASS_BPF,
+			map_requested);
+		if (rc)
+			return rc;
+	}
 #else
+	if (prog || map || map_fmode)
+		return -EOPNOTSUPP;
+#endif
+	rc = selinux_perf_relation_decide(relation, &epoch);
+	if (rc)
+		return rc;
+	WRITE_ONCE(relation->result, 0);
+	/* Publish the initialized identity/result before its valid epoch. */
+	smp_store_release(&relation->chain_epoch, epoch);
+	return 0;
+#else
+	(void)event;
+	(void)access;
+	(void)related_event;
+	(void)related_access;
+	(void)prog;
+	(void)map;
+	(void)map_fmode;
+	(void)carrier;
 	return 0;
 #endif
 }
+
+#ifdef CONFIG_SECURITY_SELINUX_NS
+static void selinux_perf_event_relation_free(
+	struct perf_event_relation *carrier)
+{
+	struct perf_event_relation_security_struct *relation =
+		selinux_perf_relation(carrier);
+	const struct cred *cred;
+	u8 i;
+
+	for (i = 0; i < relation->component_count; i++) {
+		struct selinux_pathless_projection *projection =
+			xchg(&relation->component[i].projection, NULL);
+
+		selinux_pathless_projection_put(projection);
+	}
+	relation->component_count = 0;
+	cred = xchg(&relation->cred, NULL);
+	/* Make the carrier invalid before releasing its owned identity. */
+	smp_store_release(&relation->chain_epoch, 0);
+	put_cred(cred);
+}
+
+static int selinux_perf_event_relation_valid(
+	const struct perf_event_relation *carrier)
+{
+	const struct perf_event_relation_security_struct *relation =
+		selinux_perf_relation(carrier);
+	struct selinux_state *state;
+	/* Pair with create/revalidation publication of identity and result. */
+	u64 epoch = smp_load_acquire(&relation->chain_epoch);
+
+	if (!epoch || !relation->cred || !relation->component_count ||
+	    relation->component_count > SELINUX_PERF_RELATION_MAX_COMPONENTS)
+		return -EACCES;
+	state = cred_selinux_state(relation->cred);
+	if (!state)
+		return -EACCES;
+	if (epoch != selinux_chain_epoch_read(state))
+		return -ESTALE;
+	return READ_ONCE(relation->result);
+}
+
+static int selinux_perf_event_relation_revalidate(
+	struct perf_event_relation *carrier)
+{
+	struct perf_event_relation_security_struct *relation =
+		selinux_perf_relation(carrier);
+	u64 epoch = 0;
+	int rc;
+
+	rc = selinux_perf_relation_decide(relation, &epoch);
+	if (!epoch)
+		/* Keep the stale epoch so the next use retries asynchronously. */
+		return rc;
+	WRITE_ONCE(relation->result, rc);
+	/* Publish the decision before the epoch which accepts that decision. */
+	smp_store_release(&relation->chain_epoch, epoch);
+	return rc;
+}
+#endif
 #endif
 
 #ifdef CONFIG_IO_URING
@@ -22301,26 +24438,31 @@ static int selinux_uring_cmd(struct io_uring_cmd *ioucmd)
 {
 	struct file *file = ioucmd->file;
 	struct inode *inode = file_inode(file);
-	struct inode_security_struct *isec = selinux_inode(inode);
 	struct common_audit_data ad;
 #ifdef CONFIG_SECURITY_SELINUX_NS
-	struct file_security_struct *fsec = selinux_file(file);
+	const struct file_security_struct *fsec = selinux_file(file);
+	const struct selinux_file_operation_check check = {
+		.requested = IO_URING__CMD,
+		.tclass = SECCLASS_IO_URING,
+	};
+#else
+	struct inode_security_struct *isec = selinux_inode(inode);
+	int rc;
 #endif
 
 	ad.type = LSM_AUDIT_DATA_FILE;
 	ad.u.file = file;
-
 #ifdef CONFIG_SECURITY_SELINUX_NS
-	if (fsec->pathless) {
-		if (fsec->view != fsec->pathless->view)
-			return -EXDEV;
-		return cred_pathless_has_perm_class(
-			current_cred(), fsec->pathless, SECCLASS_IO_URING,
-			IO_URING__CMD, &ad);
-	}
-#endif
+	return selinux_file_operation_has_perm(
+		current_cred(), file, file->f_cred, inode, fsec->view,
+		fsec->pathless, &check, false, &ad);
+#else
+	rc = file_use_has_perm(current_cred(), file, &ad);
+	if (rc)
+		return rc;
 	return cred_tsid_has_perm(current_cred(), isec->sid,
 				  SECCLASS_IO_URING, IO_URING__CMD, &ad);
+#endif
 }
 
 /**
@@ -22363,6 +24505,10 @@ struct lsm_blob_sizes selinux_blob_sizes __ro_after_init = {
 	.lbs_msg_msg = sizeof(struct msg_security_struct),
 #ifdef CONFIG_PERF_EVENTS
 	.lbs_perf_event = sizeof(struct perf_event_security_struct),
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	.lbs_perf_event_relation =
+		sizeof(struct perf_event_relation_security_struct),
+#endif
 #endif
 	.lbs_sock = sizeof(struct sk_security_struct),
 #ifdef CONFIG_SECURITY_SELINUX_NS
@@ -22506,6 +24652,7 @@ static struct security_hook_list selinux_hooks[] __ro_after_init = {
 #ifdef CONFIG_SECURITY_SELINUX_NS
 	LSM_HOOK_INIT(file_init_security_anon,
 		      selinux_file_init_security_anon),
+	LSM_HOOK_INIT(file_kho_preserve, selinux_file_kho_preserve),
 #endif
 	LSM_HOOK_INIT(backing_file_alloc, selinux_backing_file_alloc),
 	LSM_HOOK_INIT(backing_file_free, selinux_backing_file_free),
@@ -22655,6 +24802,7 @@ static struct security_hook_list selinux_hooks[] __ro_after_init = {
 	LSM_HOOK_INIT(ib_pkey_access, selinux_ib_pkey_access),
 	LSM_HOOK_INIT(ib_endport_manage_subnet,
 		      selinux_ib_endport_manage_subnet),
+	LSM_HOOK_INIT(ib_policy_scopes, selinux_ib_policy_scopes),
 	LSM_HOOK_INIT(ib_free_security, selinux_ib_free_security),
 #endif
 #ifdef CONFIG_SECURITY_NETWORK_XFRM
@@ -22701,6 +24849,14 @@ static struct security_hook_list selinux_hooks[] __ro_after_init = {
 	LSM_HOOK_INIT(perf_event_read, selinux_perf_event_read),
 	LSM_HOOK_INIT(perf_event_write, selinux_perf_event_write),
 	LSM_HOOK_INIT(perf_event_relation, selinux_perf_event_relation),
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	LSM_HOOK_INIT(perf_event_relation_free,
+		      selinux_perf_event_relation_free),
+	LSM_HOOK_INIT(perf_event_relation_valid,
+		      selinux_perf_event_relation_valid),
+	LSM_HOOK_INIT(perf_event_relation_revalidate,
+		      selinux_perf_event_relation_revalidate),
+#endif
 	LSM_HOOK_INIT(perf_event_free, selinux_perf_event_free),
 #endif
 
@@ -22836,12 +24992,30 @@ int selinux_state_set_maxnsdepth(unsigned int value)
 
 u64 selinux_chain_epoch_read(const struct selinux_state *state)
 {
-	return atomic64_read(&state->chain_epoch);
+	u64 epoch;
+
+	/*
+	 * A publication is bracketed by two epoch changes.  Returning the
+	 * fail-closed sentinel while it is in progress prevents a reader from
+	 * combining the new generation with the old policy (or vice versa).
+	 */
+	if (unlikely(atomic_read_acquire(&state->chain_updates)))
+		return 0;
+	epoch = atomic64_read(&state->chain_epoch);
+	/* Order the epoch sample before the second publication-marker sample. */
+	smp_rmb();
+	if (unlikely(atomic_read(&state->chain_updates)))
+		return 0;
+	return epoch;
 }
 
-static void selinux_chain_epoch_bump_locked(struct selinux_state *state)
+bool selinux_chain_update_active(const struct selinux_state *state)
 {
-	struct selinux_state *child;
+	return atomic_read_acquire(&state->chain_updates) != 0;
+}
+
+static void selinux_chain_epoch_advance_one(struct selinux_state *state)
+{
 	s64 epoch = atomic64_read(&state->chain_epoch);
 
 	/*
@@ -22854,9 +25028,51 @@ static void selinux_chain_epoch_bump_locked(struct selinux_state *state)
 		atomic64_inc(&state->chain_epoch);
 	else
 		atomic64_set(&state->chain_epoch, 0);
+}
+
+static void selinux_chain_epoch_bump_locked(struct selinux_state *state)
+{
+	struct selinux_state *child;
+
+	selinux_chain_epoch_advance_one(state);
 
 	list_for_each_entry(child, &state->children, sibling)
 		selinux_chain_epoch_bump_locked(child);
+}
+
+static void selinux_chain_update_begin_locked(struct selinux_state *state)
+{
+	struct selinux_state *child;
+
+	/* Overflow is a permanent fail-closed state, like epoch saturation. */
+	if (atomic_read(&state->chain_updates) != INT_MAX)
+		atomic_inc_return(&state->chain_updates);
+	selinux_chain_epoch_advance_one(state);
+	list_for_each_entry(child, &state->children, sibling)
+		selinux_chain_update_begin_locked(child);
+}
+
+static void selinux_chain_update_release_one(struct selinux_state *state)
+{
+	int updates = atomic_read(&state->chain_updates);
+
+	/* A saturated update counter must never wrap back to reusable. */
+	if (updates == INT_MAX)
+		return;
+	if (WARN_ON_ONCE(updates <= 0))
+		atomic_set_release(&state->chain_updates, 0);
+	else
+		atomic_dec_return_release(&state->chain_updates);
+}
+
+static void selinux_chain_update_end_locked(struct selinux_state *state)
+{
+	struct selinux_state *child;
+
+	selinux_chain_epoch_advance_one(state);
+	selinux_chain_update_release_one(state);
+	list_for_each_entry(child, &state->children, sibling)
+		selinux_chain_update_end_locked(child);
 }
 
 void selinux_chain_epoch_bump(struct selinux_state *state)
@@ -22864,6 +25080,51 @@ void selinux_chain_epoch_bump(struct selinux_state *state)
 	mutex_lock(&selinux_state_tree_mutex);
 	selinux_chain_epoch_bump_locked(state);
 	mutex_unlock(&selinux_state_tree_mutex);
+}
+
+int selinux_chain_update_begin(struct selinux_state *state)
+{
+	mutex_lock(&selinux_state_tree_mutex);
+	selinux_chain_update_begin_locked(state);
+	mutex_unlock(&selinux_state_tree_mutex);
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	if (state->label_domain) {
+		struct lsm_policy_change change = {
+			.scoped = true,
+			.scope_id = state->label_domain->id,
+		};
+		int rc;
+
+		rc = notifier_to_errno(call_blocking_lsm_notifier(
+			LSM_POLICY_CHANGE_PRE, &change));
+		if (rc) {
+			/* Roll back this update and release every partial PRE gate. */
+			mutex_lock(&selinux_state_tree_mutex);
+			selinux_chain_update_end_locked(state);
+			mutex_unlock(&selinux_state_tree_mutex);
+			call_blocking_lsm_notifier(LSM_POLICY_CHANGE_ABORT, &change);
+			return rc;
+		}
+	}
+#endif
+	return 0;
+}
+
+void selinux_chain_update_end(struct selinux_state *state)
+{
+	mutex_lock(&selinux_state_tree_mutex);
+	selinux_chain_update_end_locked(state);
+	mutex_unlock(&selinux_state_tree_mutex);
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	if (state->label_domain) {
+		struct lsm_policy_change change = {
+			.scoped = true,
+			.scope_id = state->label_domain->id,
+		};
+
+		call_blocking_lsm_notifier(LSM_POLICY_CHANGE, &change);
+	}
+#endif
 }
 
 static struct selinux_state *selinux_state_alloc(const struct cred *cred,
@@ -22919,6 +25180,7 @@ static struct selinux_state *selinux_state_alloc(const struct cred *cred,
 	INIT_LIST_HEAD(&newstate->children);
 	INIT_LIST_HEAD(&newstate->sibling);
 	atomic64_set(&newstate->chain_epoch, 1);
+	atomic_set(&newstate->chain_updates, 0);
 	newstate->label_domain = selinux_label_domain_alloc(
 		cred->user_ns, parent ? parent->label_domain : NULL, 0);
 	if (IS_ERR(newstate->label_domain)) {
@@ -22951,6 +25213,13 @@ static struct selinux_state *selinux_state_alloc(const struct cred *cred,
 
 	if (parent) {
 		mutex_lock(&selinux_state_tree_mutex);
+		/*
+		 * Join publications already active in an ancestor.  Their matching
+		 * end traversal will visit this newly linked state and release the
+		 * inherited count.
+		 */
+		atomic_set(&newstate->chain_updates,
+			   atomic_read(&parent->chain_updates));
 		list_add_tail(&newstate->sibling, &parent->children);
 		mutex_unlock(&selinux_state_tree_mutex);
 	}

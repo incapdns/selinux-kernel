@@ -910,6 +910,17 @@ static void ib_policy_change_task(struct work_struct *work)
 static int ib_security_change(struct notifier_block *nb, unsigned long event,
 			      void *lsm_data)
 {
+	const struct lsm_policy_change *change = lsm_data;
+
+	if (event != LSM_POLICY_CHANGE && event != LSM_POLICY_CHANGE_PRE &&
+	    event != LSM_POLICY_CHANGE_ABORT)
+		return NOTIFY_DONE;
+	if (change && change->scoped) {
+		int rc = ib_policy_scope_security_change(
+			change->scope_id, event == LSM_POLICY_CHANGE_PRE);
+
+		return notifier_from_errno(rc);
+	}
 	if (event != LSM_POLICY_CHANGE)
 		return NOTIFY_DONE;
 

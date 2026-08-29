@@ -4405,10 +4405,6 @@ static int bpf_perf_link_attach(const union bpf_attr *attr, struct bpf_prog *pro
 	if (IS_ERR(perf_file))
 		return PTR_ERR(perf_file);
 	event = perf_file->private_data;
-	err = security_perf_event_relation(event,
-					   PERF_SECURITY_RELATION_WRITE);
-	if (err)
-		goto out_put_file;
 
 	link = kzalloc_obj(*link, GFP_USER);
 	if (!link) {

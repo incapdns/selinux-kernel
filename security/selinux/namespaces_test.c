@@ -17,6 +17,7 @@
 #include <net/xfrm.h>
 
 #include "include/ibpkey.h"
+#include "include/avc.h"
 #include "include/audit.h"
 #include "include/label.h"
 #include "include/label_map.h"
@@ -50,6 +51,7 @@ static void selinux_test_state_init(struct selinux_state *state, u64 epoch)
 	INIT_LIST_HEAD(&state->children);
 	INIT_LIST_HEAD(&state->sibling);
 	atomic64_set(&state->chain_epoch, epoch);
+	atomic_set(&state->chain_updates, 0);
 }
 
 static void selinux_chain_epoch_subtree_test(struct kunit *test)
@@ -96,6 +98,61 @@ static void selinux_chain_epoch_saturation_test(struct kunit *test)
 	selinux_chain_epoch_bump(&state);
 	KUNIT_EXPECT_EQ(test, selinux_chain_epoch_read(&state), (u64)0);
 	KUNIT_EXPECT_EQ(test, selinux_chain_epoch_read(&child), (u64)4);
+}
+
+static void selinux_chain_update_nested_test(struct kunit *test)
+{
+	struct selinux_state root, child, sibling, grandchild;
+
+	selinux_test_state_init(&root, 1);
+	selinux_test_state_init(&child, 1);
+	selinux_test_state_init(&sibling, 1);
+	selinux_test_state_init(&grandchild, 1);
+	list_add_tail(&child.sibling, &root.children);
+	list_add_tail(&sibling.sibling, &root.children);
+	list_add_tail(&grandchild.sibling, &child.children);
+
+	KUNIT_ASSERT_EQ(test, selinux_chain_update_begin(&root), 0);
+	KUNIT_EXPECT_EQ(test, selinux_chain_epoch_read(&root), (u64)0);
+	KUNIT_EXPECT_EQ(test, selinux_chain_epoch_read(&child), (u64)0);
+	KUNIT_EXPECT_EQ(test, selinux_chain_epoch_read(&sibling), (u64)0);
+	KUNIT_EXPECT_EQ(test, selinux_chain_epoch_read(&grandchild), (u64)0);
+
+	/* A child publication may overlap its parent's publication. */
+	KUNIT_ASSERT_EQ(test, selinux_chain_update_begin(&child), 0);
+	selinux_chain_update_end(&root);
+	KUNIT_EXPECT_EQ(test, selinux_chain_epoch_read(&root), (u64)3);
+	KUNIT_EXPECT_EQ(test, selinux_chain_epoch_read(&sibling), (u64)3);
+	KUNIT_EXPECT_EQ(test, selinux_chain_epoch_read(&child), (u64)0);
+	KUNIT_EXPECT_EQ(test, selinux_chain_epoch_read(&grandchild), (u64)0);
+
+	selinux_chain_update_end(&child);
+	KUNIT_EXPECT_EQ(test, selinux_chain_epoch_read(&child), (u64)5);
+	KUNIT_EXPECT_EQ(test, selinux_chain_epoch_read(&grandchild), (u64)5);
+	KUNIT_EXPECT_FALSE(test, selinux_chain_update_active(&root));
+	KUNIT_EXPECT_FALSE(test, selinux_chain_update_active(&child));
+}
+
+static void selinux_chain_update_saturation_test(struct kunit *test)
+{
+	struct selinux_state state;
+
+	selinux_test_state_init(&state, S64_MAX - 1);
+	KUNIT_ASSERT_EQ(test, selinux_chain_update_begin(&state), 0);
+	KUNIT_EXPECT_TRUE(test, selinux_chain_update_active(&state));
+	KUNIT_EXPECT_EQ(test, selinux_chain_epoch_read(&state), (u64)0);
+	selinux_chain_update_end(&state);
+	KUNIT_EXPECT_FALSE(test, selinux_chain_update_active(&state));
+	KUNIT_EXPECT_EQ(test, selinux_chain_epoch_read(&state), (u64)0);
+
+	/* The update counter itself also saturates permanently fail closed. */
+	selinux_test_state_init(&state, 1);
+	atomic_set(&state.chain_updates, INT_MAX - 1);
+	KUNIT_ASSERT_EQ(test, selinux_chain_update_begin(&state), 0);
+	KUNIT_EXPECT_EQ(test, atomic_read(&state.chain_updates), INT_MAX);
+	selinux_chain_update_end(&state);
+	KUNIT_EXPECT_EQ(test, atomic_read(&state.chain_updates), INT_MAX);
+	KUNIT_EXPECT_EQ(test, selinux_chain_epoch_read(&state), (u64)0);
 }
 
 static void selinux_xfrm_resolution_chain_collection_test(struct kunit *test)
@@ -218,8 +275,14 @@ static void selinux_policy_snapshot_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test,
 			   selinux_policy_snapshot_equal(&snapshot, &cache_key));
 
-	selinux_chain_epoch_bump(state);
+	KUNIT_ASSERT_EQ(test, selinux_chain_update_begin(state), 0);
+	KUNIT_EXPECT_EQ(test,
+			selinux_policy_snapshot_read(state, &cache_key),
+			-EAGAIN);
+	KUNIT_EXPECT_FALSE(test,
+			   selinux_policy_snapshot_valid(state, &snapshot));
 	rcu_assign_pointer(state->policy, second);
+	selinux_chain_update_end(state);
 	KUNIT_EXPECT_FALSE(test,
 			   selinux_policy_snapshot_valid(state, &snapshot));
 	KUNIT_ASSERT_EQ(test,
@@ -427,6 +490,95 @@ selinux_test_audit_cred_ref(struct kunit *test, const struct cred *cred,
 	rsec->kind = SELINUX_PROP_REF_CRED;
 	rsec->cred = cred;
 	return ref;
+}
+
+static void selinux_cred_pair_linear_merge_test(struct kunit *test)
+{
+	struct selinux_label_domain *child_domain, *sibling_domain;
+	struct selinux_state child, sibling;
+	struct selinux_state *states[3] = {};
+	struct cred *root_cred, *child_cred, *sibling_cred;
+	u32 ssids[3] = {}, tsids[3] = {};
+	u16 count = 0;
+	int rc;
+
+	selinux_test_state_init(&child, 1);
+	selinux_test_state_init(&sibling, 1);
+	child_domain = selinux_test_domain_alloc(
+		test, init_selinux_state->label_domain);
+	KUNIT_ASSERT_NOT_NULL(test, child_domain);
+	sibling_domain = selinux_test_domain_alloc(
+		test, init_selinux_state->label_domain);
+	KUNIT_ASSERT_NOT_NULL(test, sibling_domain);
+	child.parent = init_selinux_state;
+	child.label_domain = child_domain;
+	child.depth = child_domain->depth;
+	sibling.parent = init_selinux_state;
+	sibling.label_domain = sibling_domain;
+	sibling.depth = sibling_domain->depth;
+	root_cred = selinux_test_audit_cred(
+		test, init_selinux_state, NULL, SECINITSID_KERNEL, NULL);
+	KUNIT_ASSERT_NOT_NULL(test, root_cred);
+	child_cred = selinux_test_audit_cred(
+		test, &child, root_cred, 101, NULL);
+	KUNIT_ASSERT_NOT_NULL(test, child_cred);
+	sibling_cred = selinux_test_audit_cred(
+		test, &sibling, root_cred, 202, NULL);
+	KUNIT_ASSERT_NOT_NULL(test, sibling_cred);
+
+	/* ptrace_traceme: child policy first, then the previously skipped host. */
+	rc = selinux_kunit_cred_pair_levels(
+		child_cred, root_cred, child_cred, states, ssids, tsids,
+		ARRAY_SIZE(states), &count);
+	KUNIT_ASSERT_EQ(test, rc, 0);
+	KUNIT_ASSERT_EQ(test, count, (u16)2);
+	KUNIT_EXPECT_PTR_EQ(test, states[0], &child);
+	KUNIT_EXPECT_EQ(test, ssids[0], (u32)SECINITSID_UNLABELED);
+	KUNIT_EXPECT_EQ(test, tsids[0], (u32)101);
+	KUNIT_EXPECT_PTR_EQ(test, states[1], init_selinux_state);
+	KUNIT_EXPECT_EQ(test, ssids[1], (u32)SECINITSID_KERNEL);
+	KUNIT_EXPECT_EQ(test, tsids[1], (u32)SECINITSID_KERNEL);
+
+	/* Equal-depth siblings stay isolated, while their common host still runs. */
+	memset(states, 0, sizeof(states));
+	memset(ssids, 0, sizeof(ssids));
+	memset(tsids, 0, sizeof(tsids));
+	count = 0;
+	rc = selinux_kunit_cred_pair_levels(
+		sibling_cred, sibling_cred, child_cred, states, ssids, tsids,
+		ARRAY_SIZE(states), &count);
+	KUNIT_ASSERT_EQ(test, rc, 0);
+	KUNIT_ASSERT_EQ(test, count, (u16)2);
+	KUNIT_EXPECT_PTR_EQ(test, states[0], &sibling);
+	KUNIT_EXPECT_EQ(test, ssids[0], (u32)202);
+	KUNIT_EXPECT_EQ(test, tsids[0], (u32)SECINITSID_UNLABELED);
+	KUNIT_EXPECT_PTR_EQ(test, states[1], init_selinux_state);
+	KUNIT_EXPECT_EQ(test, ssids[1], (u32)SECINITSID_KERNEL);
+	KUNIT_EXPECT_EQ(test, tsids[1], (u32)SECINITSID_KERNEL);
+
+	/* Two distinct states cannot claim the same label-domain identity. */
+	sibling.label_domain = child_domain;
+	count = 0;
+	KUNIT_EXPECT_EQ(test,
+			selinux_kunit_cred_pair_levels(
+				child_cred, sibling_cred, child_cred, states, ssids,
+				tsids, ARRAY_SIZE(states), &count),
+			-EXDEV);
+	sibling.label_domain = sibling_domain;
+
+	/* Binder impersonation compares the full chain, not colliding local SIDs. */
+	selinux_cred(sibling_cred)->sid = selinux_cred(child_cred)->sid;
+	KUNIT_EXPECT_FALSE(test,
+			  cred_sid_chain_equal(child_cred, sibling_cred));
+	KUNIT_EXPECT_TRUE(test, cred_sid_chain_equal(child_cred, child_cred));
+
+	/* A truncated or forged ancestry is rejected instead of silently skipped. */
+	child.parent = NULL;
+	KUNIT_EXPECT_EQ(test,
+			selinux_kunit_cred_pair_levels(
+				child_cred, root_cred, child_cred, states, ssids,
+				tsids, ARRAY_SIZE(states), &count),
+			-EXDEV);
 }
 
 static void selinux_audit_rule_carrier_projection_test(struct kunit *test)
@@ -4123,6 +4275,8 @@ static void selinux_ib_pkey_key_test(struct kunit *test)
 static struct kunit_case selinux_namespaces_test_cases[] = {
 	KUNIT_CASE(selinux_chain_epoch_subtree_test),
 	KUNIT_CASE(selinux_chain_epoch_saturation_test),
+	KUNIT_CASE(selinux_chain_update_nested_test),
+	KUNIT_CASE(selinux_chain_update_saturation_test),
 	KUNIT_CASE(selinux_xfrm_resolution_chain_collection_test),
 	KUNIT_CASE(selinux_xfrm_flow_origin_type_test),
 	KUNIT_CASE(selinux_policy_snapshot_test),
@@ -4130,6 +4284,7 @@ static struct kunit_case selinux_namespaces_test_cases[] = {
 	KUNIT_CASE(selinux_global_sid_cache_active_key_test),
 #endif
 	KUNIT_CASE(selinux_audit_rule_provenance_test),
+	KUNIT_CASE(selinux_cred_pair_linear_merge_test),
 	KUNIT_CASE(selinux_audit_rule_carrier_projection_test),
 	KUNIT_CASE(selinux_audit_rule_filter_failure_test),
 	KUNIT_CASE(selinux_file_permission_cache_test),

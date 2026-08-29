@@ -788,23 +788,29 @@ int selinux_xfrm_policy_lookup(struct xfrm_sec_ctx *ctx, u32 fl_secid,
 	flow = domains;
 	rc = selinux_xfrm_resolve_label(sec, flow_provenance->subject->label,
 					fl_secid, &flow);
-	selinux_net_provenance_put(flow_provenance);
 #else
 	rc = selinux_xfrm_resolve_sid(sec, fl_secid, NULL, &domains, &flow,
 				      NULL);
 #endif
 	if (rc)
-		return rc;
+		goto out_flow;
 	rc = selinux_xfrm_resolve_sid(sec, ctx->ctx_sid,
 				      sec->assertion->label, &domains,
 				      &association, NULL);
 	if (rc)
-		return rc;
+		goto out_flow;
 	rc = selinux_xfrm_has_perm_chain(sec, &flow, &association,
 					 ASSOCIATION__POLMATCH);
 	if (!rc)
 		rc = selinux_xfrm_view_domains(sec, &post);
-	return (rc == -EACCES ? -ESRCH : rc);
+	if (rc == -EACCES)
+		rc = -ESRCH;
+
+out_flow:
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	selinux_net_provenance_put(flow_provenance);
+#endif
+	return rc;
 }
 
 /*
@@ -973,8 +979,7 @@ int selinux_xfrm_skb_sid(struct sk_buff *skb, u32 *sid)
  * closed.  The returned reference is strong and requires put().
  */
 static int selinux_xfrm_skb_provenance_lookup(
-	struct sk_buff *skb, struct selinux_net_provenance **provenancep,
-	bool allow_egress)
+	struct sk_buff *skb, struct selinux_net_provenance **provenancep)
 {
 	struct selinux_xfrm_sec_ctx *selected = NULL;
 	struct sec_path *sp;
@@ -1005,16 +1010,6 @@ static int selinux_xfrm_skb_provenance_lookup(
 		}
 	}
 
-	if (!selected && allow_egress) {
-		struct dst_entry *dst = skb_dst(skb);
-		struct xfrm_state *x = dst ? dst->xfrm : NULL;
-
-		if (!x || !selinux_authorizable_xfrm(x))
-			return 0;
-		rc = selinux_xfrm_ctx_metadata(x->security, &selected);
-		if (rc)
-			return rc;
-	}
 	if (!selected)
 		return 0;
 
@@ -1025,7 +1020,7 @@ static int selinux_xfrm_skb_provenance_lookup(
 int selinux_xfrm_skb_provenance_ingress(
 	struct sk_buff *skb, struct selinux_net_provenance **provenancep)
 {
-	return selinux_xfrm_skb_provenance_lookup(skb, provenancep, false);
+	return selinux_xfrm_skb_provenance_lookup(skb, provenancep);
 }
 
 /*
@@ -1071,7 +1066,12 @@ int selinux_xfrm_skb_provenance_egress(
 int selinux_xfrm_skb_provenance(
 	struct sk_buff *skb, struct selinux_net_provenance **provenancep)
 {
-	return selinux_xfrm_skb_provenance_lookup(skb, provenancep, true);
+	int rc;
+
+	rc = selinux_xfrm_skb_provenance_lookup(skb, provenancep);
+	if (rc || *provenancep)
+		return rc;
+	return selinux_xfrm_skb_provenance_egress(skb, provenancep);
 }
 
 /*

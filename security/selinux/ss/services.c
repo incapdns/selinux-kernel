@@ -131,8 +131,14 @@ int selinux_policy_snapshot_read(struct selinux_state *state,
 
 	for (retry = 0; retry < SELINUX_POLICY_SNAPSHOT_READ_RETRIES; retry++) {
 		epoch = selinux_chain_epoch_read(state);
-		if (!epoch)
-			return -EOVERFLOW;
+		if (!epoch) {
+			if (!selinux_chain_update_active(state) &&
+			    !atomic64_read(&state->chain_epoch) &&
+			    !selinux_chain_update_active(state))
+				return -EOVERFLOW;
+			cpu_relax();
+			continue;
+		}
 
 		rcu_read_lock();
 		policy = rcu_dereference(state->policy);
@@ -2460,11 +2466,13 @@ static void selinux_notify_policy_change(struct selinux_state *state,
 	selinux_ima_measure_state_locked(state);
 }
 
-void selinux_policy_commit(struct selinux_state *state,
-			   struct selinux_load_state *load_state)
+int selinux_policy_commit(struct selinux_state *state,
+			  struct selinux_load_state *load_state)
 {
 	struct selinux_policy *oldpolicy, *newpolicy = load_state->policy;
 	unsigned long flags;
+	bool complete_init = false;
+	int rc;
 	u32 seqno;
 
 	oldpolicy = rcu_dereference_protected(state->policy,
@@ -2485,8 +2493,10 @@ void selinux_policy_commit(struct selinux_state *state,
 		newpolicy->latest_granting = 1;
 	seqno = newpolicy->latest_granting;
 
-	/* Install the new policy. */
-	selinux_chain_epoch_bump(state);
+	/* Install the new policy as one fail-closed chain publication. */
+	rc = selinux_chain_update_begin(state);
+	if (rc)
+		return rc;
 	if (oldpolicy) {
 		sidtab_freeze_begin(oldpolicy->sidtab, &flags);
 		rcu_assign_pointer(state->policy, newpolicy);
@@ -2511,9 +2521,11 @@ void selinux_policy_commit(struct selinux_state *state,
 		 * superblock completion callback while it is dormant would label objects
 		 * with the configuring parent's policy.
 		 */
-		if (selinux_state_active(state))
-			selinux_complete_init();
+		complete_init = selinux_state_active(state);
 	}
+	selinux_chain_update_end(state);
+	if (complete_init)
+		selinux_complete_init();
 
 	/* Free the old policy */
 	synchronize_rcu();
@@ -2522,6 +2534,7 @@ void selinux_policy_commit(struct selinux_state *state,
 
 	/* Notify others of the policy change */
 	selinux_notify_policy_change(state, seqno);
+	return 0;
 }
 
 /**
@@ -3305,10 +3318,18 @@ int security_set_bools(struct selinux_state *state, u32 len,
 	newpolicy->latest_granting = oldpolicy->latest_granting + 1;
 	seqno = newpolicy->latest_granting;
 
-	/* Install the new policy */
-	selinux_chain_epoch_bump(state);
+	/* Install the new conditional policy as one chain publication. */
+	rc = selinux_chain_update_begin(state);
+	if (rc) {
+		/* The duplicate borrowed the old policy's resource ownership. */
+		newpolicy->resources = NULL;
+		newpolicy->resource_bytes = 0;
+		selinux_policy_cond_free(newpolicy);
+		return rc;
+	}
 	rcu_assign_pointer(state->policy, newpolicy);
 	selinux_policy_resource_transfer(oldpolicy, newpolicy);
+	selinux_chain_update_end(state);
 
 	/*
 	 * Free the conditional portions of the old policydb

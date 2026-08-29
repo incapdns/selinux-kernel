@@ -2900,14 +2900,16 @@ EXPORT_SYMBOL(security_inode_copy_up);
  * @src: real lower path of the copied inode
  * @dst_mnt: upper-layer mount receiving the new inode
  * @dst: newly created upper dentry, not yet published by overlayfs
+ * @copy_up_cred: temporary credentials returned by the pre-copy hook
  *
  * Return: Returns 0 on success or a negative error code on error.
  */
 int security_inode_copy_up_post(const struct path *src,
 				const struct vfsmount *dst_mnt,
-				struct dentry *dst)
+				struct dentry *dst,
+				const struct cred *copy_up_cred)
 {
-	return call_int_hook(inode_copy_up_post, src, dst_mnt, dst);
+	return call_int_hook(inode_copy_up_post, src, dst_mnt, dst, copy_up_cred);
 }
 EXPORT_SYMBOL(security_inode_copy_up_post);
 
@@ -3112,6 +3114,21 @@ int security_file_init_security_anon(struct file *file)
 	return call_int_hook(file_init_security_anon, file);
 }
 EXPORT_SYMBOL_GPL(security_file_init_security_anon);
+
+/**
+ * security_file_kho_preserve() - Authorize identity-preserving KHO handover
+ * @file: file considered for serialization across a kernel handover
+ *
+ * A security module may reject preservation when the handover ABI cannot
+ * serialize enough immutable identity to reconstruct the same object.
+ *
+ * Return: 0 if preservation is safe, or a negative error code.
+ */
+int security_file_kho_preserve(struct file *file)
+{
+	return call_int_hook(file_kho_preserve, file);
+}
+EXPORT_SYMBOL_GPL(security_file_kho_preserve);
 
 /**
  * security_file_release() - Perform actions before releasing the file ref
@@ -6311,6 +6328,12 @@ void security_ib_free_security(void *sec)
 	kfree(sec);
 }
 EXPORT_SYMBOL(security_ib_free_security);
+
+int security_ib_policy_scopes(void *sec, u64 *scope_ids, u16 capacity)
+{
+	return call_int_hook(ib_policy_scopes, sec, scope_ids, capacity);
+}
+EXPORT_SYMBOL(security_ib_policy_scopes);
 #endif	/* CONFIG_SECURITY_INFINIBAND */
 
 #ifdef CONFIG_SECURITY_NETWORK_XFRM
@@ -7257,8 +7280,151 @@ int security_perf_event_write(struct perf_event *event)
 int security_perf_event_relation(struct perf_event *event,
 				 unsigned int access)
 {
-	return call_int_hook(perf_event_relation, event, access);
+	return call_int_hook(perf_event_relation, event, access, NULL, 0, NULL,
+			     NULL, 0, NULL);
 }
+
+struct perf_event_relation *security_perf_event_relation_get(
+	struct perf_event_relation *relation)
+{
+	if (relation)
+		refcount_inc(&relation->usage);
+	return relation;
+}
+EXPORT_SYMBOL_GPL(security_perf_event_relation_get);
+
+void security_perf_event_relation_put(struct perf_event_relation *relation)
+{
+	if (!relation || !refcount_dec_and_test(&relation->usage))
+		return;
+	call_void_hook(perf_event_relation_free, relation);
+	kfree(relation->security);
+	kfree(relation);
+}
+EXPORT_SYMBOL_GPL(security_perf_event_relation_put);
+
+static void security_perf_event_relation_revalidate_work(
+	struct work_struct *work)
+{
+	struct perf_event_relation *relation = container_of(
+		work, struct perf_event_relation, work);
+	struct lsm_static_call *scall;
+
+	/* Every provider must advance its epoch, even if another denies. */
+	lsm_for_each_hook(scall, perf_event_relation_revalidate)
+		scall->hl->hook.perf_event_relation_revalidate(relation);
+	atomic_set_release(&relation->work_pending, 0);
+	security_perf_event_relation_put(relation);
+}
+
+static void security_perf_event_relation_revalidate_irq(
+	struct irq_work *irq_work)
+{
+	struct perf_event_relation *relation = container_of(
+		irq_work, struct perf_event_relation, irq_work);
+
+	if (unlikely(!schedule_work(&relation->work))) {
+		atomic_set_release(&relation->work_pending, 0);
+		security_perf_event_relation_put(relation);
+	}
+}
+
+int security_perf_event_relation_create_composite(
+	struct perf_event *event, unsigned int access,
+	struct perf_event *related_event, unsigned int related_access,
+	const struct bpf_prog *prog, const struct bpf_map *map, fmode_t map_fmode,
+	struct perf_event_relation **relationp)
+{
+	struct perf_event_relation *relation;
+	int rc;
+
+	if (!event || !relationp || !access ||
+	    access & ~(PERF_SECURITY_RELATION_READ |
+		       PERF_SECURITY_RELATION_WRITE) ||
+	    (!!related_event != !!related_access) ||
+	    related_access & ~(PERF_SECURITY_RELATION_READ |
+			       PERF_SECURITY_RELATION_WRITE) ||
+	    (!!map != !!map_fmode) || (prog && map))
+		return -EINVAL;
+	*relationp = NULL;
+	/* No durable provider: preserve the legacy allocation-free path. */
+	if (!blob_sizes.lbs_perf_event_relation)
+		return call_int_hook(perf_event_relation, event, access,
+				     related_event, related_access, prog, map,
+				     map_fmode, NULL);
+	relation = kzalloc_obj(*relation, GFP_KERNEL);
+	if (!relation)
+		return -ENOMEM;
+	refcount_set(&relation->usage, 1);
+	atomic_set(&relation->work_pending, 0);
+	init_irq_work(&relation->irq_work,
+		      security_perf_event_relation_revalidate_irq);
+	INIT_WORK(&relation->work,
+		  security_perf_event_relation_revalidate_work);
+	rc = lsm_blob_alloc(&relation->security,
+			    blob_sizes.lbs_perf_event_relation, GFP_KERNEL);
+	if (rc)
+		goto out_free;
+	rc = call_int_hook(perf_event_relation, event, access, related_event,
+			   related_access, prog, map, map_fmode, relation);
+	if (rc)
+		goto out_free_security;
+	*relationp = relation;
+	return 0;
+
+out_free_security:
+	call_void_hook(perf_event_relation_free, relation);
+	kfree(relation->security);
+out_free:
+	kfree(relation);
+	return rc;
+}
+EXPORT_SYMBOL_GPL(security_perf_event_relation_create_composite);
+
+int security_perf_event_relation_create(
+	struct perf_event *event, unsigned int access,
+	struct perf_event_relation **relationp)
+{
+	return security_perf_event_relation_create_composite(
+		event, access, NULL, 0, NULL, NULL, 0, relationp);
+}
+EXPORT_SYMBOL_GPL(security_perf_event_relation_create);
+
+int security_perf_event_relation_valid(struct perf_event_relation *relation)
+{
+	struct lsm_static_call *scall;
+	bool stale = false;
+	int rc = 0;
+
+	if (!relation)
+		return 0;
+	lsm_for_each_hook(scall, perf_event_relation_valid) {
+		int hook_rc = scall->hl->hook.perf_event_relation_valid(relation);
+
+		if (hook_rc == -ESTALE)
+			stale = true;
+		else if (hook_rc && !rc)
+			rc = hook_rc;
+	}
+	if (!stale)
+		return rc;
+
+	if (atomic_cmpxchg(&relation->work_pending, 0, 1) == 0) {
+		security_perf_event_relation_get(relation);
+		if (!irq_work_queue(&relation->irq_work)) {
+			atomic_set_release(&relation->work_pending, 0);
+			security_perf_event_relation_put(relation);
+		}
+	}
+	return rc ?: -ESTALE;
+}
+EXPORT_SYMBOL_GPL(security_perf_event_relation_valid);
+
+bool security_perf_event_relation_enabled(void)
+{
+	return blob_sizes.lbs_perf_event_relation != 0;
+}
+EXPORT_SYMBOL_GPL(security_perf_event_relation_enabled);
 #endif /* CONFIG_PERF_EVENTS */
 
 #ifdef CONFIG_IO_URING

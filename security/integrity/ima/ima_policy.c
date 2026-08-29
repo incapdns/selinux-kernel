@@ -50,6 +50,11 @@
 #define HASH		0x0100
 #define DONT_HASH	0x0200
 
+/* Non-action flags which can only make a forced positive match stricter. */
+#define IMA_FAIL_CLOSED_RULE_FLAGS \
+	(IMA_DIGSIG_REQUIRED | IMA_SIGV3_REQUIRED | \
+	 IMA_FAIL_UNVERIFIABLE_SIGS | IMA_CHECK_BLACKLIST | IMA_VERITY_REQUIRED)
+
 #define INVALID_PCR(a) (((a) < 0) || \
 	(a) >= (sizeof_field(struct ima_iint_cache, measured_pcrs) * 8))
 
@@ -567,17 +572,23 @@ static bool ima_match_rule_data(struct ima_rule_entry *rule,
  * @func: LIM hook identifier
  * @mask: requested action (MAY_READ | MAY_WRITE | MAY_APPEND | MAY_EXEC)
  * @func_data: func specific data, may be NULL
+ * @inode_ref: shared immutable inode identity captured for this policy walk
+ * @inode_ref_status: result of the shared identity capture
+ * @inode_ref_captured: whether the shared capture has already been attempted
  *
- * Returns true on rule match, false on failure.
+ * Return: 1 on match, 0 on a definite no-match, or a negative errno when
+ * object identity or rule projection could not be determined.
  */
-static bool ima_match_rules(struct ima_rule_entry *rule,
-			    struct mnt_idmap *idmap,
-			    struct inode *inode, const struct cred *cred,
-			    struct lsm_prop *prop, enum ima_hooks func, int mask,
-			    const char *func_data)
+static int ima_match_rules(struct ima_rule_entry *rule,
+			   struct mnt_idmap *idmap,
+			   struct inode *inode, const struct cred *cred,
+			   struct lsm_prop *prop, enum ima_hooks func, int mask,
+			   const char *func_data,
+			   struct lsm_prop_ref **inode_ref,
+			   int *inode_ref_status, bool *inode_ref_captured)
 {
 	int i;
-	bool result = false;
+	int result = 0;
 	struct ima_rule_entry *lsm_rule = rule;
 	bool rule_reinitialized = false;
 
@@ -647,13 +658,12 @@ static bool ima_match_rules(struct ima_rule_entry *rule,
 		return false;
 	for (i = 0; i < MAX_LSM_RULES; i++) {
 		int rc = 0;
-		struct lsm_prop inode_prop = { };
 
 		if (!lsm_rule->lsm[i].rule) {
 			if (!lsm_rule->lsm[i].args_p)
 				continue;
-			else
-				return false;
+			result = false;
+			goto out;
 		}
 
 retry:
@@ -661,11 +671,14 @@ retry:
 		case LSM_OBJ_USER:
 		case LSM_OBJ_ROLE:
 		case LSM_OBJ_TYPE:
-			security_inode_getlsmprop(inode, &inode_prop);
-			rc = ima_filter_rule_match(&inode_prop,
-						   lsm_rule->lsm[i].type,
-						   Audit_equal,
-						   lsm_rule->lsm[i].rule);
+			if (!*inode_ref_captured) {
+				*inode_ref_status = security_inode_getlsmprop_ref(
+					inode, GFP_ATOMIC, inode_ref);
+				*inode_ref_captured = true;
+			}
+			rc = ima_filter_rule_match_ref(
+				*inode_ref, *inode_ref_status, lsm_rule->lsm[i].type,
+				Audit_equal, lsm_rule->lsm[i].rule);
 			break;
 		case LSM_SUBJ_USER:
 		case LSM_SUBJ_ROLE:
@@ -686,7 +699,11 @@ retry:
 			}
 		}
 		if (rc <= 0) {
-			result = false;
+			/*
+			 * Preserve a hard identity/projection error for the policy
+			 * walker; it is not equivalent to a definite no-match.
+			 */
+			result = rc;
 			goto out;
 		}
 	}
@@ -758,6 +775,9 @@ int ima_match_policy(struct mnt_idmap *idmap, struct inode *inode,
 	struct ima_rule_entry *entry;
 	int action = 0, actmask = flags | (flags << 1);
 	struct list_head *ima_rules_tmp;
+	struct lsm_prop_ref *inode_ref = NULL;
+	int inode_ref_status = 0;
+	bool inode_ref_captured = false;
 
 	if (template_desc && !*template_desc)
 		*template_desc = ima_template_desc_current();
@@ -765,15 +785,31 @@ int ima_match_policy(struct mnt_idmap *idmap, struct inode *inode,
 	rcu_read_lock();
 	ima_rules_tmp = rcu_dereference(ima_rules);
 	list_for_each_entry_rcu(entry, ima_rules_tmp, list) {
+		int match;
 
 		if (!(entry->action & actmask))
 			continue;
 
-		if (!ima_match_rules(entry, idmap, inode, cred, prop,
-				     func, mask, func_data))
+		match = ima_match_rules(entry, idmap, inode, cred, prop,
+					func, mask, func_data, &inode_ref,
+					&inode_ref_status, &inode_ref_captured);
+
+		if (!match)
+			continue;
+		/*
+		 * An indeterminate positive rule must not silently disappear.  Treat
+		 * it as matched so its specific DO action is selected.  Conversely,
+		 * an indeterminate DONT rule is never allowed to suppress a positive
+		 * action.  This preserves the action API while carrying the hard-error
+		 * distinction internally.
+		 */
+		if (match < 0 && !(entry->action & IMA_DO_MASK))
 			continue;
 
-		action |= entry->flags & IMA_NONACTION_FLAGS;
+		if (match < 0)
+			action |= entry->flags & IMA_FAIL_CLOSED_RULE_FLAGS;
+		else
+			action |= entry->flags & IMA_NONACTION_FLAGS;
 
 		action |= entry->action & IMA_DO_MASK;
 		if (entry->action & IMA_APPRAISE) {
@@ -802,6 +838,7 @@ int ima_match_policy(struct mnt_idmap *idmap, struct inode *inode,
 			break;
 	}
 	rcu_read_unlock();
+	security_lsm_prop_ref_put(inode_ref);
 
 	return action;
 }

@@ -25,6 +25,8 @@
 #include "flask.h"
 #include "policycap.h"
 
+struct selinux_copy_up_carrier;
+
 #define SECSID_NULL   0x00000000 /* unspecified SID */
 #define SECSID_WILD   0xffffffff /* wildcard SID */
 #define SECCLASS_NULL 0x0000 /* no class */
@@ -163,6 +165,8 @@ struct selinux_state {
 	struct list_head children;
 	struct list_head sibling;
 	atomic64_t chain_epoch;
+	/* Number of policy/view publications active in this ancestry. */
+	atomic_t chain_updates;
 	struct selinux_label_domain *label_domain;
 #ifdef CONFIG_SECURITY_SELINUX_NS
 	struct selinux_ns_control *ns_control;
@@ -189,6 +193,9 @@ int selinux_state_set_maxnsdepth(unsigned int value);
 void __put_selinux_state(struct selinux_state *state);
 u64 selinux_chain_epoch_read(const struct selinux_state *state);
 void selinux_chain_epoch_bump(struct selinux_state *state);
+int selinux_chain_update_begin(struct selinux_state *state);
+void selinux_chain_update_end(struct selinux_state *state);
+bool selinux_chain_update_active(const struct selinux_state *state);
 int selinux_policy_snapshot_read(struct selinux_state *state,
 				 struct selinux_policy_snapshot *snapshot);
 bool selinux_policy_snapshot_valid(
@@ -260,6 +267,8 @@ struct cred_security_struct {
 	struct selinux_global_sid_handle *create_sid_handle;
 	struct selinux_global_sid_handle *keycreate_sid_handle;
 	struct selinux_global_sid_handle *sockcreate_sid_handle;
+	/* Synchronous overlayfs transaction state; never inherited by new creds. */
+	struct selinux_copy_up_carrier *copy_up;
 #endif
 	struct selinux_state *state; /* selinux namespace */
 	const struct cred *parent_cred; /* cred in parent ns */
@@ -454,8 +463,8 @@ struct selinux_load_state {
 int security_mls_enabled(struct selinux_state *state);
 int security_load_policy(struct selinux_state *state, void *data, size_t len,
 			 struct selinux_load_state *load_state);
-void selinux_policy_commit(struct selinux_state *state,
-			   struct selinux_load_state *load_state);
+int selinux_policy_commit(struct selinux_state *state,
+				struct selinux_load_state *load_state);
 void selinux_policy_cancel(struct selinux_state *state,
 			   struct selinux_load_state *load_state);
 int security_policy_size(struct selinux_state *state, size_t *len);

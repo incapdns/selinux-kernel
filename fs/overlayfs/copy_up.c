@@ -592,6 +592,8 @@ struct ovl_copy_up_ctx {
 	bool metacopy;
 	bool metacopy_digest;
 	bool metadata_fsync;
+	/* Extra reference retaining LSM pre-copy state until the post hook. */
+	const struct cred *copy_up_cred;
 };
 
 static int ovl_link_up(struct ovl_copy_up_ctx *c)
@@ -735,13 +737,30 @@ ovl_prepare_copy_up_creds(struct ovl_copy_up_ctx *ctx)
 
 	err = security_inode_copy_up(&ctx->lowerpath, ovl_upper_mnt(ofs),
 				     &copy_up_cred);
-	if (err < 0)
+	if (err < 0) {
+		/*
+		 * The LSM stack transfers ownership through @copy_up_cred as soon
+		 * as any hook publishes a prepared credential.  A later hook may
+		 * still reject the operation, so the caller must release that
+		 * partial stacked result on the aggregate error path.
+		 */
+		if (copy_up_cred)
+			abort_creds(copy_up_cred);
 		return ERR_PTR(err);
+	}
 
 	if (!copy_up_cred)
 		return NULL;
 
+	ctx->copy_up_cred = get_cred(copy_up_cred);
 	return override_creds(copy_up_cred);
+}
+
+static void ovl_copy_up_cred_put(struct ovl_copy_up_ctx *ctx)
+{
+	if (ctx->copy_up_cred)
+		put_cred(ctx->copy_up_cred);
+	ctx->copy_up_cred = NULL;
 }
 
 static void ovl_revert_copy_up_creds(const struct cred *orig_cred)
@@ -785,7 +804,7 @@ static int ovl_copy_up_workdir(struct ovl_copy_up_ctx *c)
 	}
 
 	if (IS_ERR(temp))
-		return PTR_ERR(temp);
+		goto out_cred;
 
 	/*
 	 * Copy up data first and then xattrs. Writing data after
@@ -793,7 +812,8 @@ static int ovl_copy_up_workdir(struct ovl_copy_up_ctx *c)
 	 */
 	path.dentry = temp;
 	err = security_inode_copy_up_post(&c->lowerpath, ovl_upper_mnt(ofs),
-					  temp);
+					  temp, c->copy_up_cred);
+	ovl_copy_up_cred_put(c);
 	if (err) {
 		ovl_start_write(c->dentry);
 		goto cleanup_unlocked;
@@ -855,6 +875,11 @@ out:
 
 	return err;
 
+out_cred:
+	err = PTR_ERR(temp);
+	ovl_copy_up_cred_put(c);
+	return err;
+
 cleanup_unlocked:
 	ovl_cleanup(ofs, c->workdir, temp);
 	dput(temp);
@@ -880,11 +905,12 @@ static int ovl_copy_up_tmpfile(struct ovl_copy_up_ctx *c)
 	}
 
 	if (IS_ERR(tmpfile))
-		return PTR_ERR(tmpfile);
+		goto out_cred;
 
 	temp = tmpfile->f_path.dentry;
 	err = security_inode_copy_up_post(&c->lowerpath, ovl_upper_mnt(ofs),
-					  temp);
+					  temp, c->copy_up_cred);
+	ovl_copy_up_cred_put(c);
 	if (err)
 		goto out_fput;
 	if (!c->metacopy && c->stat.size) {
@@ -934,6 +960,11 @@ out:
 	ovl_end_write(c->dentry);
 out_fput:
 	fput(tmpfile);
+	return err;
+
+out_cred:
+	err = PTR_ERR(tmpfile);
+	ovl_copy_up_cred_put(c);
 	return err;
 }
 

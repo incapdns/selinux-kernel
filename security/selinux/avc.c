@@ -1460,6 +1460,7 @@ int avc_has_perm_snapshot(
 	return rc;
 }
 
+#ifndef CONFIG_SECURITY_SELINUX_NS
 static u32 task_sid_obj_for_state(const struct task_struct *p,
 				  const struct selinux_state *state)
 {
@@ -1477,6 +1478,7 @@ static u32 task_sid_obj_for_state(const struct task_struct *p,
 	rcu_read_unlock();
 	return sid;
 }
+#endif
 
 #ifdef CONFIG_SECURITY_SELINUX_NS
 #define SELINUX_AVC_CHAIN_RETRIES 3
@@ -3226,6 +3228,152 @@ int selinux_kunit_resolution_levels(
 #endif
 #endif
 
+#ifdef CONFIG_SECURITY_SELINUX_NS
+static int selinux_cred_chain_advance(const struct cred **cursor)
+{
+	const struct cred_security_struct *current_sec, *parent;
+	const struct cred *next;
+
+	if (!cursor || !*cursor)
+		return -EINVAL;
+	current_sec = selinux_cred(*cursor);
+	if (!current_sec->state || !current_sec->state->label_domain ||
+	    current_sec->state->depth != current_sec->state->label_domain->depth)
+		return -EXDEV;
+	next = current_sec->parent_cred;
+	if (!next) {
+		if (current_sec->state->parent ||
+		    current_sec->state->label_domain->parent ||
+		    current_sec->state->depth)
+			return -EXDEV;
+		*cursor = NULL;
+		return 0;
+	}
+	parent = selinux_cred(next);
+	if (!parent->state || !parent->state->label_domain ||
+	    current_sec->state->parent != parent->state ||
+	    current_sec->state->label_domain->parent !=
+		    parent->state->label_domain ||
+	    current_sec->state->depth != parent->state->depth + 1 ||
+	    current_sec->state->label_domain->depth !=
+		    parent->state->label_domain->depth + 1)
+		return -EXDEV;
+	*cursor = next;
+	return 0;
+}
+
+/*
+ * Resolve one monotonically descending credential chain against @state.
+ * The cursor never rewinds, so resolving every level of another chain is
+ * Theta(left depth + right depth), rather than Theta(depth squared).
+ */
+static int selinux_cred_chain_sid_for_state(const struct cred **cursor,
+					    const struct selinux_state *state,
+					    u32 *sid)
+{
+	if (!cursor || !state || !state->label_domain || !sid ||
+	    state->depth != state->label_domain->depth)
+		return -EXDEV;
+
+	while (*cursor) {
+		const struct cred_security_struct *crsec = selinux_cred(*cursor);
+		int rc;
+
+		if (!crsec->state || !crsec->state->label_domain ||
+		    crsec->state->depth != crsec->state->label_domain->depth)
+			return -EXDEV;
+		if (crsec->state != state &&
+		    crsec->state->label_domain == state->label_domain)
+			return -EXDEV;
+		if (crsec->state == state) {
+			*sid = crsec->sid;
+			return selinux_cred_chain_advance(cursor);
+		}
+		if (crsec->state->depth <= state->depth)
+			break;
+		rc = selinux_cred_chain_advance(cursor);
+		if (rc)
+			return rc;
+	}
+	*sid = SECINITSID_UNLABELED;
+	return 0;
+}
+
+static int selinux_cred_pair_levels(
+	const struct cred *policy_cred, const struct cred *subject,
+	const struct cred *target, u16 tclass, u32 requested,
+	struct selinux_avc_level *levels, u16 capacity, u16 *countp)
+{
+	const struct cred *subject_cursor = subject;
+	const struct cred *target_cursor = target;
+	u16 count = 0;
+
+	if (!policy_cred || !subject || !target || !tclass || !requested ||
+	    !levels || !capacity || !countp)
+		return -EINVAL;
+	while (policy_cred) {
+		const struct cred_security_struct *policy =
+			selinux_cred(policy_cred);
+		int rc;
+
+		if (count >= capacity)
+			return -E2BIG;
+		if (!policy->state || !policy->state->label_domain)
+			return -EXDEV;
+		rc = selinux_cred_chain_sid_for_state(
+			&subject_cursor, policy->state, &levels[count].ssid);
+		if (rc)
+			return rc;
+		rc = selinux_cred_chain_sid_for_state(
+			&target_cursor, policy->state, &levels[count].tsid);
+		if (rc)
+			return rc;
+		levels[count].state = policy->state;
+		levels[count].tclass = tclass;
+		levels[count].requested = requested;
+		count++;
+		rc = selinux_cred_chain_advance(&policy_cred);
+		if (rc)
+			return rc;
+	}
+	if (subject_cursor || target_cursor)
+		return -EXDEV;
+	*countp = count;
+	return count ? 0 : -EINVAL;
+}
+
+#ifdef CONFIG_SECURITY_SELINUX_KUNIT_TEST
+int selinux_kunit_cred_pair_levels(
+	const struct cred *policy_cred, const struct cred *subject,
+	const struct cred *target, struct selinux_state **states, u32 *ssids,
+	u32 *tsids, u16 capacity, u16 *countp)
+{
+	struct selinux_avc_level *levels;
+	u16 count, i;
+	int rc;
+
+	if (!states || !ssids || !tsids || !capacity || !countp)
+		return -EINVAL;
+	levels = kcalloc(capacity, sizeof(*levels), GFP_KERNEL);
+	if (!levels)
+		return -ENOMEM;
+	rc = selinux_cred_pair_levels(policy_cred, subject, target,
+				      SECCLASS_PROCESS, PROCESS__PTRACE,
+				      levels, capacity, &count);
+	if (!rc) {
+		for (i = 0; i < count; i++) {
+			states[i] = levels[i].state;
+			ssids[i] = levels[i].ssid;
+			tsids[i] = levels[i].tsid;
+		}
+		*countp = count;
+	}
+	kfree(levels);
+	return rc;
+}
+#endif
+#endif
+
 /**
  * cred_task_has_perm - Check and audit permissions on a (cred, task) pair
  * @cred: subject credentials
@@ -3247,22 +3395,14 @@ int cred_task_has_perm(const struct cred *cred, const struct task_struct *p,
 {
 #ifdef CONFIG_SECURITY_SELINUX_NS
 	struct selinux_avc_level levels[SELINUX_LABEL_RESOLUTION_MAX_DEPTH + 1] = {};
-	u16 count = 0;
+	const struct cred *target = get_task_cred((struct task_struct *)p);
+	u16 count;
+	int rc;
 
-	while (cred) {
-		struct cred_security_struct *crsec = selinux_cred(cred);
-
-		if (count >= SELINUX_LABEL_RESOLUTION_MAX_DEPTH + 1)
-			return -E2BIG;
-		levels[count].state = crsec->state;
-		levels[count].ssid = crsec->sid;
-		levels[count].tsid = task_sid_obj_for_state(p, crsec->state);
-		levels[count].tclass = tclass;
-		levels[count].requested = requested;
-		count++;
-		cred = crsec->parent_cred;
-	}
-	return selinux_avc_levels_has_perm(levels, count, ad);
+	rc = selinux_cred_pair_levels(cred, cred, target, tclass, requested,
+				      levels, ARRAY_SIZE(levels), &count);
+	put_cred(target);
+	return rc ?: selinux_avc_levels_has_perm(levels, count, ad);
 #else
 	struct cred_security_struct *crsec;
 	struct selinux_state *state;
@@ -3287,6 +3427,7 @@ int cred_task_has_perm(const struct cred *cred, const struct task_struct *p,
 #endif
 }
 
+#ifndef CONFIG_SECURITY_SELINUX_NS
 static const struct cred_security_struct *task_cred_security(
 	const struct task_struct *p)
 {
@@ -3299,6 +3440,7 @@ static const struct cred_security_struct *task_cred_security(
 		return NULL;
 	return crsec;
 }
+#endif
 
 /**
  * task_obj_has_perm - Check and audit permissions on a (task, other-task) pair
@@ -3323,45 +3465,18 @@ int task_obj_has_perm(const struct task_struct *s,
 {
 #ifdef CONFIG_SECURITY_SELINUX_NS
 	struct selinux_avc_level levels[SELINUX_LABEL_RESOLUTION_MAX_DEPTH + 1] = {};
-	const struct cred_security_struct *crsec;
-	u16 count = 0;
+	const struct cred *source = get_task_cred((struct task_struct *)s);
+	const struct cred *target = get_task_cred((struct task_struct *)t);
+	u16 count;
 	int rc;
 
-	rcu_read_lock();
-	crsec = task_cred_security(s);
-	if (!crsec) {
-		levels[0].state = current_selinux_state;
-		levels[0].ssid = SECINITSID_UNLABELED;
-		levels[0].tsid = task_sid_obj_for_state(t,
-						       current_selinux_state);
-		levels[0].tclass = tclass;
-		levels[0].requested = requested;
-		count = 1;
-	} else {
-		for (;;) {
-			const struct cred *parent;
-
-			if (count >= ARRAY_SIZE(levels)) {
-				rc = -E2BIG;
-				goto out_unlock;
-			}
-			levels[count].state = crsec->state;
-			levels[count].ssid = crsec->sid;
-			levels[count].tsid =
-				task_sid_obj_for_state(t, crsec->state);
-			levels[count].tclass = tclass;
-			levels[count].requested = requested;
-			count++;
-
-			parent = crsec->parent_cred;
-			if (!parent)
-				break;
-			crsec = selinux_cred(parent);
-		}
-	}
-	rc = selinux_avc_levels_has_perm(levels, count, ad);
-out_unlock:
-	rcu_read_unlock();
+	/* The traced task's policy chain protects the traced object. */
+	rc = selinux_cred_pair_levels(target, source, target, tclass, requested,
+				      levels, ARRAY_SIZE(levels), &count);
+	if (!rc)
+		rc = selinux_avc_levels_has_perm(levels, count, ad);
+	put_cred(target);
+	put_cred(source);
 	return rc;
 #else
 	const struct cred *cred;
@@ -4587,6 +4702,7 @@ int cred_ssid_has_perm(const struct cred *cred, u32 ssid, u32 tsid, u16 tclass,
 #endif
 }
 
+#ifndef CONFIG_SECURITY_SELINUX_NS
 static u32 cred_sid_for_state(const struct cred *cred,
 			      const struct selinux_state *state)
 {
@@ -4602,6 +4718,7 @@ static u32 cred_sid_for_state(const struct cred *cred,
 		sid = SECINITSID_UNLABELED;
 	return sid;
 }
+#endif
 
 /**
  * cred_sid_chain_equal - Compare complete policy/SID credential chains
@@ -4627,6 +4744,91 @@ bool cred_sid_chain_equal(const struct cred *left, const struct cred *right)
 	return !left && !right;
 }
 
+#ifdef CONFIG_SECURITY_SELINUX_NS
+/*
+ * Binder transaction authorization is one policy transaction: an optional
+ * actor -> sender impersonate edge followed by the sender -> receiver call
+ * edge.  Keeping both edges in one vector prevents a policy reload from
+ * assembling an allow out of decisions made in different generations.
+ */
+int cred_binder_transaction_has_perm(const struct cred *actor,
+				     const struct cred *from,
+				     const struct cred *to)
+{
+	const u16 capacity = 2 * (SELINUX_LABEL_RESOLUTION_MAX_DEPTH + 1);
+	struct selinux_avc_transaction_workspace *workspace;
+	struct selinux_policy_snapshot *snapshots;
+	struct selinux_avc_level *levels;
+	unsigned int retry;
+	u16 count, edge_count, i;
+	int rc = -ESTALE;
+
+	if (!actor || !from || !to)
+		return -EINVAL;
+	levels = kcalloc(capacity, sizeof(*levels),
+			 GFP_ATOMIC | __GFP_NOWARN);
+	if (!levels)
+		return -ENOMEM;
+	snapshots = kcalloc(capacity, sizeof(*snapshots),
+			    GFP_ATOMIC | __GFP_NOWARN);
+	if (!snapshots) {
+		rc = -ENOMEM;
+		goto out_levels;
+	}
+	workspace = selinux_avc_transaction_workspace_alloc(
+		capacity, GFP_ATOMIC | __GFP_NOWARN);
+	if (!workspace) {
+		rc = -ENOMEM;
+		goto out_snapshots;
+	}
+
+	count = 0;
+	if (!cred_sid_chain_equal(actor, from)) {
+		rc = selinux_cred_pair_levels(
+			actor, actor, from, SECCLASS_BINDER,
+			BINDER__IMPERSONATE, levels, capacity, &edge_count);
+		if (rc)
+			goto out_workspace;
+		count = edge_count;
+	}
+	rc = selinux_cred_pair_levels(from, from, to, SECCLASS_BINDER,
+				      BINDER__CALL, levels + count,
+				      capacity - count, &edge_count);
+	if (rc)
+		goto out_workspace;
+	count += edge_count;
+
+	for (retry = 0; retry < SELINUX_AVC_CHAIN_RETRIES; retry++) {
+		bool stale = false;
+
+		for (i = 0; i < count; i++) {
+			rc = selinux_avc_perm_snapshot_read(
+				levels[i].state, &snapshots[i], i);
+			if (rc == -EAGAIN || rc == -ESTALE) {
+				stale = true;
+				break;
+			}
+			if (rc)
+				goto out_workspace;
+		}
+		if (stale)
+			continue;
+		rc = selinux_avc_transaction_has_perm_workspace(
+			levels, snapshots, count, NULL, workspace);
+		if (rc != -ESTALE)
+			break;
+	}
+
+out_workspace:
+	selinux_avc_transaction_workspace_free(workspace);
+out_snapshots:
+	kfree(snapshots);
+out_levels:
+	kfree(levels);
+	return rc;
+}
+#endif
+
 /**
  * cred_other_has_perm - Check and audit permissions on a (cred, other-cred) pair
  * @cred: subject credentials
@@ -4648,22 +4850,12 @@ int cred_other_has_perm(const struct cred *cred, const struct cred *other,
 {
 #ifdef CONFIG_SECURITY_SELINUX_NS
 	struct selinux_avc_level levels[SELINUX_LABEL_RESOLUTION_MAX_DEPTH + 1] = {};
-	u16 count = 0;
+	u16 count;
+	int rc;
 
-	while (cred) {
-		struct cred_security_struct *crsec = selinux_cred(cred);
-
-		if (count >= ARRAY_SIZE(levels))
-			return -E2BIG;
-		levels[count].state = crsec->state;
-		levels[count].ssid = crsec->sid;
-		levels[count].tsid = cred_sid_for_state(other, crsec->state);
-		levels[count].tclass = tclass;
-		levels[count].requested = requested;
-		count++;
-		cred = crsec->parent_cred;
-	}
-	return selinux_avc_levels_has_perm(levels, count, ad);
+	rc = selinux_cred_pair_levels(cred, cred, other, tclass, requested,
+				      levels, ARRAY_SIZE(levels), &count);
+	return rc ?: selinux_avc_levels_has_perm(levels, count, ad);
 #else
 	struct cred_security_struct *crsec;
 	struct selinux_state *state;

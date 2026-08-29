@@ -163,6 +163,19 @@ struct selinux_copy_up_assertion {
 	u32 sid;
 	u8 source;
 };
+
+/* Exact pre-create identity carried by the temporary copy-up credentials. */
+struct selinux_copy_up_carrier {
+	struct selinux_label_ref *label;
+	const struct selinux_label_view *src_view;
+	const struct selinux_label_view *dst_view;
+	struct selinux_global_sid_handle *sid_handle;
+	struct selinux_global_sid_handle *create_handle;
+	struct inode *src_inode;
+	u32 sid;
+	u16 sclass;
+	u8 source;
+};
 #endif
 
 struct mount_security_struct {
@@ -181,7 +194,8 @@ struct file_security_struct {
 	u32 sid; /* SID of open file description */
 	u32 isid; /* SID of inode at the time of file open */
 	u64 chain_epoch; /* Policy-chain generation at file open */
-	const struct cred *cred; /* cred for file owner (for SIGIO) */
+	/* Protected by the containing file's f_owner lock. */
+	const struct cred *fowner_cred; /* cred for file owner (for SIGIO) */
 	const struct selinux_label_view *view; /* view selected by f_path */
 #ifdef CONFIG_SECURITY_SELINUX_NS
 	/* Strong creator-origin identity for operations which no longer carry a path. */
@@ -200,6 +214,10 @@ static inline bool selinux_file_permission_cache_valid(
 struct backing_file_security_struct {
 	const struct cred *cred; /* credentials that opened the user file */
 	const struct selinux_label_view *view; /* user-visible file view */
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	/* Pathless identity captured from the user-visible file description. */
+	struct selinux_pathless_projection *pathless;
+#endif
 };
 
 struct superblock_security_struct {
@@ -365,6 +383,8 @@ struct key_security_struct {
 struct ib_security_struct {
 	u32 sid; /* SID of the queue pair or MAD agent */
 #ifdef CONFIG_SECURITY_SELINUX_NS
+	/* Immutable creator lineage used by asynchronous policy revalidation. */
+	const struct cred *cred;
 	struct selinux_pathless_projection *projection;
 #endif
 };
@@ -393,6 +413,24 @@ struct perf_event_security_struct {
 	struct selinux_pathless_projection *projection;
 #endif
 };
+
+#if defined(CONFIG_SECURITY_SELINUX_NS) && defined(CONFIG_PERF_EVENTS)
+#define SELINUX_PERF_RELATION_MAX_COMPONENTS 4
+struct perf_event_relation_component {
+	struct selinux_pathless_projection *projection;
+	u32 requested;
+	u16 sclass;
+};
+
+struct perf_event_relation_security_struct {
+	const struct cred *cred;
+	struct perf_event_relation_component
+		component[SELINUX_PERF_RELATION_MAX_COMPONENTS];
+	u8 component_count;
+	u64 chain_epoch;
+	int result;
+};
+#endif
 
 extern struct lsm_blob_sizes selinux_blob_sizes;
 
@@ -527,6 +565,15 @@ selinux_perf_event(void *perf_event)
 {
 	return perf_event + selinux_blob_sizes.lbs_perf_event;
 }
+
+#if defined(CONFIG_SECURITY_SELINUX_NS) && defined(CONFIG_PERF_EVENTS)
+static inline struct perf_event_relation_security_struct *
+selinux_perf_relation(const struct perf_event_relation *relation)
+{
+	return relation->security +
+	       selinux_blob_sizes.lbs_perf_event_relation;
+}
+#endif
 
 #ifdef CONFIG_BPF_SYSCALL
 static inline struct bpf_security_struct *

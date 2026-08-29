@@ -484,20 +484,25 @@ static ssize_t sel_write_enforce(struct file *file, const char __user *buf,
 				      NULL);
 		if (length)
 			goto out;
+		length = selinux_chain_update_begin(state);
+		if (length)
+			goto out;
 		audit_log(audit_context(), GFP_KERNEL, AUDIT_MAC_STATUS,
 			"enforcing=%d old_enforcing=%d auid=%u ses=%u"
 			" enabled=1 old-enabled=1 lsm=selinux res=1",
 			new_value, old_value,
 			from_kuid(&init_user_ns, audit_get_loginuid(current)),
 			audit_get_sessionid(current));
-		selinux_chain_epoch_bump(state);
 		enforcing_set(state, new_value);
 		if (new_value)
 			avc_ss_reset(state->avc, 0);
+		selinux_chain_update_end(state);
 		selnl_notify_setenforce(new_value);
 		selinux_status_update_setenforce(state, new_value);
+#ifndef CONFIG_SECURITY_SELINUX_NS
 		if (!new_value)
 			call_blocking_lsm_notifier(LSM_POLICY_CHANGE, NULL);
+#endif
 
 		selinux_ima_measure_state(state);
 	}
@@ -876,7 +881,11 @@ static long selinux_nsfd_load_policy(struct selinux_ns_control *control,
 	}
 	rc = security_load_policy(state, data, request.size, &load_state);
 	if (!rc) {
-		selinux_policy_commit(state, &load_state);
+		rc = selinux_policy_commit(state, &load_state);
+		if (rc) {
+			selinux_policy_cancel(state, &load_state);
+			goto out_data;
+		}
 		audit_log(audit_context(), GFP_KERNEL, AUDIT_MAC_POLICY_LOAD,
 			  "auid=%u ses=%u lsm=selinux selinuxns=%llu res=1",
 			  from_kuid(&init_user_ns, audit_get_loginuid(current)),
@@ -1717,7 +1726,11 @@ static ssize_t sel_write_load(struct file *file, const char __user *buf,
 		goto out_unlock;
 	}
 
-	selinux_policy_commit(fsi->state, &load_state);
+	length = selinux_policy_commit(fsi->state, &load_state);
+	if (length) {
+		selinux_policy_cancel(fsi->state, &load_state);
+		goto out_unlock;
+	}
 	length = count;
 	audit_log(audit_context(), GFP_KERNEL, AUDIT_MAC_POLICY_LOAD,
 		"auid=%u ses=%u lsm=selinux res=1",
