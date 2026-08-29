@@ -20043,25 +20043,28 @@ static int selinux_state_pkey_has_perm(struct selinux_state *state, u32 ssid,
 				       u64 subnet_prefix, u16 pkey_val,
 				       struct common_audit_data *ad)
 {
-	struct selinux_policy_chain_snapshot chain;
+	struct selinux_policy_chain_snapshot *chain __free(kfree) =
+		kzalloc_obj(*chain, GFP_ATOMIC);
 	unsigned int retry;
 
+	if (!chain)
+		return -ENOMEM;
 	for (retry = 0; retry < SELINUX_POLICY_OPERATION_RETRIES; retry++) {
 		struct selinux_state *policy_state = state;
 		u32 policy_ssid = ssid;
 		u16 i;
 		int rc = 0;
 
-		rc = selinux_policy_chain_snapshot_read(current_cred(), &chain);
+		rc = selinux_policy_chain_snapshot_read(current_cred(), chain);
 		if (rc == -EAGAIN || rc == -ESTALE)
 			continue;
 		if (rc)
 			return rc;
-		for (i = 0; i < chain.count; i++) {
+		for (i = 0; i < chain->count; i++) {
 			const struct cred_security_struct *crsec =
-				selinux_cred(chain.cred[i]);
+				selinux_cred(chain->cred[i]);
 			const struct selinux_policy_snapshot *snapshot =
-				&chain.policy[i];
+				&chain->policy[i];
 			u32 pkey_sid;
 
 			if (!policy_state || crsec->state != policy_state) {
@@ -20085,7 +20088,7 @@ static int selinux_state_pkey_has_perm(struct selinux_state *state, u32 ssid,
 		if (!rc && policy_state)
 			rc = -EXDEV;
 		if (rc == -ESTALE ||
-		    !selinux_policy_chain_snapshot_valid(&chain))
+		    !selinux_policy_chain_snapshot_valid(chain))
 			continue;
 		return rc;
 	}
@@ -20280,7 +20283,7 @@ static void selinux_ib_free_security(void *ib_sec)
 static int selinux_bpf(int cmd, union bpf_attr *attr,
 		       unsigned int size, bool kernel)
 {
-	struct selinux_policy_chain_snapshot chain;
+	struct selinux_policy_chain_snapshot *chain __free(kfree) = NULL;
 	unsigned int retry;
 	bool object_cap_only = false;
 	u32 requested;
@@ -20316,22 +20319,25 @@ static int selinux_bpf(int cmd, union bpf_attr *attr,
 	default:
 		return 0;
 	}
+	chain = kzalloc_obj(*chain, GFP_KERNEL);
+	if (!chain)
+		return -ENOMEM;
 
 	for (retry = 0; retry < SELINUX_POLICY_OPERATION_RETRIES; retry++) {
 		u16 i;
 		int rc;
 
-		rc = selinux_policy_chain_snapshot_read(current_cred(), &chain);
+		rc = selinux_policy_chain_snapshot_read(current_cred(), chain);
 		if (rc == -EAGAIN || rc == -ESTALE)
 			continue;
 		if (rc)
 			return rc;
 
-		for (i = 0; i < chain.count; i++) {
+		for (i = 0; i < chain->count; i++) {
 			const struct cred_security_struct *crsec =
-				selinux_cred(chain.cred[i]);
+				selinux_cred(chain->cred[i]);
 			const struct selinux_policy_snapshot *snapshot =
-				&chain.policy[i];
+				&chain->policy[i];
 
 			if (object_cap_only &&
 			    !selinux_policycap_bpf_object_perms(snapshot))
@@ -20351,7 +20357,7 @@ static int selinux_bpf(int cmd, union bpf_attr *attr,
 				break;
 		}
 		if (rc == -ESTALE ||
-		    !selinux_policy_chain_snapshot_valid(&chain))
+		    !selinux_policy_chain_snapshot_valid(chain))
 			continue;
 		return rc;
 	}
@@ -20512,23 +20518,26 @@ static int selinux_bpf_projection_has_perm(
 	const struct selinux_pathless_projection *projection, u16 tclass,
 	u32 requested)
 {
-	struct selinux_policy_chain_snapshot chain;
+	struct selinux_policy_chain_snapshot *chain __free(kfree) = NULL;
 	unsigned int retry;
 
 	if (!projection || !tclass)
 		return -EACCES;
+	chain = kzalloc_obj(*chain, GFP_KERNEL);
+	if (!chain)
+		return -ENOMEM;
 	for (retry = 0; retry < SELINUX_POLICY_OPERATION_RETRIES; retry++) {
 		u16 i;
 		int rc;
 
-		rc = selinux_policy_chain_snapshot_read(cred, &chain);
+		rc = selinux_policy_chain_snapshot_read(cred, chain);
 		if (rc == -EAGAIN || rc == -ESTALE)
 			continue;
 		if (rc)
 			return rc;
-		for (i = 0; i < chain.count; i++) {
+		for (i = 0; i < chain->count; i++) {
 			const struct cred_security_struct *crsec =
-				selinux_cred(chain.cred[i]);
+				selinux_cred(chain->cred[i]);
 			u32 tsid;
 
 			rc = selinux_bpf_projection_resolve(
@@ -20536,13 +20545,13 @@ static int selinux_bpf_projection_has_perm(
 			if (rc)
 				break;
 			rc = avc_has_perm_snapshot(
-				crsec->state, &chain.policy[i], crsec->sid, tsid,
+				crsec->state, &chain->policy[i], crsec->sid, tsid,
 				tclass, requested, NULL);
 			if (rc)
 				break;
 		}
 		if (rc == -ESTALE ||
-		    !selinux_policy_chain_snapshot_valid(&chain))
+		    !selinux_policy_chain_snapshot_valid(chain))
 			continue;
 		return rc;
 	}
@@ -20690,7 +20699,7 @@ static int selinux_bpf_map_relation(struct bpf_map *outer,
 	const struct selinux_pathless_projection *outer_object = READ_ONCE(
 		selinux_bpf_map_security(outer)->object);
 	const struct selinux_pathless_projection *target_object;
-	struct selinux_policy_chain_snapshot chain;
+	struct selinux_policy_chain_snapshot *chain __free(kfree) = NULL;
 	u32 target_perm;
 	unsigned int retry;
 
@@ -20707,18 +20716,21 @@ static int selinux_bpf_map_relation(struct bpf_map *outer,
 	}
 	if (!target_object)
 		return -EACCES;
+	chain = kzalloc_obj(*chain, GFP_KERNEL);
+	if (!chain)
+		return -ENOMEM;
 	for (retry = 0; retry < SELINUX_POLICY_OPERATION_RETRIES; retry++) {
 		u16 i;
 		int rc = 0;
 
-		rc = selinux_policy_chain_snapshot_read(current_cred(), &chain);
+		rc = selinux_policy_chain_snapshot_read(current_cred(), chain);
 		if (rc == -EAGAIN || rc == -ESTALE)
 			continue;
 		if (rc)
 			return rc;
-		for (i = 0; i < chain.count; i++) {
+		for (i = 0; i < chain->count; i++) {
 			const struct cred_security_struct *crsec =
-				selinux_cred(chain.cred[i]);
+				selinux_cred(chain->cred[i]);
 			u32 tsid;
 
 			rc = selinux_bpf_projection_resolve(
@@ -20726,7 +20738,7 @@ static int selinux_bpf_map_relation(struct bpf_map *outer,
 			if (rc)
 				break;
 			rc = avc_has_perm_snapshot(
-				crsec->state, &chain.policy[i], crsec->sid, tsid,
+				crsec->state, &chain->policy[i], crsec->sid, tsid,
 				SECCLASS_BPF, BPF__MAP_WRITE, NULL);
 			if (rc)
 				break;
@@ -20735,12 +20747,12 @@ static int selinux_bpf_map_relation(struct bpf_map *outer,
 			if (rc)
 				break;
 			rc = avc_has_perm_snapshot(
-				crsec->state, &chain.policy[i], crsec->sid, tsid,
+				crsec->state, &chain->policy[i], crsec->sid, tsid,
 				SECCLASS_BPF, target_perm, NULL);
 			if (rc)
 				break;
 		}
-		if (rc == -ESTALE || !selinux_policy_chain_snapshot_valid(&chain))
+		if (rc == -ESTALE || !selinux_policy_chain_snapshot_valid(chain))
 			continue;
 		return rc;
 	}
@@ -20790,23 +20802,26 @@ static int selinux_bpf_prog_map_relation(struct bpf_prog *prog,
 		selinux_bpf_prog_security(prog)->object);
 	const struct selinux_pathless_projection *map_object = READ_ONCE(
 		selinux_bpf_map_security((struct bpf_map *)map)->object);
-	struct selinux_policy_chain_snapshot chain;
+	struct selinux_policy_chain_snapshot *chain __free(kfree) = NULL;
 	unsigned int retry;
 
 	if (!prog_object || !map_object)
 		return -EACCES;
+	chain = kzalloc_obj(*chain, GFP_KERNEL);
+	if (!chain)
+		return -ENOMEM;
 	for (retry = 0; retry < SELINUX_POLICY_OPERATION_RETRIES; retry++) {
 		u16 i;
 		int rc;
 
-		rc = selinux_policy_chain_snapshot_read(current_cred(), &chain);
+		rc = selinux_policy_chain_snapshot_read(current_cred(), chain);
 		if (rc == -EAGAIN || rc == -ESTALE)
 			continue;
 		if (rc)
 			return rc;
-		for (i = 0; i < chain.count; i++) {
+		for (i = 0; i < chain->count; i++) {
 			const struct cred_security_struct *crsec =
-				selinux_cred(chain.cred[i]);
+				selinux_cred(chain->cred[i]);
 			u32 tsid;
 
 			rc = selinux_bpf_projection_resolve(
@@ -20814,7 +20829,7 @@ static int selinux_bpf_prog_map_relation(struct bpf_prog *prog,
 			if (rc)
 				break;
 			rc = avc_has_perm_snapshot(
-				crsec->state, &chain.policy[i], crsec->sid, tsid,
+				crsec->state, &chain->policy[i], crsec->sid, tsid,
 				SECCLASS_BPF, BPF__PROG_RUN, NULL);
 			if (rc)
 				break;
@@ -20823,13 +20838,13 @@ static int selinux_bpf_prog_map_relation(struct bpf_prog *prog,
 			if (rc)
 				break;
 			rc = avc_has_perm_snapshot(
-				crsec->state, &chain.policy[i], crsec->sid, tsid,
+				crsec->state, &chain->policy[i], crsec->sid, tsid,
 				SECCLASS_BPF, BPF__MAP_READ, NULL);
 			if (rc)
 				break;
 		}
 		if (rc == -ESTALE ||
-		    !selinux_policy_chain_snapshot_valid(&chain))
+		    !selinux_policy_chain_snapshot_valid(chain))
 			continue;
 		return rc;
 	}
@@ -21106,23 +21121,26 @@ static int selinux_bpf_prog_commit(struct bpf_prog *prog)
 		READ_ONCE(bpfsec->object);
 	const struct selinux_pathless_projection *grantor =
 		READ_ONCE(bpfsec->grantor);
-	struct selinux_policy_chain_snapshot chain;
+	struct selinux_policy_chain_snapshot *chain __free(kfree) = NULL;
 	unsigned int retry;
 
 	if (!prog_object)
 		return -EACCES;
+	chain = kzalloc_obj(*chain, GFP_KERNEL);
+	if (!chain)
+		return -ENOMEM;
 	for (retry = 0; retry < SELINUX_POLICY_OPERATION_RETRIES; retry++) {
 		u16 i;
 		int rc = 0;
 
-		rc = selinux_policy_chain_snapshot_read(current_cred(), &chain);
+		rc = selinux_policy_chain_snapshot_read(current_cred(), chain);
 		if (rc == -EAGAIN || rc == -ESTALE)
 			continue;
 		if (rc)
 			return rc;
-		for (i = 0; i < chain.count; i++) {
+		for (i = 0; i < chain->count; i++) {
 			const struct cred_security_struct *crsec =
-				selinux_cred(chain.cred[i]);
+				selinux_cred(chain->cred[i]);
 			u32 ssid = crsec->sid, tsid;
 			u32 j;
 
@@ -21138,7 +21156,7 @@ static int selinux_bpf_prog_commit(struct bpf_prog *prog)
 			if (rc)
 				break;
 			rc = avc_has_perm_snapshot(
-				crsec->state, &chain.policy[i], ssid, tsid,
+				crsec->state, &chain->policy[i], ssid, tsid,
 				SECCLASS_BPF, BPF__PROG_LOAD, NULL);
 			if (rc)
 				break;
@@ -21153,7 +21171,7 @@ static int selinux_bpf_prog_commit(struct bpf_prog *prog)
 				if (rc)
 					break;
 				rc = avc_has_perm_snapshot(
-					crsec->state, &chain.policy[i], crsec->sid,
+					crsec->state, &chain->policy[i], crsec->sid,
 					tsid, SECCLASS_BPF, BPF__PROG_RUN, NULL);
 				if (rc)
 					break;
@@ -21168,7 +21186,7 @@ static int selinux_bpf_prog_commit(struct bpf_prog *prog)
 				if (rc)
 					break;
 				rc = avc_has_perm_snapshot(
-					crsec->state, &chain.policy[i], crsec->sid,
+					crsec->state, &chain->policy[i], crsec->sid,
 					tsid, SECCLASS_BPF,
 					selinux_bpf_prog_map_av(map), NULL);
 				if (rc)
@@ -21176,7 +21194,7 @@ static int selinux_bpf_prog_commit(struct bpf_prog *prog)
 			}
 			if (rc)
 				break;
-			if (!selinux_policycap_bpf_object_perms(&chain.policy[i]))
+			if (!selinux_policycap_bpf_object_perms(&chain->policy[i]))
 				continue;
 
 			if (prog->aux->btf) {
@@ -21189,7 +21207,7 @@ static int selinux_bpf_prog_commit(struct bpf_prog *prog)
 				if (rc)
 					break;
 				rc = avc_has_perm_snapshot(
-					crsec->state, &chain.policy[i], crsec->sid,
+					crsec->state, &chain->policy[i], crsec->sid,
 					tsid, SECCLASS_BPF, BPF__BTF_READ, NULL);
 				if (rc)
 					break;
@@ -21204,7 +21222,7 @@ static int selinux_bpf_prog_commit(struct bpf_prog *prog)
 				if (rc)
 					break;
 				rc = avc_has_perm_snapshot(
-					crsec->state, &chain.policy[i], crsec->sid,
+					crsec->state, &chain->policy[i], crsec->sid,
 					tsid, SECCLASS_BPF, BPF__BTF_READ, NULL);
 				if (rc)
 					break;
@@ -21219,7 +21237,7 @@ static int selinux_bpf_prog_commit(struct bpf_prog *prog)
 				if (rc)
 					break;
 				rc = avc_has_perm_snapshot(
-					crsec->state, &chain.policy[i], crsec->sid,
+					crsec->state, &chain->policy[i], crsec->sid,
 					tsid, SECCLASS_BPF, BPF__BTF_READ, NULL);
 				if (rc)
 					break;
@@ -21227,7 +21245,7 @@ static int selinux_bpf_prog_commit(struct bpf_prog *prog)
 			if (rc)
 				break;
 		}
-		if (rc == -ESTALE || !selinux_policy_chain_snapshot_valid(&chain))
+		if (rc == -ESTALE || !selinux_policy_chain_snapshot_valid(chain))
 			continue;
 		return rc;
 	}
@@ -21648,27 +21666,30 @@ next_retry:
 static int selinux_bpf_link_access(struct bpf_link *link, enum bpf_cmd cmd)
 {
 	struct bpf_security_struct *bpfsec = selinux_bpf_link_security(link);
-	struct selinux_policy_chain_snapshot chain;
+	struct selinux_policy_chain_snapshot *chain __free(kfree) = NULL;
 	u32 requested = selinux_bpf_link_cmd_perm(cmd);
 	unsigned int retry;
 
 	if (!requested || !READ_ONCE(bpfsec->object))
 		return -EOPNOTSUPP;
+	chain = kzalloc_obj(*chain, GFP_KERNEL);
+	if (!chain)
+		return -ENOMEM;
 	for (retry = 0; retry < SELINUX_POLICY_OPERATION_RETRIES; retry++) {
 		u16 i;
 		int rc = 0;
 
-		rc = selinux_policy_chain_snapshot_read(current_cred(), &chain);
+		rc = selinux_policy_chain_snapshot_read(current_cred(), chain);
 		if (rc == -EAGAIN || rc == -ESTALE)
 			continue;
 		if (rc)
 			return rc;
-		for (i = 0; i < chain.count; i++) {
+		for (i = 0; i < chain->count; i++) {
 			const struct cred_security_struct *crsec =
-				selinux_cred(chain.cred[i]);
+				selinux_cred(chain->cred[i]);
 			u32 tsid;
 
-			if (!selinux_policycap_bpf_object_perms(&chain.policy[i]))
+			if (!selinux_policycap_bpf_object_perms(&chain->policy[i]))
 				continue;
 			rc = selinux_bpf_projection_resolve(
 				READ_ONCE(bpfsec->object),
@@ -21676,12 +21697,12 @@ static int selinux_bpf_link_access(struct bpf_link *link, enum bpf_cmd cmd)
 			if (rc)
 				break;
 			rc = avc_has_perm_snapshot(
-				crsec->state, &chain.policy[i], crsec->sid, tsid,
+				crsec->state, &chain->policy[i], crsec->sid, tsid,
 				SECCLASS_BPF, requested, NULL);
 			if (rc)
 				break;
 		}
-		if (rc == -ESTALE || !selinux_policy_chain_snapshot_valid(&chain))
+		if (rc == -ESTALE || !selinux_policy_chain_snapshot_valid(chain))
 			continue;
 		return rc;
 	}
@@ -21698,7 +21719,7 @@ static int selinux_bpf_link_update(struct bpf_link *link,
 		selinux_bpf_link_security(link)->object);
 	const struct selinux_pathless_projection *new_object = NULL;
 	const struct selinux_pathless_projection *old_object = NULL;
-	struct selinux_policy_chain_snapshot chain;
+	struct selinux_policy_chain_snapshot *chain __free(kfree) = NULL;
 	u32 object_perm;
 	unsigned int retry;
 
@@ -21723,28 +21744,31 @@ static int selinux_bpf_link_update(struct bpf_link *link,
 			(struct bpf_map *)old_map)->object);
 	if (!new_object || ((old_prog || old_map) && !old_object))
 		return -EACCES;
+	chain = kzalloc_obj(*chain, GFP_KERNEL);
+	if (!chain)
+		return -ENOMEM;
 
 	for (retry = 0; retry < SELINUX_POLICY_OPERATION_RETRIES; retry++) {
 		u16 i;
 		int rc = 0;
 
-		rc = selinux_policy_chain_snapshot_read(current_cred(), &chain);
+		rc = selinux_policy_chain_snapshot_read(current_cred(), chain);
 		if (rc == -EAGAIN || rc == -ESTALE)
 			continue;
 		if (rc)
 			return rc;
-		for (i = 0; i < chain.count; i++) {
+		for (i = 0; i < chain->count; i++) {
 			const struct cred_security_struct *crsec =
-				selinux_cred(chain.cred[i]);
+				selinux_cred(chain->cred[i]);
 			u32 tsid;
 
-			if (selinux_policycap_bpf_object_perms(&chain.policy[i])) {
+			if (selinux_policycap_bpf_object_perms(&chain->policy[i])) {
 				rc = selinux_bpf_projection_resolve(
 					link_object, crsec->state->label_domain, &tsid);
 				if (rc)
 					break;
 				rc = avc_has_perm_snapshot(
-					crsec->state, &chain.policy[i], crsec->sid,
+					crsec->state, &chain->policy[i], crsec->sid,
 					tsid, SECCLASS_BPF, BPF__LINK_UPDATE, NULL);
 				if (rc)
 					break;
@@ -21754,7 +21778,7 @@ static int selinux_bpf_link_update(struct bpf_link *link,
 			if (rc)
 				break;
 			rc = avc_has_perm_snapshot(
-				crsec->state, &chain.policy[i], crsec->sid, tsid,
+				crsec->state, &chain->policy[i], crsec->sid, tsid,
 				SECCLASS_BPF, object_perm, NULL);
 			if (rc)
 				break;
@@ -21764,13 +21788,13 @@ static int selinux_bpf_link_update(struct bpf_link *link,
 				if (rc)
 					break;
 				rc = avc_has_perm_snapshot(
-					crsec->state, &chain.policy[i], crsec->sid,
+					crsec->state, &chain->policy[i], crsec->sid,
 					tsid, SECCLASS_BPF, object_perm, NULL);
 				if (rc)
 					break;
 			}
 		}
-		if (rc == -ESTALE || !selinux_policy_chain_snapshot_valid(&chain))
+		if (rc == -ESTALE || !selinux_policy_chain_snapshot_valid(chain))
 			continue;
 		return rc;
 	}
@@ -21877,26 +21901,29 @@ static int selinux_bpf_btf(const struct btf *btf)
 {
 	struct bpf_security_struct *bpfsec =
 		selinux_bpf_btf_security((struct btf *)btf);
-	struct selinux_policy_chain_snapshot chain;
+	struct selinux_policy_chain_snapshot *chain __free(kfree) = NULL;
 	unsigned int retry;
 
 	if (!READ_ONCE(bpfsec->object))
 		return -EACCES;
+	chain = kzalloc_obj(*chain, GFP_KERNEL);
+	if (!chain)
+		return -ENOMEM;
 	for (retry = 0; retry < SELINUX_POLICY_OPERATION_RETRIES; retry++) {
 		u16 i;
 		int rc = 0;
 
-		rc = selinux_policy_chain_snapshot_read(current_cred(), &chain);
+		rc = selinux_policy_chain_snapshot_read(current_cred(), chain);
 		if (rc == -EAGAIN || rc == -ESTALE)
 			continue;
 		if (rc)
 			return rc;
-		for (i = 0; i < chain.count; i++) {
+		for (i = 0; i < chain->count; i++) {
 			const struct cred_security_struct *crsec =
-				selinux_cred(chain.cred[i]);
+				selinux_cred(chain->cred[i]);
 			u32 tsid;
 
-			if (!selinux_policycap_bpf_object_perms(&chain.policy[i]))
+			if (!selinux_policycap_bpf_object_perms(&chain->policy[i]))
 				continue;
 			rc = selinux_bpf_projection_resolve(
 				READ_ONCE(bpfsec->object),
@@ -21904,12 +21931,12 @@ static int selinux_bpf_btf(const struct btf *btf)
 			if (rc)
 				break;
 			rc = avc_has_perm_snapshot(
-				crsec->state, &chain.policy[i], crsec->sid, tsid,
+				crsec->state, &chain->policy[i], crsec->sid, tsid,
 				SECCLASS_BPF, BPF__BTF_READ, NULL);
 			if (rc)
 				break;
 		}
-		if (rc == -ESTALE || !selinux_policy_chain_snapshot_valid(&chain))
+		if (rc == -ESTALE || !selinux_policy_chain_snapshot_valid(chain))
 			continue;
 		return rc;
 	}
