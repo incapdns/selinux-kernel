@@ -757,7 +757,7 @@ static void selinux_xperm_policycap_per_level_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, result.ordinary_audits, (u16)1);
 }
 
-static void selinux_xperm_audit_failure_test(struct kunit *test)
+static void selinux_xperm_audit_failure_preserves_denial_test(struct kunit *test)
 {
 	const unsigned long policycaps[3] = {};
 	struct selinux_kunit_xperm_result result = {};
@@ -766,7 +766,7 @@ static void selinux_xperm_audit_failure_test(struct kunit *test)
 	selinux_kunit_audit_buckets_reset();
 	rc = selinux_kunit_avc_xperm_vector(
 		policycaps, 1, -1, -ENOMEM, &result);
-	KUNIT_EXPECT_EQ(test, rc, -ENOMEM);
+	KUNIT_EXPECT_EQ(test, rc, -EACCES);
 	KUNIT_EXPECT_EQ(test, result.aggregate_calls, (u16)1);
 	KUNIT_EXPECT_EQ(test, result.aggregate_denials, (u16)1);
 	KUNIT_EXPECT_EQ(test, result.ordinary_audits, (u16)0);
@@ -869,14 +869,15 @@ static void selinux_mount_stale_exhaustion_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, result.ordinary_audits, (u16)0);
 }
 
-static void selinux_mount_aggregate_failure_closed_test(struct kunit *test)
+static void selinux_mount_audit_failure_preserves_denial_test(
+	struct kunit *test)
 {
 	struct selinux_kunit_mount_transaction_result result = {};
 	int rc;
 
 	rc = selinux_kunit_avc_mount_transaction(
 		BIT(1), -1, false, -ENOMEM, &result);
-	KUNIT_EXPECT_EQ(test, rc, -ENOMEM);
+	KUNIT_EXPECT_EQ(test, rc, -EACCES);
 	KUNIT_EXPECT_EQ(test, result.aggregate_calls, (u16)1);
 	KUNIT_EXPECT_EQ(test, result.aggregate_denials, (u16)1);
 	KUNIT_EXPECT_EQ(test, result.ordinary_audits, (u16)0);
@@ -997,12 +998,13 @@ static void selinux_composite_allocation_failure_test(struct kunit *test)
 	rc = selinux_kunit_avc_validatetrans_transaction(
 		BIT(1), BIT(0), 0, -1,
 		SELINUX_KUNIT_COMPOSITE_ALLOC_AGGREGATE, 0, &result);
-	KUNIT_EXPECT_EQ(test, rc, -ENOMEM);
+	KUNIT_EXPECT_EQ(test, rc, -EACCES);
 	KUNIT_EXPECT_EQ(test, result.aggregate_calls, (u16)0);
 	KUNIT_EXPECT_EQ(test, result.ordinary_audits, (u16)0);
 }
 
-static void selinux_composite_emitter_failure_test(struct kunit *test)
+static void selinux_composite_emitter_failure_preserves_denial_test(
+	struct kunit *test)
 {
 	struct selinux_kunit_composite_transaction_result result = {};
 	int rc;
@@ -1011,10 +1013,35 @@ static void selinux_composite_emitter_failure_test(struct kunit *test)
 	rc = selinux_kunit_avc_validatetrans_transaction(
 		BIT(1), BIT(0), 0, -1,
 		SELINUX_KUNIT_COMPOSITE_ALLOC_NONE, -ENOBUFS, &result);
-	KUNIT_EXPECT_EQ(test, rc, -ENOBUFS);
+	KUNIT_EXPECT_EQ(test, rc, -EACCES);
 	KUNIT_EXPECT_EQ(test, result.aggregate_calls, (u16)1);
 	KUNIT_EXPECT_EQ(test, result.aggregate_denials, (u16)2);
 	KUNIT_EXPECT_EQ(test, result.ordinary_audits, (u16)0);
+}
+
+static void selinux_composite_audit_quota_preserves_decision_test(
+	struct kunit *test)
+{
+	struct selinux_kunit_composite_transaction_result result = {};
+	int rc;
+
+	/* A permissive would-deny remains allowed when audit quota is empty. */
+	selinux_kunit_audit_buckets_reset();
+	selinux_kunit_audit_host_tokens_set(0);
+	rc = selinux_kunit_avc_validatetrans_transaction(
+		0, 0, BIT(0), -1, SELINUX_KUNIT_COMPOSITE_ALLOC_NONE, 0,
+		&result);
+	KUNIT_EXPECT_EQ(test, rc, 0);
+	KUNIT_EXPECT_EQ(test, result.aggregate_calls, (u16)0);
+
+	/* An enforcing denial keeps its policy errno, never EDQUOT. */
+	memset(&result, 0, sizeof(result));
+	rc = selinux_kunit_avc_validatetrans_transaction(
+		BIT(1), 0, 0, -1, SELINUX_KUNIT_COMPOSITE_ALLOC_NONE, 0,
+		&result);
+	KUNIT_EXPECT_EQ(test, rc, -EACCES);
+	KUNIT_EXPECT_EQ(test, result.aggregate_calls, (u16)0);
+	selinux_kunit_audit_buckets_reset();
 }
 
 static void selinux_netlink_mixed_snapshot_abi_test(struct kunit *test)
@@ -1112,20 +1139,21 @@ static struct kunit_case selinux_create_plan_test_cases[] = {
 	KUNIT_CASE(selinux_filesystem_policycap_vector_test),
 	KUNIT_CASE(selinux_xperm_intermediate_denial_test),
 	KUNIT_CASE(selinux_xperm_policycap_per_level_test),
-	KUNIT_CASE(selinux_xperm_audit_failure_test),
+	KUNIT_CASE(selinux_xperm_audit_failure_preserves_denial_test),
 	KUNIT_CASE(selinux_xperm_stale_retry_test),
 	KUNIT_CASE(selinux_secmark_host_denial_aggregate_test),
 	KUNIT_CASE(selinux_secmark_stale_retry_no_partial_audit_test),
 	KUNIT_CASE(selinux_mount_child_denial_keeps_host_test),
 	KUNIT_CASE(selinux_mount_stale_retries_whole_vector_test),
 	KUNIT_CASE(selinux_mount_stale_exhaustion_test),
-	KUNIT_CASE(selinux_mount_aggregate_failure_closed_test),
+	KUNIT_CASE(selinux_mount_audit_failure_preserves_denial_test),
 	KUNIT_CASE(selinux_composite_child_host_denials_test),
 	KUNIT_CASE(selinux_composite_avc_validatetrans_test),
 	KUNIT_CASE(selinux_composite_permissive_would_deny_test),
 	KUNIT_CASE(selinux_composite_stale_retry_no_partial_audit_test),
 	KUNIT_CASE(selinux_composite_allocation_failure_test),
-	KUNIT_CASE(selinux_composite_emitter_failure_test),
+	KUNIT_CASE(selinux_composite_emitter_failure_preserves_denial_test),
+	KUNIT_CASE(selinux_composite_audit_quota_preserves_decision_test),
 	KUNIT_CASE(selinux_netlink_mixed_snapshot_abi_test),
 	KUNIT_CASE(selinux_netlink_batch_stale_no_partial_audit_test),
 	KUNIT_CASE(selinux_noaudit_cap_precheck_errno_test),

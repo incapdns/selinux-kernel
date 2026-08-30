@@ -167,8 +167,10 @@ config SECURITY_SELINUX_AUDIT_TOKENS_PER_USERNS
 	range 8 65536
 	default 256
 	help
-	  Maximum burst of mandatory SELinux audit records attributable to one
-	  owning user namespace. Tokens refill at the rate selected below.
+	  Maximum burst of SELinux audit records attributable to one owning user
+	  namespace. Tokens refill at the rate selected below. Exhaustion is
+	  reported through the audit lost-record mechanism and never changes the
+	  underlying SELinux access decision.
 
 config SECURITY_SELINUX_AUDIT_CHILD_TOKENS_GLOBAL
 	int "SELinux aggregate child audit burst"
@@ -195,6 +197,7 @@ config SECURITY_SELINUX_AUDIT_REFILL_PER_SECOND
 	default 64
 	help
 	  Token refill rate for owner, child-global, and host-reserved buckets.
+	  These buckets bound audit traffic only; they do not grant or deny access.
 
 config SECURITY_SELINUX_DEBUG
 	bool "SELinux kernel debugging support"

@@ -106,6 +106,7 @@ u64 selinux_kunit_audit_host_tokens(void);
 u64 selinux_kunit_audit_child_tokens(void);
 u64 selinux_kunit_audit_refill_amount(u64 periods, u64 maximum);
 void selinux_kunit_audit_child_tokens_set(u64 tokens);
+void selinux_kunit_audit_host_tokens_set(u64 tokens);
 #endif
 
 #endif /* _SELINUX_RESOURCE_H_ */

@@ -3123,7 +3123,7 @@ static void selinux_net_assertion_sid_lifetime_test(struct kunit *test)
 	struct selinux_global_sid_handle *producer, *stale;
 	struct selinux_net_assertion *assertion, *wrong;
 	struct selinux_label_domain *domain;
-	struct selinux_label_ref *canonical, *label;
+	struct selinux_label_ref *canonical, *label, *wrong_label;
 	struct selinux_state state;
 	u32 sid;
 	int rc;
@@ -3132,6 +3132,14 @@ static void selinux_net_assertion_sid_lifetime_test(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, domain);
 	label = selinux_test_global_label(test, &state, domain, context, &sid);
 	KUNIT_ASSERT_NOT_NULL(test, label);
+	wrong_label = selinux_label_ref_intern(
+		domain, "u:object_r:kunit_net_assertion_wrong_t:s0",
+		strlen("u:object_r:kunit_net_assertion_wrong_t:s0") + 1,
+		GFP_KERNEL);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, wrong_label);
+	rc = kunit_add_action_or_reset(test, selinux_test_label_ref_put,
+				       wrong_label);
+	KUNIT_ASSERT_EQ(test, rc, 0);
 	wrong = selinux_net_assertion_alloc_handle(
 		NULL, SECCLASS_PACKET, SELINUX_NET_ASSERTION_SOURCE_SOCKET,
 		0, GFP_KERNEL);

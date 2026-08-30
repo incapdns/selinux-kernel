@@ -909,8 +909,14 @@ noinline int slow_avc_audit(struct selinux_state *state,
 
 	a->selinux_audit_data = &sad;
 
-	return common_lsm_audit_status(a, avc_audit_pre_callback,
-				       avc_audit_post_callback);
+	/*
+	 * Auditing is observational and must not replace the access decision.
+	 * This matches the upstream AVC contract: the audit core accounts for
+	 * lost records, while callers continue to receive the policy result.
+	 */
+	(void)common_lsm_audit_status(a, avc_audit_pre_callback,
+				      avc_audit_post_callback);
+	return 0;
 }
 
 /**
@@ -1922,12 +1928,17 @@ static int selinux_avc_host_aggregate_composite(
 		return -EOVERFLOW;
 	rc = selinux_audit_reserve(host_state->label_domain->resources, bytes,
 				   &reservation);
+	if (rc == -EDQUOT || rc == -ENOMEM || rc == -ENOBUFS) {
+		audit_log_lost("SELinux aggregate audit resource limit exceeded");
+		return 0;
+	}
 	if (rc)
 		return rc;
 	aggregate = selinux_avc_transaction_calloc(
 		1, bytes, SELINUX_AVC_TRANSACTION_ALLOC_AGGREGATE);
 	if (!aggregate) {
-		rc = -ENOMEM;
+		audit_log_lost("out of memory in SELinux aggregate audit");
+		rc = 0;
 		goto out_release;
 	}
 	aggregate->count = denial_count;
@@ -1978,7 +1989,9 @@ static int selinux_avc_host_aggregate_composite(
 		ad = &stack_ad;
 	saved_selinux_data = ad->selinux_audit_data;
 	ad->selinux_audit_data = (void *)aggregate;
-	rc = selinux_avc_host_audit_emit(ad, selinux_avc_aggregate_pre, NULL);
+	/* The audit core reports lost records; authorization stays unchanged. */
+	(void)selinux_avc_host_audit_emit(ad, selinux_avc_aggregate_pre, NULL);
+	rc = 0;
 	ad->selinux_audit_data = saved_selinux_data;
 	kfree(aggregate);
 out_release:

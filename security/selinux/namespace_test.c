@@ -765,7 +765,7 @@ static void selinux_audit_dontaudit_host_aggregate_test(struct kunit *test)
 			current_selinux_state->ns_control->ns.ns_id);
 }
 
-static void selinux_audit_allocation_failure_test(struct kunit *test)
+static void selinux_audit_emitter_failure_is_nonfatal_test(struct kunit *test)
 {
 	u16 count = 0;
 	u64 namespace_id = 0;
@@ -774,8 +774,22 @@ static void selinux_audit_allocation_failure_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test,
 		selinux_kunit_avc_host_aggregate(true, -ENOMEM, &count,
 						 &namespace_id),
-		-ENOMEM);
+		0);
 	KUNIT_EXPECT_EQ(test, count, (u16)1);
+}
+
+static void selinux_audit_quota_is_nonfatal_test(struct kunit *test)
+{
+	u64 namespace_id = 0;
+	u16 count = 0;
+
+	selinux_kunit_audit_buckets_reset();
+	selinux_kunit_audit_host_tokens_set(0);
+	KUNIT_EXPECT_EQ(test,
+		selinux_kunit_avc_host_aggregate(true, 0, &count, &namespace_id), 0);
+	KUNIT_EXPECT_EQ(test, count, (u16)0);
+	KUNIT_EXPECT_EQ(test, selinux_kunit_audit_host_tokens(), (u64)0);
+	selinux_kunit_audit_buckets_reset();
 }
 
 static void selinux_audit_format_expansion_failure_test(struct kunit *test)
@@ -819,7 +833,8 @@ static struct kunit_case selinux_namespace_control_test_cases[] = {
 	KUNIT_CASE(selinux_namespace_limit_validation_test),
 	KUNIT_CASE(selinux_audit_host_reserve_lifetime_test),
 	KUNIT_CASE(selinux_audit_dontaudit_host_aggregate_test),
-	KUNIT_CASE(selinux_audit_allocation_failure_test),
+	KUNIT_CASE(selinux_audit_emitter_failure_is_nonfatal_test),
+	KUNIT_CASE(selinux_audit_quota_is_nonfatal_test),
 	KUNIT_CASE(selinux_audit_format_expansion_failure_test),
 	KUNIT_CASE(selinux_audit_refill_saturation_test),
 	{}

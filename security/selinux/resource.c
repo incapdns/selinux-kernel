@@ -709,4 +709,15 @@ void selinux_kunit_audit_child_tokens_set(u64 tokens)
 	selinux_audit_child_refill = jiffies;
 	spin_unlock_irqrestore(&selinux_audit_child_lock, flags);
 }
+
+void selinux_kunit_audit_host_tokens_set(u64 tokens)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&selinux_audit_host_lock, flags);
+	selinux_audit_host_tokens = min_t(
+		u64, tokens, CONFIG_SECURITY_SELINUX_AUDIT_HOST_TOKENS_RESERVED);
+	selinux_audit_host_refill = jiffies;
+	spin_unlock_irqrestore(&selinux_audit_host_lock, flags);
+}
 #endif
