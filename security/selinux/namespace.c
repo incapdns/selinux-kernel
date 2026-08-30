@@ -409,9 +409,14 @@ static int selinux_ns_control_activate_locked(
 	if (rc && rc != -EALREADY)
 		goto done;
 
-	rc = selinux_chain_update_begin(control->state);
+	rc = selinux_chain_update_prepare(control->state);
 	if (rc)
 		goto done;
+	rc = selinux_chain_update_begin(control->state);
+	if (rc) {
+		selinux_chain_update_abort(control->state);
+		goto done;
+	}
 	update_started = true;
 	rc = selinux_label_domain_publish_map(control->state->label_domain,
 					      control->map,
@@ -435,6 +440,10 @@ static int selinux_ns_control_activate_locked(
 done:
 	if (update_started) {
 		selinux_chain_update_end(control->state);
+		if (rc)
+			selinux_chain_update_abort(control->state);
+		else
+			selinux_chain_update_complete(control->state);
 		if (!rc) {
 			control->child_chain_epoch =
 				selinux_chain_epoch_read(control->state);

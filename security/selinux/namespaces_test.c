@@ -155,6 +155,86 @@ static void selinux_chain_update_saturation_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, selinux_chain_epoch_read(&state), (u64)0);
 }
 
+struct selinux_chain_notifier_test_ctx {
+	struct notifier_block notifier;
+	struct selinux_state *state;
+	bool pre_seen;
+	bool pre_active;
+	bool post_seen;
+	bool post_active;
+	bool abort_seen;
+	bool abort_active;
+	bool reject_pre;
+};
+
+static int selinux_chain_notifier_test_call(struct notifier_block *nb,
+					     unsigned long event, void *data)
+{
+	struct selinux_chain_notifier_test_ctx *ctx =
+		container_of(nb, struct selinux_chain_notifier_test_ctx, notifier);
+
+	if (event == LSM_POLICY_CHANGE_PRE) {
+		ctx->pre_seen = true;
+		ctx->pre_active = selinux_chain_update_active(ctx->state);
+		if (ctx->reject_pre)
+			return notifier_from_errno(-EBUSY);
+	} else if (event == LSM_POLICY_CHANGE) {
+		ctx->post_seen = true;
+		ctx->post_active = selinux_chain_update_active(ctx->state);
+	} else if (event == LSM_POLICY_CHANGE_ABORT) {
+		ctx->abort_seen = true;
+		ctx->abort_active = selinux_chain_update_active(ctx->state);
+	}
+	return NOTIFY_OK;
+}
+
+static void selinux_chain_notifier_test_unregister(void *data)
+{
+	struct selinux_chain_notifier_test_ctx *ctx = data;
+
+	unregister_blocking_lsm_notifier(&ctx->notifier);
+}
+
+static void selinux_chain_notifier_outside_publication_test(struct kunit *test)
+{
+	struct selinux_chain_notifier_test_ctx *ctx;
+	struct selinux_label_domain *domain;
+	struct selinux_state state;
+	int rc;
+
+	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	domain = selinux_test_domain_alloc(test, NULL);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, domain);
+	selinux_test_state_init(&state, 1);
+	state.label_domain = domain;
+	ctx->state = &state;
+	ctx->notifier.notifier_call = selinux_chain_notifier_test_call;
+	rc = register_blocking_lsm_notifier(&ctx->notifier);
+	KUNIT_ASSERT_EQ(test, rc, 0);
+	rc = kunit_add_action_or_reset(
+		test, selinux_chain_notifier_test_unregister, ctx);
+	KUNIT_ASSERT_EQ(test, rc, 0);
+
+	rc = selinux_chain_update_prepare(&state);
+	KUNIT_ASSERT_EQ(test, rc, 0);
+	KUNIT_EXPECT_TRUE(test, ctx->pre_seen);
+	KUNIT_EXPECT_FALSE(test, ctx->pre_active);
+	KUNIT_ASSERT_EQ(test, selinux_chain_update_begin(&state), 0);
+	KUNIT_EXPECT_TRUE(test, selinux_chain_update_active(&state));
+	selinux_chain_update_end(&state);
+	selinux_chain_update_complete(&state);
+	KUNIT_EXPECT_TRUE(test, ctx->post_seen);
+	KUNIT_EXPECT_FALSE(test, ctx->post_active);
+
+	ctx->reject_pre = true;
+	rc = selinux_chain_update_prepare(&state);
+	KUNIT_EXPECT_EQ(test, rc, -EBUSY);
+	KUNIT_EXPECT_TRUE(test, ctx->abort_seen);
+	KUNIT_EXPECT_FALSE(test, ctx->abort_active);
+	KUNIT_EXPECT_FALSE(test, selinux_chain_update_active(&state));
+}
+
 static void selinux_xfrm_resolution_chain_collection_test(struct kunit *test)
 {
 	struct selinux_label_resolution source = {}, target = {};
@@ -4477,6 +4557,7 @@ static struct kunit_case selinux_namespaces_test_cases[] = {
 	KUNIT_CASE(selinux_chain_epoch_saturation_test),
 	KUNIT_CASE(selinux_chain_update_nested_test),
 	KUNIT_CASE(selinux_chain_update_saturation_test),
+	KUNIT_CASE(selinux_chain_notifier_outside_publication_test),
 	KUNIT_CASE(selinux_xfrm_resolution_chain_collection_test),
 	KUNIT_CASE(selinux_xfrm_flow_origin_type_test),
 	KUNIT_CASE(selinux_policy_snapshot_test),

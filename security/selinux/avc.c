@@ -1195,6 +1195,8 @@ static int avc_has_extended_perms_noaudit_internal(
 	rcu_read_lock();
 
 	node = avc_lookup(state->avc, ssid, tsid, tclass);
+	if (node && snapshot && node->ae.avd.seqno != snapshot->seqno)
+		node = NULL;
 	if (unlikely(!node)) {
 		avc_compute_av(state, ssid, tsid, tclass, &avd, xp_node);
 	} else {
@@ -1387,6 +1389,48 @@ inline int avc_has_perm_noaudit(struct selinux_state *state,
 	return 0;
 }
 
+/*
+ * Snapshot users must not turn an old-generation AVC node into -ESTALE.
+ * Policy publication and AVC flushing are necessarily separate operations;
+ * during that short interval the cache can still contain an otherwise valid
+ * node from the preceding generation.  Treat it exactly like a cache miss and
+ * compute against the currently published policy.  The caller's existing
+ * snapshot validation then either accepts that decision or retries a genuine
+ * concurrent publication.
+ */
+static int avc_has_perm_noaudit_snapshot(
+	struct selinux_state *state,
+	const struct selinux_policy_snapshot *snapshot,
+	u32 ssid, u32 tsid, u16 tclass, u32 requested,
+	unsigned int flags, struct av_decision *avd)
+{
+	u32 denied;
+	struct avc_node *node;
+
+	if (WARN_ON_ONCE(!snapshot))
+		return -EINVAL;
+	if (WARN_ON(!requested))
+		return -EACCES;
+	if (!selinux_policy_snapshot_valid(state, snapshot))
+		return -ESTALE;
+
+	rcu_read_lock();
+	node = avc_lookup(state->avc, ssid, tsid, tclass);
+	if (unlikely(!node || node->ae.avd.seqno != snapshot->seqno)) {
+		rcu_read_unlock();
+		return avc_perm_nonode(state, ssid, tsid, tclass, requested,
+				       flags, avd);
+	}
+	denied = requested & ~node->ae.avd.allowed;
+	memcpy(avd, &node->ae.avd, sizeof(*avd));
+	rcu_read_unlock();
+
+	if (unlikely(denied))
+		return avc_denied(state, ssid, tsid, tclass, requested, 0, 0,
+				  0, flags, avd);
+	return 0;
+}
+
 /**
  * avc_has_perm - Check permissions and perform any appropriate auditing.
  * @state: SELinux state
@@ -1453,9 +1497,9 @@ int avc_has_perm_snapshot(
 	if (!selinux_policy_snapshot_valid(state, snapshot))
 		return -ESTALE;
 
-	rc = avc_has_perm_noaudit(state, ssid, tsid, tclass, requested, 0,
-				  &avd);
-	if (avd.seqno != snapshot->seqno ||
+	rc = avc_has_perm_noaudit_snapshot(state, snapshot, ssid, tsid,
+					   tclass, requested, 0, &avd);
+	if (rc == -ESTALE || avd.seqno != snapshot->seqno ||
 	    !selinux_policy_snapshot_valid(state, snapshot))
 		return -ESTALE;
 
@@ -2158,9 +2202,9 @@ static int selinux_avc_perm_decide(
 		return 0;
 	}
 #endif
-	return avc_has_perm_noaudit(level->state, level->ssid, level->tsid,
-				    level->tclass, level->requested, 0,
-				    decision);
+	return avc_has_perm_noaudit_snapshot(
+		level->state, snapshot, level->ssid, level->tsid,
+		level->tclass, level->requested, 0, decision);
 }
 
 static int selinux_avc_perm_audit(
@@ -4128,7 +4172,7 @@ int cred_label_has_perm_noaudit(const struct cred *cred, u32 tsid,
 			struct cred_security_struct *crsec =
 				selinux_cred(chain.cred[i]);
 			struct selinux_state *state = crsec->state;
-			struct av_decision tmp_avd;
+			struct av_decision tmp_avd = {};
 			u16 depth = state->label_domain->depth;
 
 			if (depth > operation->labels.max_depth ||
@@ -4138,10 +4182,12 @@ int cred_label_has_perm_noaudit(const struct cred *cred, u32 tsid,
 				rc = -EOPNOTSUPP;
 				break;
 			}
-			rc = avc_has_perm_noaudit(
-				state, crsec->sid, operation->labels.sid[depth], tclass,
-				requested, 0, &tmp_avd);
-			if (tmp_avd.seqno != chain.policy[i].seqno ||
+			rc = avc_has_perm_noaudit_snapshot(
+				state, &chain.policy[i], crsec->sid,
+				operation->labels.sid[depth], tclass, requested, 0,
+				&tmp_avd);
+			if (rc == -ESTALE ||
+			    tmp_avd.seqno != chain.policy[i].seqno ||
 			    !selinux_policy_snapshot_valid(state,
 							   &chain.policy[i])) {
 				rc = -ESTALE;
@@ -4314,12 +4360,12 @@ static int __cred_pathless_has_perm(
 			struct cred_security_struct *crsec =
 				selinux_cred(chain.cred[i]);
 			struct selinux_pathless_resolution resolved;
-			struct av_decision decision;
+			struct av_decision decision = {};
 			int decision_rc;
 
 			resolved = line->level[crsec->state->label_domain->depth];
-			decision_rc = avc_has_perm_noaudit(
-				crsec->state, crsec->sid, resolved.sid,
+			decision_rc = avc_has_perm_noaudit_snapshot(
+				crsec->state, &chain.policy[i], crsec->sid, resolved.sid,
 				tclass ? tclass : resolved.sclass, requested, 0,
 				&decision);
 			levels[i].state = crsec->state;
@@ -4332,7 +4378,8 @@ static int __cred_pathless_has_perm(
 				projection->view, projection->source);
 			work->provenance[i].map_generation = resolved.map_generation;
 			decisions[i] = decision;
-			if (decision.seqno != chain.policy[i].seqno ||
+			if (decision_rc == -ESTALE ||
+			    decision.seqno != chain.policy[i].seqno ||
 			    !selinux_policy_snapshot_valid(crsec->state,
 						   &chain.policy[i])) {
 				rc = -ESTALE;
@@ -4360,16 +4407,17 @@ static int __cred_pathless_has_perm(
 			struct cred_security_struct *crsec =
 				selinux_cred(chain.cred[i]);
 			struct selinux_pathless_resolution resolved;
-			struct av_decision decision;
+			struct av_decision decision = {};
 			int decision_rc;
 			int audit_rc;
 
 			resolved = line->level[crsec->state->label_domain->depth];
-			decision_rc = avc_has_perm_noaudit(
-				crsec->state, crsec->sid, resolved.sid,
+			decision_rc = avc_has_perm_noaudit_snapshot(
+				crsec->state, &chain.policy[i], crsec->sid, resolved.sid,
 				tclass ? tclass : resolved.sclass, requested, 0,
 				&decision);
-			if (decision.seqno != chain.policy[i].seqno ||
+			if (decision_rc == -ESTALE ||
+			    decision.seqno != chain.policy[i].seqno ||
 			    !selinux_policy_snapshot_valid(crsec->state,
 						   &chain.policy[i]))
 				return -ESTALE;
@@ -4455,7 +4503,7 @@ int cred_pathless_relation_has_perm(
 				selinux_cred(chain.cred[i]);
 			struct selinux_pathless_resolution source_resolved;
 			struct selinux_pathless_resolution target_resolved;
-			struct av_decision decision;
+			struct av_decision decision = {};
 			int decision_rc;
 
 			source_resolved = source_line->level[
@@ -4467,8 +4515,8 @@ int cred_pathless_relation_has_perm(
 				rc = -EOPNOTSUPP;
 				break;
 			}
-			decision_rc = avc_has_perm_noaudit(
-				crsec->state, source_resolved.sid,
+			decision_rc = avc_has_perm_noaudit_snapshot(
+				crsec->state, &chain.policy[i], source_resolved.sid,
 				target_resolved.sid, tclass, requested, 0,
 				&decision);
 			levels[i].state = crsec->state;
@@ -4482,7 +4530,8 @@ int cred_pathless_relation_has_perm(
 			work->provenance[i].map_generation =
 				target_resolved.map_generation;
 			decisions[i] = decision;
-			if (decision.seqno != chain.policy[i].seqno ||
+			if (decision_rc == -ESTALE ||
+			    decision.seqno != chain.policy[i].seqno ||
 			    !selinux_policy_snapshot_valid(crsec->state,
 						   &chain.policy[i])) {
 				rc = -ESTALE;
@@ -4511,7 +4560,7 @@ int cred_pathless_relation_has_perm(
 				selinux_cred(chain.cred[i]);
 			struct selinux_pathless_resolution source_resolved;
 			struct selinux_pathless_resolution target_resolved;
-			struct av_decision decision;
+			struct av_decision decision = {};
 			int decision_rc;
 			int audit_rc;
 
@@ -4522,11 +4571,12 @@ int cred_pathless_relation_has_perm(
 			if (source_resolved.sclass != source_tclass ||
 			    target_resolved.sclass != tclass)
 				return -EOPNOTSUPP;
-			decision_rc = avc_has_perm_noaudit(
-				crsec->state, source_resolved.sid,
+			decision_rc = avc_has_perm_noaudit_snapshot(
+				crsec->state, &chain.policy[i], source_resolved.sid,
 				target_resolved.sid, tclass, requested, 0,
 				&decision);
-			if (decision.seqno != chain.policy[i].seqno ||
+			if (decision_rc == -ESTALE ||
+			    decision.seqno != chain.policy[i].seqno ||
 			    !selinux_policy_snapshot_valid(crsec->state,
 						   &chain.policy[i]))
 				return -ESTALE;
@@ -4589,13 +4639,14 @@ int cred_pathless_has_perm_noaudit(
 			struct cred_security_struct *crsec =
 				selinux_cred(chain.cred[i]);
 			struct selinux_pathless_resolution resolved;
-			struct av_decision tmp_avd;
+			struct av_decision tmp_avd = {};
 
 			resolved = line->level[crsec->state->label_domain->depth];
-			rc = avc_has_perm_noaudit(
-				crsec->state, crsec->sid, resolved.sid,
+			rc = avc_has_perm_noaudit_snapshot(
+				crsec->state, &chain.policy[i], crsec->sid, resolved.sid,
 				resolved.sclass, requested, 0, &tmp_avd);
-			if (tmp_avd.seqno != chain.policy[i].seqno ||
+			if (rc == -ESTALE ||
+			    tmp_avd.seqno != chain.policy[i].seqno ||
 			    !selinux_policy_snapshot_valid(crsec->state,
 							   &chain.policy[i])) {
 				rc = -ESTALE;

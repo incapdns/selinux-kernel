@@ -484,19 +484,27 @@ static ssize_t sel_write_enforce(struct file *file, const char __user *buf,
 				      NULL);
 		if (length)
 			goto out;
-		length = selinux_chain_update_begin(state);
+		length = selinux_chain_update_prepare(state);
 		if (length)
 			goto out;
+		length = selinux_chain_update_begin(state);
+		if (WARN_ON_ONCE(length)) {
+			selinux_chain_update_abort(state);
+			goto out;
+		}
+		enforcing_set(state, new_value);
+		selinux_chain_update_end(state);
+
+		/* Audit and cache callbacks may block; publication is stable now. */
 		audit_log(audit_context(), GFP_KERNEL, AUDIT_MAC_STATUS,
 			"enforcing=%d old_enforcing=%d auid=%u ses=%u"
 			" enabled=1 old-enabled=1 lsm=selinux res=1",
 			new_value, old_value,
 			from_kuid(&init_user_ns, audit_get_loginuid(current)),
 			audit_get_sessionid(current));
-		enforcing_set(state, new_value);
 		if (new_value)
 			avc_ss_reset(state->avc, 0);
-		selinux_chain_update_end(state);
+		selinux_chain_update_complete(state);
 		selnl_notify_setenforce(new_value);
 		selinux_status_update_setenforce(state, new_value);
 #ifndef CONFIG_SECURITY_SELINUX_NS

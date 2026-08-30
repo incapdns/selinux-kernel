@@ -195,6 +195,9 @@ u64 selinux_chain_epoch_read(const struct selinux_state *state);
 void selinux_chain_epoch_bump(struct selinux_state *state);
 int selinux_chain_update_begin(struct selinux_state *state);
 void selinux_chain_update_end(struct selinux_state *state);
+int selinux_chain_update_prepare(struct selinux_state *state);
+void selinux_chain_update_abort(struct selinux_state *state);
+void selinux_chain_update_complete(struct selinux_state *state);
 bool selinux_chain_update_active(const struct selinux_state *state);
 int selinux_policy_snapshot_read(struct selinux_state *state,
 				 struct selinux_policy_snapshot *snapshot);

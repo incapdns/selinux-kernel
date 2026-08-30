@@ -26376,6 +26376,17 @@ int selinux_chain_update_begin(struct selinux_state *state)
 	mutex_lock(&selinux_state_tree_mutex);
 	selinux_chain_update_begin_locked(state);
 	mutex_unlock(&selinux_state_tree_mutex);
+	return 0;
+}
+
+/*
+ * Blocking policy-change notifiers are a preparation barrier, not part of
+ * the publication itself.  In particular, they may sleep.  Keeping them out
+ * of the chain_updates interval is required because authorization also runs
+ * from non-sleepable contexts and therefore cannot wait for a notifier.
+ */
+int selinux_chain_update_prepare(struct selinux_state *state)
+{
 #ifdef CONFIG_SECURITY_SELINUX_NS
 	if (state->label_domain) {
 		struct lsm_policy_change change = {
@@ -26386,14 +26397,9 @@ int selinux_chain_update_begin(struct selinux_state *state)
 
 		rc = notifier_to_errno(call_blocking_lsm_notifier(
 			LSM_POLICY_CHANGE_PRE, &change));
-		if (rc) {
-			/* Roll back this update and release every partial PRE gate. */
-			mutex_lock(&selinux_state_tree_mutex);
-			selinux_chain_update_end_locked(state);
-			mutex_unlock(&selinux_state_tree_mutex);
+		if (rc)
 			call_blocking_lsm_notifier(LSM_POLICY_CHANGE_ABORT, &change);
-			return rc;
-		}
+		return rc;
 	}
 #endif
 	return 0;
@@ -26404,6 +26410,24 @@ void selinux_chain_update_end(struct selinux_state *state)
 	mutex_lock(&selinux_state_tree_mutex);
 	selinux_chain_update_end_locked(state);
 	mutex_unlock(&selinux_state_tree_mutex);
+}
+
+void selinux_chain_update_abort(struct selinux_state *state)
+{
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	if (state->label_domain) {
+		struct lsm_policy_change change = {
+			.scoped = true,
+			.scope_id = state->label_domain->id,
+		};
+
+		call_blocking_lsm_notifier(LSM_POLICY_CHANGE_ABORT, &change);
+	}
+#endif
+}
+
+void selinux_chain_update_complete(struct selinux_state *state)
+{
 #ifdef CONFIG_SECURITY_SELINUX_NS
 	if (state->label_domain) {
 		struct lsm_policy_change change = {

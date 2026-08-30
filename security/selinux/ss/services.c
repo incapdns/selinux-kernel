@@ -2457,8 +2457,7 @@ void selinux_policy_cancel(struct selinux_state *state,
 static void selinux_notify_policy_change(struct selinux_state *state,
 					u32 seqno)
 {
-	/* Flush external caches and notify userspace of policy load */
-	avc_ss_reset(state->avc, seqno);
+	/* Notify userspace and flush caches outside SELinux's AVC. */
 	selnl_notify_policyload(seqno);
 	selinux_status_update_policyload(state, seqno);
 	selinux_netlbl_cache_invalidate();
@@ -2493,10 +2492,19 @@ int selinux_policy_commit(struct selinux_state *state,
 		newpolicy->latest_granting = 1;
 	seqno = newpolicy->latest_granting;
 
-	/* Install the new policy as one fail-closed chain publication. */
-	rc = selinux_chain_update_begin(state);
+	/*
+	 * Let blocking consumers prepare while the old generation remains fully
+	 * usable.  Only the pointer/epoch transition belongs to the fail-closed
+	 * publication interval below.
+	 */
+	rc = selinux_chain_update_prepare(state);
 	if (rc)
 		return rc;
+	rc = selinux_chain_update_begin(state);
+	if (WARN_ON_ONCE(rc)) {
+		selinux_chain_update_abort(state);
+		return rc;
+	}
 	if (oldpolicy) {
 		sidtab_freeze_begin(oldpolicy->sidtab, &flags);
 		rcu_assign_pointer(state->policy, newpolicy);
@@ -2504,9 +2512,6 @@ int selinux_policy_commit(struct selinux_state *state,
 	} else {
 		rcu_assign_pointer(state->policy, newpolicy);
 	}
-
-	/* Report the capabilities from the policy object just published. */
-	security_log_policycaps(newpolicy);
 
 	if (!selinux_initialized(state)) {
 		/*
@@ -2524,6 +2529,16 @@ int selinux_policy_commit(struct selinux_state *state,
 		complete_init = selinux_state_active(state);
 	}
 	selinux_chain_update_end(state);
+
+	/*
+	 * An old-generation AVC entry is a cache miss for snapshot-aware checks,
+	 * but flush it promptly before running any potentially blocking work.
+	 */
+	avc_ss_reset(state->avc, seqno);
+	selinux_chain_update_complete(state);
+
+	/* Logging may allocate and block; it must not extend publication. */
+	security_log_policycaps(newpolicy);
 	if (complete_init)
 		selinux_complete_init();
 
@@ -3318,10 +3333,18 @@ int security_set_bools(struct selinux_state *state, u32 len,
 	newpolicy->latest_granting = oldpolicy->latest_granting + 1;
 	seqno = newpolicy->latest_granting;
 
-	/* Install the new conditional policy as one chain publication. */
-	rc = selinux_chain_update_begin(state);
+	/* Prepare blocking consumers before entering the publication interval. */
+	rc = selinux_chain_update_prepare(state);
 	if (rc) {
 		/* The duplicate borrowed the old policy's resource ownership. */
+		newpolicy->resources = NULL;
+		newpolicy->resource_bytes = 0;
+		selinux_policy_cond_free(newpolicy);
+		return rc;
+	}
+	rc = selinux_chain_update_begin(state);
+	if (WARN_ON_ONCE(rc)) {
+		selinux_chain_update_abort(state);
 		newpolicy->resources = NULL;
 		newpolicy->resource_bytes = 0;
 		selinux_policy_cond_free(newpolicy);
@@ -3330,6 +3353,8 @@ int security_set_bools(struct selinux_state *state, u32 len,
 	rcu_assign_pointer(state->policy, newpolicy);
 	selinux_policy_resource_transfer(oldpolicy, newpolicy);
 	selinux_chain_update_end(state);
+	avc_ss_reset(state->avc, seqno);
+	selinux_chain_update_complete(state);
 
 	/*
 	 * Free the conditional portions of the old policydb
