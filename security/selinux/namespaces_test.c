@@ -895,6 +895,11 @@ static void selinux_test_label_view_put(void *view)
 	selinux_label_view_kunit_put_and_wait(view);
 }
 
+static void selinux_test_label_operation_put(void *data)
+{
+	selinux_label_operation_resolution_put(data);
+}
+
 static struct selinux_label_domain *
 selinux_test_domain_alloc(struct kunit *test,
 			  struct selinux_label_domain *parent)
@@ -2643,6 +2648,184 @@ static void selinux_label_view_stale_snapshot_resolution_test(struct kunit *test
 	KUNIT_EXPECT_EQ(test, resolved, second_sid);
 }
 
+static void selinux_label_operation_sibling_snapshot_test(struct kunit *test)
+{
+	struct selinux_label_domain *root, *source_domain, *target_domain;
+	struct selinux_label_domain *missing_domain;
+	struct selinux_label_map *source_map, *first_target, *second_target;
+	struct selinux_label_ref *root_label, *source_label;
+	struct selinux_label_ref *first_label, *second_label;
+	struct selinux_state root_state, source_state, first_state, second_state;
+	const struct selinux_label_view *source_view;
+	struct selinux_label_operation_resolution *first, *second, *failed;
+	u32 root_sid, source_sid, first_sid, second_sid;
+	int refs, rc;
+
+	root = selinux_test_domain_alloc(test, NULL);
+	KUNIT_ASSERT_NOT_NULL(test, root);
+	source_domain = selinux_test_domain_alloc(test, root);
+	KUNIT_ASSERT_NOT_NULL(test, source_domain);
+	target_domain = selinux_test_domain_alloc(test, root);
+	KUNIT_ASSERT_NOT_NULL(test, target_domain);
+	missing_domain = selinux_test_domain_alloc(test, root);
+	KUNIT_ASSERT_NOT_NULL(test, missing_domain);
+	first = kunit_kzalloc(test, sizeof(*first), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, first);
+	second = kunit_kzalloc(test, sizeof(*second), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, second);
+	failed = kunit_kzalloc(test, sizeof(*failed), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, failed);
+	root_label = selinux_test_global_label(
+		test, &root_state, root, "u:object_r:kunit_op_root_t:s0",
+		&root_sid);
+	KUNIT_ASSERT_NOT_NULL(test, root_label);
+	source_label = selinux_test_global_label(
+		test, &source_state, source_domain,
+		"u:object_r:kunit_op_source_t:s0", &source_sid);
+	KUNIT_ASSERT_NOT_NULL(test, source_label);
+	first_label = selinux_test_global_label(
+		test, &first_state, target_domain,
+		"u:object_r:kunit_op_first_t:s0", &first_sid);
+	KUNIT_ASSERT_NOT_NULL(test, first_label);
+	second_label = selinux_test_global_label(
+		test, &second_state, target_domain,
+		"u:object_r:kunit_op_second_t:s0", &second_sid);
+	KUNIT_ASSERT_NOT_NULL(test, second_label);
+
+	source_map = selinux_test_label_map_alloc(test, root, source_domain);
+	KUNIT_ASSERT_NOT_NULL(test, source_map);
+	KUNIT_ASSERT_EQ(test, selinux_test_map_pair(
+		source_map, root_label, root_sid, source_label, source_sid), 0);
+	KUNIT_ASSERT_EQ(test, selinux_label_map_seal(source_map, root), 0);
+	KUNIT_ASSERT_EQ(test, selinux_test_label_domain_publish_map(
+		test, source_domain, source_map, root), 0);
+	source_view = selinux_identity_view_alloc(
+		&init_user_ns, root, source_domain);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, source_view);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(
+		test, selinux_test_label_view_put, (void *)source_view), 0);
+
+	first_target = selinux_test_label_map_alloc(test, root, target_domain);
+	KUNIT_ASSERT_NOT_NULL(test, first_target);
+	KUNIT_ASSERT_EQ(test, selinux_test_map_pair(
+		first_target, root_label, root_sid, first_label, first_sid), 0);
+	KUNIT_ASSERT_EQ(test, selinux_label_map_seal(first_target, root), 0);
+	KUNIT_ASSERT_EQ(test, selinux_test_label_domain_publish_map(
+		test, target_domain, first_target, root), 0);
+
+	rc = selinux_label_view_resolve_operation(
+		source_view, source_label, source_sid, target_domain, first);
+	KUNIT_ASSERT_EQ(test, rc, 0);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(
+		test, selinux_test_label_operation_put, first), 0);
+	KUNIT_EXPECT_EQ(test, first->labels.sid[0], root_sid);
+	KUNIT_EXPECT_EQ(test, first->labels.sid[1], first_sid);
+	KUNIT_EXPECT_PTR_EQ(test, first->source_maps[0], source_map);
+	KUNIT_EXPECT_PTR_EQ(test, first->target_maps[0], first_target);
+
+	second_target = selinux_test_label_map_alloc(test, root, target_domain);
+	KUNIT_ASSERT_NOT_NULL(test, second_target);
+	KUNIT_ASSERT_EQ(test, selinux_test_map_pair(
+		second_target, root_label, root_sid, second_label, second_sid), 0);
+	KUNIT_ASSERT_EQ(test, selinux_label_map_seal(second_target, root), 0);
+	KUNIT_ASSERT_EQ(test, selinux_test_label_domain_publish_map(
+		test, target_domain, second_target, root), 0);
+	rc = selinux_label_view_resolve_operation(
+		source_view, source_label, source_sid, target_domain, second);
+	KUNIT_ASSERT_EQ(test, rc, 0);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(
+		test, selinux_test_label_operation_put, second), 0);
+	KUNIT_EXPECT_EQ(test, first->labels.sid[1], first_sid);
+	KUNIT_EXPECT_EQ(test, second->labels.sid[1], second_sid);
+	KUNIT_EXPECT_NE(test, first->map_generation[1],
+			second->map_generation[1]);
+
+	refs = refcount_read(&source_map->refs);
+	rc = selinux_label_view_resolve_operation(
+		source_view, source_label, source_sid, missing_domain, failed);
+	KUNIT_EXPECT_EQ(test, rc, -EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, refcount_read(&source_map->refs), refs);
+	selinux_label_operation_resolution_put(failed);
+}
+
+static void selinux_label_operation_cousin_lca_test(struct kunit *test)
+{
+	struct selinux_label_domain *root, *common, *source_domain, *target_domain;
+	struct selinux_label_map *common_map, *source_map, *target_map;
+	struct selinux_label_ref *root_label, *common_label;
+	struct selinux_label_ref *source_label, *target_label;
+	struct selinux_state root_state, common_state, source_state, target_state;
+	struct selinux_label_operation_resolution *operation;
+	const struct selinux_label_view *source_view;
+	u32 root_sid, common_sid, source_sid, target_sid;
+	int rc;
+
+	root = selinux_test_domain_alloc(test, NULL);
+	KUNIT_ASSERT_NOT_NULL(test, root);
+	common = selinux_test_domain_alloc(test, root);
+	KUNIT_ASSERT_NOT_NULL(test, common);
+	source_domain = selinux_test_domain_alloc(test, common);
+	KUNIT_ASSERT_NOT_NULL(test, source_domain);
+	target_domain = selinux_test_domain_alloc(test, common);
+	KUNIT_ASSERT_NOT_NULL(test, target_domain);
+	operation = kunit_kzalloc(test, sizeof(*operation), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, operation);
+	root_label = selinux_test_global_label(
+		test, &root_state, root, "u:object_r:kunit_lca_root_t:s0",
+		&root_sid);
+	KUNIT_ASSERT_NOT_NULL(test, root_label);
+	common_label = selinux_test_global_label(
+		test, &common_state, common, "u:object_r:kunit_lca_common_t:s0",
+		&common_sid);
+	KUNIT_ASSERT_NOT_NULL(test, common_label);
+	source_label = selinux_test_global_label(
+		test, &source_state, source_domain,
+		"u:object_r:kunit_lca_source_t:s0", &source_sid);
+	KUNIT_ASSERT_NOT_NULL(test, source_label);
+	target_label = selinux_test_global_label(
+		test, &target_state, target_domain,
+		"u:object_r:kunit_lca_target_t:s0", &target_sid);
+	KUNIT_ASSERT_NOT_NULL(test, target_label);
+
+	common_map = selinux_test_label_map_alloc(test, root, common);
+	KUNIT_ASSERT_NOT_NULL(test, common_map);
+	KUNIT_ASSERT_EQ(test, selinux_test_map_pair(
+		common_map, root_label, root_sid, common_label, common_sid), 0);
+	KUNIT_ASSERT_EQ(test, selinux_label_map_seal(common_map, root), 0);
+	KUNIT_ASSERT_EQ(test, selinux_test_label_domain_publish_map(
+		test, common, common_map, root), 0);
+	source_map = selinux_test_label_map_alloc(test, common, source_domain);
+	KUNIT_ASSERT_NOT_NULL(test, source_map);
+	KUNIT_ASSERT_EQ(test, selinux_test_map_pair(
+		source_map, common_label, common_sid, source_label, source_sid), 0);
+	KUNIT_ASSERT_EQ(test, selinux_label_map_seal(source_map, common), 0);
+	KUNIT_ASSERT_EQ(test, selinux_test_label_domain_publish_map(
+		test, source_domain, source_map, common), 0);
+	target_map = selinux_test_label_map_alloc(test, common, target_domain);
+	KUNIT_ASSERT_NOT_NULL(test, target_map);
+	KUNIT_ASSERT_EQ(test, selinux_test_map_pair(
+		target_map, common_label, common_sid, target_label, target_sid), 0);
+	KUNIT_ASSERT_EQ(test, selinux_label_map_seal(target_map, common), 0);
+	KUNIT_ASSERT_EQ(test, selinux_test_label_domain_publish_map(
+		test, target_domain, target_map, common), 0);
+
+	source_view = selinux_identity_view_alloc(
+		&init_user_ns, root, source_domain);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, source_view);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(
+		test, selinux_test_label_view_put, (void *)source_view), 0);
+	rc = selinux_label_view_resolve_operation(
+		source_view, source_label, source_sid, target_domain, operation);
+	KUNIT_ASSERT_EQ(test, rc, 0);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(
+		test, selinux_test_label_operation_put, operation), 0);
+	KUNIT_EXPECT_EQ(test, operation->labels.sid[0], root_sid);
+	KUNIT_EXPECT_EQ(test, operation->labels.sid[1], common_sid);
+	KUNIT_EXPECT_EQ(test, operation->labels.sid[2], target_sid);
+	KUNIT_EXPECT_PTR_EQ(test, operation->source_maps[1], source_map);
+	KUNIT_EXPECT_PTR_EQ(test, operation->target_maps[1], target_map);
+}
+
 static void selinux_secmark_carrier_match_test(struct kunit *test)
 {
 	struct selinux_net_provenance *correct = NULL, *wrong_class = NULL;
@@ -4313,6 +4496,8 @@ static struct kunit_case selinux_namespaces_test_cases[] = {
 	KUNIT_CASE(selinux_pathless_projection_sid_lifetime_test),
 	KUNIT_CASE(selinux_label_view_chain_fail_closed_test),
 	KUNIT_CASE(selinux_label_view_stale_snapshot_resolution_test),
+	KUNIT_CASE(selinux_label_operation_sibling_snapshot_test),
+	KUNIT_CASE(selinux_label_operation_cousin_lca_test),
 	KUNIT_CASE(selinux_secmark_carrier_match_test),
 	KUNIT_CASE(selinux_secmark_carrier_sealed_view_test),
 	KUNIT_CASE(selinux_net_carrier_lifetime_test),

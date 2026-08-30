@@ -31,6 +31,16 @@ struct selinux_label_resolution {
 	u16 max_depth;
 };
 
+#ifdef CONFIG_SECURITY_SELINUX_NS
+struct selinux_label_operation_resolution {
+	struct selinux_label_resolution labels;
+	u64 map_generation[SELINUX_LABEL_RESOLUTION_MAX_DEPTH + 1];
+	/* Strong refs pin every boundary generation through authorization. */
+	struct selinux_label_map *source_maps[SELINUX_LABEL_RESOLUTION_MAX_DEPTH];
+	struct selinux_label_map *target_maps[SELINUX_LABEL_RESOLUTION_MAX_DEPTH];
+};
+#endif
+
 /*
  * A label view is immutable after publication.  Only the reference count and
  * RCU linkage are mutable lifetime metadata; identity, generation, and flags
@@ -94,6 +104,13 @@ int selinux_label_view_resolve(const struct selinux_label_view *view,
 			       const struct selinux_label_domain *policy_domain,
 			       const struct selinux_label_ref *source,
 			       u32 source_sid, u32 *resolved_sid);
+int selinux_label_view_resolve_operation(
+	const struct selinux_label_view *source_view,
+	const struct selinux_label_ref *source, u32 source_sid,
+	const struct selinux_label_domain *target_leaf,
+	struct selinux_label_operation_resolution *resolution);
+void selinux_label_operation_resolution_put(
+	struct selinux_label_operation_resolution *resolution);
 #endif
 
 #endif /* _SELINUX_LABEL_VIEW_H_ */

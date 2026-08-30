@@ -1813,6 +1813,24 @@ int security_inode_init_security_anon(struct inode *inode,
 			     context_inode);
 }
 
+/**
+ * security_inode_init_security_nsfs() - Initialize an nsfs inode
+ * @inode: the newly allocated stashed nsfs inode
+ * @ns: namespace object retained by the inode
+ *
+ * Mark an nsfs inode before it is instantiated so an LSM can retain the
+ * namespace creator's complete path-independent security provenance.  The
+ * corresponding file is finalized by the normal file path/open hooks before
+ * it is exposed to userspace.
+ *
+ * Return: 0 on success, or a negative errno on failure.
+ */
+int security_inode_init_security_nsfs(struct inode *inode,
+				      struct ns_common *ns)
+{
+	return call_int_hook(inode_init_security_nsfs, inode, ns);
+}
+
 #ifdef CONFIG_SECURITY_PATH
 /**
  * security_path_mknod() - Check if creating a special file is allowed

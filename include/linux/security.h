@@ -68,6 +68,7 @@ struct file_operations;
 struct msg_msg;
 struct xattr;
 struct kernfs_node;
+struct ns_common;
 struct xfrm_sec_ctx;
 struct mm_struct;
 struct fs_context;
@@ -537,6 +538,8 @@ int security_inode_setxattr_plan_finish(
 int security_inode_init_security_anon(struct inode *inode,
 				      const struct qstr *name,
 				      const struct inode *context_inode);
+int security_inode_init_security_nsfs(struct inode *inode,
+				      struct ns_common *ns);
 int security_inode_create_mnt(const struct vfsmount *mnt, struct inode *dir,
 			      struct dentry *dentry, umode_t mode);
 int security_inode_create(struct inode *dir, struct dentry *dentry, umode_t mode);
@@ -1237,6 +1240,12 @@ static inline int security_inode_setxattr_plan_finish(
 static inline int security_inode_init_security_anon(struct inode *inode,
 						    const struct qstr *name,
 						    const struct inode *context_inode)
+{
+	return 0;
+}
+
+static inline int security_inode_init_security_nsfs(struct inode *inode,
+						    struct ns_common *ns)
 {
 	return 0;
 }

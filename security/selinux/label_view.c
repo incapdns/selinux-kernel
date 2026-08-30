@@ -447,6 +447,178 @@ out_down:
 	return rc;
 }
 
+void selinux_label_operation_resolution_put(
+	struct selinux_label_operation_resolution *resolution)
+{
+	int i;
+
+	if (!resolution)
+		return;
+	for (i = 0; i < ARRAY_SIZE(resolution->source_maps); i++) {
+		selinux_label_map_put(resolution->source_maps[i]);
+		resolution->source_maps[i] = NULL;
+		selinux_label_map_put(resolution->target_maps[i]);
+		resolution->target_maps[i] = NULL;
+	}
+}
+
+/*
+ * Compose the immutable source view to the LCA with a strong snapshot of the
+ * target branch.  Both directional lookups are parent-sealed map entries; no
+ * SID is ever interpreted outside the domain of the label returned with it.
+ */
+int selinux_label_view_resolve_operation(
+	const struct selinux_label_view *source_view,
+	const struct selinux_label_ref *source, u32 source_sid,
+	const struct selinux_label_domain *target_leaf,
+	struct selinux_label_operation_resolution *resolution)
+{
+	const struct selinux_label_domain *target_by_depth[
+		SELINUX_LABEL_RESOLUTION_MAX_DEPTH + 1] = {};
+	const struct selinux_label_domain *lca, *cursor;
+	struct selinux_label_ref *canonical, *cursor_label, *down = NULL;
+	u32 down_sid = 0, sid;
+	int depth, rc = 0;
+
+	if (!source || !source_sid || !target_leaf || !resolution ||
+	    target_leaf->depth > SELINUX_LABEL_RESOLUTION_MAX_DEPTH)
+		return -EINVAL;
+	memset(resolution, 0, sizeof(*resolution));
+	canonical = global_sid_to_label_ref(source_sid);
+	if (IS_ERR(canonical))
+		return PTR_ERR(canonical);
+	if (canonical != source) {
+		selinux_label_ref_put(canonical);
+		return -EINVAL;
+	}
+	selinux_label_ref_put(canonical);
+	resolution->labels.max_depth = target_leaf->depth;
+	for (cursor = target_leaf; cursor; cursor = cursor->parent) {
+		target_by_depth[cursor->depth] = cursor;
+		resolution->labels.domain_id[cursor->depth] = cursor->id;
+	}
+
+	if ((source->domain->flags & SELINUX_LABEL_DOMAIN_KERNEL_GLOBAL) &&
+	    source_sid <= SECINITSID_NUM) {
+		for (depth = 0; depth <= target_leaf->depth; depth++)
+			resolution->labels.sid[depth] = source_sid;
+		return 0;
+	}
+
+	lca = source->domain;
+	while (lca && lca->depth > target_leaf->depth)
+		lca = lca->parent;
+	while (lca && target_by_depth[lca->depth] != lca)
+		lca = lca->parent;
+	if (!lca)
+		return -EXDEV;
+
+	cursor_label = selinux_label_ref_get(
+		(struct selinux_label_ref *)source);
+	sid = source_sid;
+	while (cursor_label->domain != lca) {
+		struct selinux_label_map *map;
+		struct selinux_label_ref *next = NULL;
+		u32 next_sid;
+
+		depth = cursor_label->domain->depth;
+		if (!source_view || !depth || depth > source_view->map_count ||
+		    !source_view->maps[depth - 1]) {
+			rc = -EOPNOTSUPP;
+			goto out;
+		}
+		map = selinux_label_map_get(source_view->maps[depth - 1]);
+		if (map->child_domain_id != cursor_label->domain->id) {
+			selinux_label_map_put(map);
+			rc = -ESTALE;
+			goto out;
+		}
+		resolution->source_maps[depth - 1] = map;
+		resolution->map_generation[depth] = map->generation;
+		rc = selinux_label_map_resolve(
+			map, SELINUX_LABEL_MAP_CHILD_TO_PARENT, cursor_label, sid,
+			&next_sid, &next);
+		if (rc)
+			goto out;
+		selinux_label_ref_put(cursor_label);
+		cursor_label = next;
+		sid = next_sid;
+		if (cursor_label->domain->depth <= target_leaf->depth)
+			resolution->labels.sid[cursor_label->domain->depth] = sid;
+	}
+	resolution->labels.sid[lca->depth] = sid;
+	down = selinux_label_ref_get(cursor_label);
+	down_sid = sid;
+	while (source_view && cursor_label->domain->parent) {
+		struct selinux_label_map *map;
+		struct selinux_label_ref *next = NULL;
+		u32 next_sid;
+
+		depth = cursor_label->domain->depth;
+		if (depth > source_view->map_count ||
+		    !source_view->maps[depth - 1]) {
+			rc = -EOPNOTSUPP;
+			goto out;
+		}
+		map = selinux_label_map_get(source_view->maps[depth - 1]);
+		if (map->child_domain_id != cursor_label->domain->id) {
+			selinux_label_map_put(map);
+			rc = -ESTALE;
+			goto out;
+		}
+		resolution->source_maps[depth - 1] = map;
+		resolution->map_generation[depth] = map->generation;
+		rc = selinux_label_map_resolve(
+			map, SELINUX_LABEL_MAP_CHILD_TO_PARENT, cursor_label, sid,
+			&next_sid, &next);
+		if (rc)
+			goto out;
+		selinux_label_ref_put(cursor_label);
+		cursor_label = next;
+		sid = next_sid;
+		resolution->labels.sid[cursor_label->domain->depth] = sid;
+	}
+	selinux_label_ref_put(cursor_label);
+	cursor_label = down;
+	down = NULL;
+	sid = down_sid;
+
+	for (depth = lca->depth + 1; depth <= target_leaf->depth; depth++) {
+		struct selinux_label_map *map;
+		struct selinux_label_ref *next = NULL;
+		u32 next_sid;
+
+		map = selinux_label_domain_get_map(target_by_depth[depth]);
+		if (!map) {
+			rc = -EOPNOTSUPP;
+			goto out;
+		}
+		if (map->child_domain_id != target_by_depth[depth]->id ||
+		    map->parent != target_by_depth[depth - 1]) {
+			selinux_label_map_put(map);
+			rc = -ESTALE;
+			goto out;
+		}
+		resolution->target_maps[depth - 1] = map;
+		resolution->map_generation[depth] = map->generation;
+		rc = selinux_label_map_resolve(
+			map, SELINUX_LABEL_MAP_PARENT_TO_CHILD, cursor_label, sid,
+			&next_sid, &next);
+		if (rc)
+			goto out;
+		selinux_label_ref_put(cursor_label);
+		cursor_label = next;
+		sid = next_sid;
+		resolution->labels.sid[depth] = sid;
+	}
+out:
+	selinux_label_ref_put(cursor_label);
+	selinux_label_ref_put(down);
+	if (rc)
+		selinux_label_operation_resolution_put(resolution);
+	return rc;
+}
+
 int selinux_label_view_resolve(const struct selinux_label_view *view,
 			       const struct selinux_label_domain *policy_domain,
 			       const struct selinux_label_ref *source,

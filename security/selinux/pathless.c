@@ -363,8 +363,26 @@ selinux_pathless_projection_alloc_sealed(
 		projection->seals[i].sid = expects[i].sid;
 		projection->seals[i].sclass = expects[i].sclass;
 		projection->seals[i].model = expects[i].model;
+		if (expects[i].model == SELINUX_PATHLESS_MODEL_LEGACY &&
+		    !projection->legacy_sclass)
+			projection->legacy_sclass = expects[i].sclass;
 		projection->seal_count++;
 	}
+	/*
+	 * Preserve the exact class/model associated with the canonical label.
+	 * This is required when a later operation asks a descendant policy to
+	 * derive a new immutable seal; kind alone cannot distinguish IPC classes.
+	 */
+	i = kernel_global ? view->origin_domain->depth : label->domain->depth;
+	if (i >= projection->seal_count) {
+		rc = -EINVAL;
+		goto out_projection;
+	}
+	projection->canonical_depth = i;
+	projection->canonical_sclass = projection->seals[i].sclass;
+	projection->canonical_model = projection->seals[i].model;
+	if (!projection->legacy_sclass && kind == SELINUX_PATHLESS_KIND_MEMFD)
+		projection->legacy_sclass = SECCLASS_FILE;
 	return projection;
 
 out_projection:
@@ -379,6 +397,170 @@ selinux_pathless_projection_get(struct selinux_pathless_projection *projection)
 	if (projection)
 		refcount_inc(&projection->refs);
 	return projection;
+}
+
+int selinux_pathless_policy_expect(
+	const struct selinux_pathless_projection *projection,
+	const struct selinux_policy_snapshot *snapshot,
+	const struct selinux_label_domain *domain, u32 mapped_sid,
+	struct selinux_pathless_expect *expect)
+{
+	const struct selinux_pathless_seal *seal;
+
+	if (!projection || !snapshot || !domain || !mapped_sid || !expect)
+		return -EINVAL;
+	memset(expect, 0, sizeof(*expect));
+	expect->domain = domain;
+	expect->sid = mapped_sid;
+	if (domain->depth < projection->seal_count &&
+	    projection->seals[domain->depth].domain_id == domain->id) {
+		seal = &projection->seals[domain->depth];
+		if (seal->sid != mapped_sid ||
+		    global_sid_handle_sid(seal->sid_handle) != seal->sid)
+			return -ESTALE;
+		expect->sclass = seal->sclass;
+		expect->model = seal->model;
+		return 0;
+	}
+
+	/*
+	 * Kind never substitutes for policy metadata: the canonical tuple was
+	 * captured explicitly at construction.  memfd_class is the sole policy
+	 * capability which changes the tuple for these object families.
+	 */
+	if (!projection->canonical_sclass ||
+	    !selinux_pathless_model_valid(projection->canonical_model))
+		return -EOPNOTSUPP;
+	if (projection->kind == SELINUX_PATHLESS_KIND_MEMFD &&
+	    !selinux_policycap_memfd_class(snapshot)) {
+		if (!projection->legacy_sclass)
+			return -EOPNOTSUPP;
+		expect->sclass = projection->legacy_sclass;
+		expect->model = SELINUX_PATHLESS_MODEL_LEGACY;
+	} else {
+		/*
+		 * A legacy-only origin does not describe the modern transition or
+		 * context-copy tuple.  A heterogeneous descendant must fail closed
+		 * until that metadata is explicitly present.
+		 */
+		if (projection->kind == SELINUX_PATHLESS_KIND_MEMFD &&
+		    projection->canonical_model == SELINUX_PATHLESS_MODEL_LEGACY)
+			return -EOPNOTSUPP;
+		expect->sclass = projection->canonical_sclass;
+		expect->model = projection->canonical_model;
+	}
+	return 0;
+}
+
+/*
+ * Resolve a published identity into an operation-local policy line.  The
+ * projection remains immutable.  No view/projection/resource is allocated:
+ * source-to-LCA uses the source branch's sealed reverse maps and LCA-to-leaf
+ * uses the observer branch's sealed forward maps.  This makes sibling and
+ * cousin transfer linear in total ancestry depth without quota churn.
+ */
+int selinux_pathless_projection_resolve_cred_chain(
+	const struct selinux_pathless_projection *projection,
+	const struct cred *const *cred,
+	const struct selinux_policy_snapshot *snapshots, u16 count,
+	struct selinux_pathless_chain_resolution *resolved)
+{
+	const struct selinux_label_domain *leaf_domain;
+	u16 i;
+	int rc;
+
+	if (!projection || !cred || !snapshots || !resolved || !count ||
+	    count > SELINUX_LABEL_RESOLUTION_MAX_DEPTH + 1)
+		return -EINVAL;
+	leaf_domain = selinux_cred(cred[0])->state->label_domain;
+	if (!leaf_domain || leaf_domain->depth + 1 != count)
+		return -EXDEV;
+	memset(resolved, 0, sizeof(*resolved));
+	for (i = 0; i < count; i++) {
+		const struct cred_security_struct *crsec = selinux_cred(cred[i]);
+		const struct cred_security_struct *parent =
+			i + 1 < count ? selinux_cred(cred[i + 1]) : NULL;
+
+		if (!crsec->state || !crsec->state->label_domain ||
+		    crsec->state->label_domain->depth != count - i - 1 ||
+		    (parent && (crsec->parent_cred != cred[i + 1] ||
+				crsec->state->parent != parent->state ||
+				crsec->state->label_domain->parent !=
+					parent->state->label_domain)) ||
+		    (!parent && (crsec->parent_cred || crsec->state->parent ||
+				 crsec->state->label_domain->parent)))
+			return -EXDEV;
+	}
+	/* Common case: the published seals already are this exact actor chain. */
+	for (i = 0; i < count; i++) {
+		const struct selinux_label_domain *domain =
+			selinux_cred(cred[i])->state->label_domain;
+		struct selinux_pathless_resolution exact;
+
+		rc = selinux_pathless_projection_resolve_sealed(
+			projection, domain, &exact);
+		if (rc)
+			break;
+		if (domain->depth && domain->depth <= projection->view->map_count &&
+		    projection->view->maps[domain->depth - 1])
+			exact.map_generation =
+				projection->view->maps[domain->depth - 1]->generation;
+		resolved->level[domain->depth] = exact;
+	}
+	if (i == count) {
+		resolved->count = count;
+		return 0;
+	}
+	memset(resolved, 0, sizeof(*resolved));
+	rc = selinux_label_view_resolve_operation(
+		projection->view, projection->label, projection->sid, leaf_domain,
+		&resolved->labels);
+	if (rc)
+		return rc;
+	for (i = 0; i < count; i++) {
+		const struct selinux_label_domain *domain =
+			selinux_cred(cred[i])->state->label_domain;
+		struct selinux_pathless_expect expect;
+		u16 depth = domain->depth;
+		u32 sid = resolved->labels.labels.sid[depth];
+
+		if (depth >= count ||
+		    resolved->labels.labels.domain_id[depth] != domain->id ||
+		    (depth && domain->parent->id !=
+			     resolved->labels.labels.domain_id[depth - 1])) {
+			rc = -EXDEV;
+			goto out;
+		}
+		if (!sid) {
+			rc = -EOPNOTSUPP;
+			goto out;
+		}
+		rc = selinux_pathless_policy_expect(
+			projection, &snapshots[i], domain, sid,
+			&expect);
+		if (rc)
+			goto out;
+		resolved->level[depth].sid = sid;
+		resolved->level[depth].sclass = expect.sclass;
+		resolved->level[depth].model = expect.model;
+		resolved->level[depth].map_generation =
+			resolved->labels.map_generation[depth];
+	}
+	resolved->count = count;
+	rc = 0;
+out:
+	if (rc)
+		selinux_label_operation_resolution_put(&resolved->labels);
+	return rc;
+}
+
+void selinux_pathless_chain_resolution_put(
+	struct selinux_pathless_chain_resolution *resolved)
+{
+	if (!resolved)
+		return;
+	selinux_label_operation_resolution_put(&resolved->labels);
+	resolved->count = 0;
 }
 
 static void selinux_pathless_projection_free(struct rcu_head *rcu)

@@ -28,6 +28,7 @@ struct file *open_namespace_file(struct ns_common *ns);
 
 #if IS_ENABLED(CONFIG_KUNIT)
 bool nsfs_kunit_handle_fields_valid(u64 ns_id, u32 ns_inum, u32 ns_type);
+void nsfs_kunit_fail_security_init_once(struct ns_common *ns, int error);
 #endif
 
 #define __current_namespace_from_type(__ns)				\

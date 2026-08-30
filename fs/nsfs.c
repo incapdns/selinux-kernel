@@ -27,6 +27,32 @@ static struct vfsmount *nsfs_mnt;
 
 static struct path nsfs_root_path = {};
 
+#if IS_ENABLED(CONFIG_KUNIT)
+static DEFINE_SPINLOCK(nsfs_kunit_security_init_lock);
+static struct ns_common *nsfs_kunit_security_init_ns;
+static int nsfs_kunit_security_init_error;
+
+void nsfs_kunit_fail_security_init_once(struct ns_common *ns, int error)
+{
+	guard(spinlock)(&nsfs_kunit_security_init_lock);
+	nsfs_kunit_security_init_ns = ns;
+	nsfs_kunit_security_init_error = error;
+}
+
+static int nsfs_kunit_security_failure(struct ns_common *ns)
+{
+	int error = 0;
+
+	guard(spinlock)(&nsfs_kunit_security_init_lock);
+	if (nsfs_kunit_security_init_ns == ns) {
+		error = nsfs_kunit_security_init_error;
+		nsfs_kunit_security_init_ns = NULL;
+		nsfs_kunit_security_init_error = 0;
+	}
+	return error;
+}
+#endif
+
 void nsfs_get_root(struct path *path)
 {
 	*path = nsfs_root_path;
@@ -421,11 +447,23 @@ static const struct super_operations nsfs_ops = {
 static int nsfs_init_inode(struct inode *inode, void *data)
 {
 	struct ns_common *ns = data;
+	int ret;
 
 	inode->i_private = data;
 	inode->i_mode |= S_IRUGO;
 	inode->i_fop = &ns_file_operations;
 	inode->i_ino = ns->inum;
+
+	/* nsfs_evict() unconditionally drops this active reference. */
+	__ns_ref_active_get(ns);
+#if IS_ENABLED(CONFIG_KUNIT)
+	ret = nsfs_kunit_security_failure(ns);
+	if (!ret)
+#endif
+		ret = security_inode_init_security_nsfs(inode, ns);
+	if (ret)
+		/* prepare_anon_dentry() iputs and balances through nsfs_evict(). */
+		return ret;
 
 	/*
 	 * Bring the namespace subtree back to life if we have to. This
@@ -435,7 +473,6 @@ static int nsfs_init_inode(struct inode *inode, void *data)
 	 * ioctl on such a socket will resurrect the relevant namespace
 	 * subtree.
 	 */
-	__ns_ref_active_get(ns);
 	return 0;
 }
 

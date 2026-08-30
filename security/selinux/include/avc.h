@@ -159,6 +159,8 @@ struct selinux_label_view;
 struct selinux_avc_provenance {
 	const struct selinux_label_ref *label;
 	const struct selinux_label_view *view;
+	/* Target-branch boundary used by composed operation-local resolution. */
+	u64 map_generation;
 	u8 source;
 };
 

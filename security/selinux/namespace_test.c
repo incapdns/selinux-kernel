@@ -8,12 +8,15 @@
 #include <linux/kconfig.h>
 #include <linux/nsfs.h>
 #include <linux/proc_ns.h>
+#include <linux/user_namespace.h>
 
 #include "global_sidtab.h"
 #include "label.h"
 #include "label_map.h"
 #include "label_view.h"
 #include "namespace.h"
+#include "objsec.h"
+#include "pathless.h"
 #include "resource.h"
 #include "security.h"
 #include "ss/services.h"
@@ -384,6 +387,87 @@ static void selinux_ns_control_from_file_ref_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, refcount_read(&control->state->count), state_refs);
 }
 
+static void selinux_ns_control_nsfs_security_unwind_test(struct kunit *test)
+{
+	struct selinux_ns_control *control, *other;
+	struct file *nsfile;
+	int ns_refs, state_refs;
+
+	control = selinux_test_ns_control_alloc(test);
+	KUNIT_ASSERT_NOT_NULL(test, control);
+	ns_refs = __ns_ref_read(&control->ns);
+	state_refs = refcount_read(&control->state->count);
+
+	/* A different nsfs materialization must not consume this scoped fault. */
+	other = selinux_test_ns_control_alloc(test);
+	KUNIT_ASSERT_NOT_NULL(test, other);
+	nsfs_kunit_fail_security_init_once(&control->ns, -ENOMEM);
+	selinux_ns_control_get(other);
+	nsfile = open_namespace_file(&other->ns);
+	if (IS_ERR(nsfile)) {
+		nsfs_kunit_fail_security_init_once(NULL, 0);
+		KUNIT_FAIL(test, "unrelated nsfs open failed: %ld",
+			   PTR_ERR(nsfile));
+		return;
+	}
+	fput(nsfile);
+
+	/* open_namespace_file() consumes the complete reference on failure too. */
+	selinux_ns_control_get(control);
+	nsfile = open_namespace_file(&control->ns);
+	if (!IS_ERR(nsfile)) {
+		fput(nsfile);
+		KUNIT_FAIL(test, "targeted nsfs open unexpectedly succeeded");
+		return;
+	}
+	KUNIT_EXPECT_EQ(test, PTR_ERR(nsfile), -ENOMEM);
+	KUNIT_EXPECT_EQ(test, __ns_ref_read(&control->ns), ns_refs);
+	KUNIT_EXPECT_EQ(test, refcount_read(&control->state->count), state_refs);
+}
+
+static void selinux_ns_generic_nsfs_projection_test(struct kunit *test)
+{
+	struct selinux_pathless_projection *projection, *reopened_projection;
+	struct cred *cred;
+	struct user_namespace *user_ns;
+	struct file *nsfile, *reopened;
+	int rc;
+
+	/* A new userns is controlled here and has no previously stashed dentry. */
+	cred = prepare_creds();
+	KUNIT_ASSERT_NOT_NULL(test, cred);
+	rc = kunit_add_action_or_reset(test, selinux_test_abort_creds, cred);
+	KUNIT_ASSERT_EQ(test, rc, 0);
+	rc = create_user_ns(cred);
+	KUNIT_ASSERT_EQ(test, rc, 0);
+	/* userns_operations is intentionally unrelated to selinuxns_operations. */
+	user_ns = get_user_ns(cred->user_ns);
+	nsfile = open_namespace_file(&user_ns->ns);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(nsfile));
+	rc = kunit_add_action_or_reset(test, selinux_test_fput, nsfile);
+	KUNIT_ASSERT_EQ(test, rc, 0);
+	projection = selinux_file(nsfile)->pathless;
+	KUNIT_ASSERT_NOT_NULL(test, projection);
+	KUNIT_EXPECT_EQ(test, projection->kind,
+			SELINUX_PATHLESS_KIND_NSFS);
+	KUNIT_EXPECT_EQ(test, projection->source,
+			SELINUX_LABEL_SOURCE_KERNEL_INITIAL);
+	KUNIT_EXPECT_EQ(test, projection->seal_count, (u16)1);
+	KUNIT_EXPECT_PTR_EQ(test, projection->view,
+			 selinux_file(nsfile)->view);
+
+	/* Reopening the stashed dentry must not rematerialize its nsfs inode. */
+	user_ns = get_user_ns(cred->user_ns);
+	reopened = open_namespace_file(&user_ns->ns);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(reopened));
+	rc = kunit_add_action_or_reset(test, selinux_test_fput, reopened);
+	KUNIT_ASSERT_EQ(test, rc, 0);
+	reopened_projection = selinux_file(reopened)->pathless;
+	KUNIT_ASSERT_NOT_NULL(test, reopened_projection);
+	KUNIT_EXPECT_PTR_EQ(test, file_inode(reopened), file_inode(nsfile));
+	KUNIT_EXPECT_PTR_EQ(test, reopened_projection, projection);
+}
+
 static void selinux_ns_restore_mismatch_is_not_published_test(struct kunit *test)
 {
 	struct selinux_ns_control *control;
@@ -724,6 +808,8 @@ static struct kunit_case selinux_namespace_control_test_cases[] = {
 	KUNIT_CASE(selinux_ns_direct_child_dormant_rejected_test),
 	KUNIT_CASE(selinux_ns_direct_child_relationship_test),
 	KUNIT_CASE(selinux_ns_control_from_file_ref_test),
+	KUNIT_CASE(selinux_ns_control_nsfs_security_unwind_test),
+	KUNIT_CASE(selinux_ns_generic_nsfs_projection_test),
 	KUNIT_CASE(selinux_ns_restore_mismatch_is_not_published_test),
 	KUNIT_CASE(selinux_policy_effective_digest_generation_test),
 	KUNIT_CASE(selinux_policy_snapshot_digest_generation_test),

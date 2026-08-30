@@ -15,6 +15,8 @@ struct selinux_label_domain;
 struct selinux_label_view;
 struct selinux_global_sid_handle;
 struct selinux_resource_account;
+struct selinux_policy_snapshot;
+struct cred;
 
 /* The object family whose path-independent label is being projected. */
 enum selinux_pathless_kind {
@@ -27,6 +29,7 @@ enum selinux_pathless_kind {
 	SELINUX_PATHLESS_KIND_IPC,
 	SELINUX_PATHLESS_KIND_MSG,
 	SELINUX_PATHLESS_KIND_INFINIBAND,
+	SELINUX_PATHLESS_KIND_NSFS,
 	SELINUX_PATHLESS_KIND_MAX,
 };
 
@@ -55,9 +58,17 @@ struct selinux_pathless_expect {
 };
 
 struct selinux_pathless_resolution {
+	u64 map_generation;
 	u32 sid;
 	u16 sclass;
 	u8 model;
+};
+
+struct selinux_pathless_chain_resolution {
+	struct selinux_label_operation_resolution labels;
+	struct selinux_pathless_resolution level[
+		SELINUX_LABEL_RESOLUTION_MAX_DEPTH + 1];
+	u16 count;
 };
 
 /*
@@ -74,8 +85,13 @@ struct selinux_pathless_projection {
 	struct selinux_resource_account *resources;
 	size_t charged_bytes;
 	u32 sid;
+	/* Explicit policy-local tuple at the canonical label's origin depth. */
+	u16 canonical_sclass;
+	u16 legacy_sclass;
 	u8 kind;
 	u8 source;
+	u8 canonical_model;
+	u8 canonical_depth;
 	u16 seal_count;
 	struct rcu_head rcu;
 #ifdef CONFIG_SECURITY_SELINUX_KUNIT_TEST
@@ -100,6 +116,18 @@ selinux_pathless_projection_alloc_sealed(
 	gfp_t gfp);
 struct selinux_pathless_projection *
 selinux_pathless_projection_get(struct selinux_pathless_projection *projection);
+int selinux_pathless_policy_expect(
+	const struct selinux_pathless_projection *projection,
+	const struct selinux_policy_snapshot *snapshot,
+	const struct selinux_label_domain *domain, u32 mapped_sid,
+	struct selinux_pathless_expect *expect);
+int selinux_pathless_projection_resolve_cred_chain(
+	const struct selinux_pathless_projection *projection,
+	const struct cred *const *cred,
+	const struct selinux_policy_snapshot *snapshots, u16 count,
+	struct selinux_pathless_chain_resolution *resolved);
+void selinux_pathless_chain_resolution_put(
+	struct selinux_pathless_chain_resolution *resolved);
 void
 selinux_pathless_projection_put(struct selinux_pathless_projection *projection);
 enum selinux_pathless_kunit_fault {

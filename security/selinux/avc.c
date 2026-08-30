@@ -1869,6 +1869,10 @@ static void selinux_avc_audit_level_identity(
 	audit_level->source = provenance->source;
 	audit_level->view_id = provenance->view->id;
 	audit_level->view_generation = provenance->view->generation;
+	if (provenance->map_generation) {
+		audit_level->map_generation = provenance->map_generation;
+		return;
+	}
 	depth = state->label_domain->depth;
 	if (depth && depth <= provenance->view->map_count &&
 	    provenance->view->maps[depth - 1])
@@ -3883,15 +3887,63 @@ struct selinux_avc_chain_snapshot {
 	u16 count;
 };
 
+DEFINE_FREE(selinux_pathless_chain_resolution_put,
+	struct selinux_pathless_chain_resolution,
+	selinux_pathless_chain_resolution_put(&_T))
+
+static void selinux_pathless_chain_resolution_ptr_free(
+	struct selinux_pathless_chain_resolution *resolution)
+{
+	if (!resolution)
+		return;
+	selinux_pathless_chain_resolution_put(resolution);
+	kfree(resolution);
+}
+
+DEFINE_FREE(selinux_pathless_chain_resolution_ptr_put,
+	struct selinux_pathless_chain_resolution *,
+	if (_T)
+		selinux_pathless_chain_resolution_ptr_free(_T))
+
+static void selinux_label_operation_resolution_ptr_free(
+	struct selinux_label_operation_resolution *resolution)
+{
+	if (!resolution)
+		return;
+	selinux_label_operation_resolution_put(resolution);
+	kfree(resolution);
+}
+
+DEFINE_FREE(selinux_label_operation_resolution_ptr_put,
+	struct selinux_label_operation_resolution *,
+	if (_T)
+		selinux_label_operation_resolution_ptr_free(_T))
+
 static bool selinux_avc_chain_snapshot_valid(
 	const struct selinux_avc_chain_snapshot *chain)
 {
 	u16 i;
 
+	if (!chain || !chain->count)
+		return false;
 	for (i = 0; i < chain->count; i++) {
-		struct selinux_state *state = selinux_cred(chain->cred[i])->state;
+		const struct cred_security_struct *crsec =
+			selinux_cred(chain->cred[i]);
+		const struct cred_security_struct *parent =
+			i + 1 < chain->count ?
+				selinux_cred(chain->cred[i + 1]) : NULL;
+		struct selinux_state *state = crsec->state;
 
-		if (!selinux_policy_snapshot_valid(state, &chain->policy[i]))
+		if (!state || !state->label_domain ||
+		    state->depth != state->label_domain->depth ||
+		    state->depth != chain->count - i - 1 ||
+		    (parent && (crsec->parent_cred != chain->cred[i + 1] ||
+				state->parent != parent->state ||
+				state->label_domain->parent !=
+					parent->state->label_domain)) ||
+		    (!parent && (crsec->parent_cred || state->parent ||
+				 state->label_domain->parent)) ||
+		    !selinux_policy_snapshot_valid(state, &chain->policy[i]))
 			return false;
 	}
 	return true;
@@ -3910,6 +3962,8 @@ static int selinux_avc_chain_snapshot_read(
 
 		if (count >= ARRAY_SIZE(chain->cred))
 			return -E2BIG;
+		if (!crsec->state || !crsec->state->label_domain)
+			return -EXDEV;
 		chain->cred[count] = cred;
 		rc = selinux_policy_snapshot_read(crsec->state,
 						  &chain->policy[count]);
@@ -3927,47 +3981,81 @@ int cred_label_has_perm(const struct cred *cred, u32 tsid,
 			const struct selinux_label_view *view, u16 tclass,
 			u32 requested, struct common_audit_data *ad)
 {
+	struct selinux_avc_transaction_workspace *workspace;
+	struct selinux_avc_chain_snapshot chain;
 	struct selinux_avc_audit_work *work __free(kfree) = NULL;
-	struct selinux_label_resolution resolution;
-	u16 count = 0;
-	int rc;
+	unsigned int retry;
+	int rc = -ESTALE;
 
 	if (!label || !view)
 		return -EOPNOTSUPP;
-	rc = selinux_label_view_resolve_chain(view, label, tsid, &resolution);
-	if (rc)
-		return rc;
 	work = kzalloc_obj(*work, GFP_ATOMIC | __GFP_NOWARN);
 	if (!work)
 		return -ENOMEM;
-	while (cred) {
-		const struct cred_security_struct *crsec = selinux_cred(cred);
-		struct selinux_state *state = crsec->state;
-		struct selinux_avc_level *level;
-		u16 depth;
+	workspace = selinux_avc_transaction_workspace_alloc(
+		SELINUX_LABEL_RESOLUTION_MAX_DEPTH + 1,
+		GFP_ATOMIC | __GFP_NOWARN);
+	if (!workspace)
+		return -ENOMEM;
+	chain.policy = work->snapshots;
+	for (retry = 0; retry < SELINUX_AVC_CHAIN_RETRIES; retry++) {
+		struct selinux_label_operation_resolution *operation
+			__free(selinux_label_operation_resolution_ptr_put) =
+			kzalloc_obj(*operation, GFP_ATOMIC | __GFP_NOWARN);
+		u16 i;
 
-		if (!state || !state->label_domain)
-			return -EOPNOTSUPP;
-		if (count >= SELINUX_LABEL_RESOLUTION_MAX_DEPTH + 1)
-			return -E2BIG;
-		depth = state->label_domain->depth;
-		if (depth > resolution.max_depth ||
-		    resolution.domain_id[depth] != state->label_domain->id ||
-		    !resolution.sid[depth])
-			return -EOPNOTSUPP;
-		level = &work->levels[count];
-		level->state = state;
-		level->ssid = crsec->sid;
-		level->tsid = resolution.sid[depth];
-		level->tclass = tclass;
-		level->requested = requested;
-		selinux_avc_level_set_provenance(
-			level, &work->provenance[count], label, view,
-			SELINUX_LABEL_SOURCE_UNSPECIFIED);
-		count++;
-		cred = crsec->parent_cred;
+		if (!operation) {
+			rc = -ENOMEM;
+			break;
+		}
+		rc = selinux_avc_chain_snapshot_read(cred, &chain);
+		if (rc == -EAGAIN || rc == -ESTALE)
+			continue;
+		if (rc)
+			break;
+		rc = selinux_label_view_resolve_operation(
+			view, label, tsid,
+			selinux_cred(chain.cred[0])->state->label_domain, operation);
+		if (rc)
+			break;
+		for (i = 0; i < chain.count; i++) {
+			const struct cred_security_struct *crsec =
+				selinux_cred(chain.cred[i]);
+			u16 depth = crsec->state->label_domain->depth;
+
+			if (operation->labels.domain_id[depth] !=
+				    crsec->state->label_domain->id ||
+			    !operation->labels.sid[depth]) {
+				rc = -EOPNOTSUPP;
+				break;
+			}
+			work->provenance[i] = (struct selinux_avc_provenance) {
+				.label = label,
+				.view = view,
+				.map_generation = operation->map_generation[depth],
+				.source = SELINUX_LABEL_SOURCE_UNSPECIFIED,
+			};
+			work->levels[i] = (struct selinux_avc_level) {
+				.state = crsec->state,
+				.ssid = crsec->sid,
+				.tsid = operation->labels.sid[depth],
+				.tclass = tclass,
+				.requested = requested,
+				.provenance = &work->provenance[i],
+			};
+		}
+		if (rc)
+			break;
+		rc = selinux_avc_transaction_has_perm_workspace(
+			work->levels, chain.policy, chain.count, ad, workspace);
+		if (rc == -ESTALE || !selinux_avc_chain_snapshot_valid(&chain)) {
+			rc = -ESTALE;
+			continue;
+		}
+		break;
 	}
-	return selinux_avc_levels_has_perm(work->levels, count, ad);
+	selinux_avc_transaction_workspace_free(workspace);
+	return rc;
 }
 
 int cred_label_has_perm_noaudit(const struct cred *cred, u32 tsid,
@@ -3977,18 +4065,12 @@ int cred_label_has_perm_noaudit(const struct cred *cred, u32 tsid,
 {
 	struct selinux_avc_chain_snapshot chain;
 	struct selinux_policy_snapshot *snapshots __free(kfree) = NULL;
-	struct selinux_label_resolution resolution;
 	unsigned int retry;
 	int rc = -ESTALE;
 
 	if (!label || !view) {
 		av_decision_fail_closed(avd);
 		return -EOPNOTSUPP;
-	}
-	rc = selinux_label_view_resolve_chain(view, label, tsid, &resolution);
-	if (rc) {
-		av_decision_fail_closed(avd);
-		return rc;
 	}
 	snapshots = kcalloc(SELINUX_LABEL_RESOLUTION_MAX_DEPTH + 1,
 			    sizeof(*snapshots), GFP_ATOMIC | __GFP_NOWARN);
@@ -3999,12 +4081,24 @@ int cred_label_has_perm_noaudit(const struct cred *cred, u32 tsid,
 	chain.policy = snapshots;
 
 	for (retry = 0; retry < SELINUX_AVC_CHAIN_RETRIES; retry++) {
+		struct selinux_label_operation_resolution *operation
+			__free(selinux_label_operation_resolution_ptr_put) =
+			kzalloc_obj(*operation, GFP_ATOMIC | __GFP_NOWARN);
 		bool first = true;
 		u16 i;
 
+		if (!operation) {
+			rc = -ENOMEM;
+			break;
+		}
 		rc = selinux_avc_chain_snapshot_read(cred, &chain);
 		if (rc == -EAGAIN || rc == -ESTALE)
 			continue;
+		if (rc)
+			break;
+		rc = selinux_label_view_resolve_operation(
+			view, label, tsid,
+			selinux_cred(chain.cred[0])->state->label_domain, operation);
 		if (rc)
 			break;
 		for (i = 0; i < chain.count; i++) {
@@ -4014,15 +4108,15 @@ int cred_label_has_perm_noaudit(const struct cred *cred, u32 tsid,
 			struct av_decision tmp_avd;
 			u16 depth = state->label_domain->depth;
 
-			if (depth > resolution.max_depth ||
-			    resolution.domain_id[depth] !=
+			if (depth > operation->labels.max_depth ||
+			    operation->labels.domain_id[depth] !=
 				    state->label_domain->id ||
-			    !resolution.sid[depth]) {
+			    !operation->labels.sid[depth]) {
 				rc = -EOPNOTSUPP;
 				break;
 			}
 			rc = avc_has_perm_noaudit(
-				state, crsec->sid, resolution.sid[depth], tclass,
+				state, crsec->sid, operation->labels.sid[depth], tclass,
 				requested, 0, &tmp_avd);
 			if (tmp_avd.seqno != chain.policy[i].seqno ||
 			    !selinux_policy_snapshot_valid(state,
@@ -4062,31 +4156,37 @@ int cred_label_has_extended_perms(const struct cred *cred, u32 tsid,
 				  struct common_audit_data *ad)
 {
 	struct selinux_avc_chain_snapshot chain;
-	struct selinux_label_resolution resolution;
 	struct selinux_avc_audit_work *work __free(kfree) = NULL;
 	unsigned int retry;
 	int rc = -ESTALE;
 
 	if (!label || !view)
 		return -EOPNOTSUPP;
-	rc = selinux_label_view_resolve_chain(view, label, tsid, &resolution);
-	if (rc)
-		return rc;
 	work = kzalloc(sizeof(*work), GFP_ATOMIC | __GFP_NOWARN);
 	if (!work)
 		return -ENOMEM;
 	chain.policy = work->snapshots;
 
 	for (retry = 0; retry < SELINUX_AVC_CHAIN_RETRIES; retry++) {
+		struct selinux_label_operation_resolution *operation
+			__free(selinux_label_operation_resolution_ptr_put) =
+			kzalloc_obj(*operation, GFP_ATOMIC | __GFP_NOWARN);
 		struct selinux_avc_level *levels = work->levels;
 		struct av_decision *decisions = work->decisions;
 		struct avc_xperms_audit_decision *xdecisions = work->xdecisions;
 		int first_rc = 0;
 		u16 i;
 
+		if (!operation)
+			return -ENOMEM;
 		rc = selinux_avc_chain_snapshot_read(cred, &chain);
 		if (rc == -EAGAIN || rc == -ESTALE)
 			continue;
+		if (rc)
+			return rc;
+		rc = selinux_label_view_resolve_operation(
+			view, label, tsid,
+			selinux_cred(chain.cred[0])->state->label_domain, operation);
 		if (rc)
 			return rc;
 		for (i = 0; i < chain.count; i++) {
@@ -4095,25 +4195,27 @@ int cred_label_has_extended_perms(const struct cred *cred, u32 tsid,
 			struct selinux_state *state = crsec->state;
 			u16 depth = state->label_domain->depth;
 
-			if (depth > resolution.max_depth ||
-			    resolution.domain_id[depth] !=
+			if (depth > operation->labels.max_depth ||
+			    operation->labels.domain_id[depth] !=
 				    state->label_domain->id ||
-			    !resolution.sid[depth]) {
+			    !operation->labels.sid[depth]) {
 				rc = -EOPNOTSUPP;
 				break;
 			}
 			rc = avc_has_extended_perms_noaudit_internal(
 				state, &chain.policy[i], crsec->sid,
-				resolution.sid[depth], tclass, requested, driver,
+				operation->labels.sid[depth], tclass, requested, driver,
 				base_perm, xperm, &xdecisions[i]);
 			levels[i].state = state;
 			levels[i].ssid = crsec->sid;
-			levels[i].tsid = resolution.sid[depth];
+			levels[i].tsid = operation->labels.sid[depth];
 			levels[i].tclass = tclass;
 			levels[i].requested = requested;
 			selinux_avc_level_set_provenance(&levels[i],
 						       &work->provenance[i], label, view,
 						       SELINUX_LABEL_SOURCE_UNSPECIFIED);
+			work->provenance[i].map_generation =
+				operation->map_generation[depth];
 			decisions[i].allowed = requested & ~xdecisions[i].denied;
 			if (rc && !first_rc)
 				first_rc = rc;
@@ -4138,7 +4240,7 @@ int cred_label_has_extended_perms(const struct cred *cred, u32 tsid,
 			int audit_rc;
 
 			audit_rc = avc_xperms_audit_decision(
-				crsec->state, crsec->sid, resolution.sid[depth],
+				crsec->state, crsec->sid, operation->labels.sid[depth],
 				tclass, requested, &xdecisions[i], ad);
 			if (audit_rc && !first_rc)
 				first_rc = audit_rc;
@@ -4165,14 +4267,24 @@ static int __cred_pathless_has_perm(
 		return -ENOMEM;
 	chain.policy = work->snapshots;
 	for (retry = 0; retry < SELINUX_AVC_CHAIN_RETRIES; retry++) {
+		struct selinux_pathless_chain_resolution *line
+			__free(selinux_pathless_chain_resolution_ptr_put) =
+			kzalloc_obj(*line, GFP_ATOMIC | __GFP_NOWARN);
 		struct selinux_avc_level *levels = work->levels;
 		struct av_decision *decisions = work->decisions;
 		int first_rc = 0;
 		u16 i;
 
+		if (!line)
+			return -ENOMEM;
+
 		rc = selinux_avc_chain_snapshot_read(cred, &chain);
 		if (rc == -EAGAIN || rc == -ESTALE)
 			continue;
+		if (rc)
+			return rc;
+		rc = selinux_pathless_projection_resolve_cred_chain(
+			projection, chain.cred, chain.policy, chain.count, line);
 		if (rc)
 			return rc;
 		for (i = 0; i < chain.count; i++) {
@@ -4182,10 +4294,7 @@ static int __cred_pathless_has_perm(
 			struct av_decision decision;
 			int decision_rc;
 
-			rc = selinux_pathless_projection_resolve_sealed(
-				projection, crsec->state->label_domain, &resolved);
-			if (rc)
-				break;
+			resolved = line->level[crsec->state->label_domain->depth];
 			decision_rc = avc_has_perm_noaudit(
 				crsec->state, crsec->sid, resolved.sid,
 				tclass ? tclass : resolved.sclass, requested, 0,
@@ -4197,8 +4306,8 @@ static int __cred_pathless_has_perm(
 			levels[i].requested = requested;
 			selinux_avc_level_set_provenance(
 				&levels[i], &work->provenance[i], projection->label,
-				projection->view,
-				projection->source);
+				projection->view, projection->source);
+			work->provenance[i].map_generation = resolved.map_generation;
 			decisions[i] = decision;
 			if (decision.seqno != chain.policy[i].seqno ||
 			    !selinux_policy_snapshot_valid(crsec->state,
@@ -4232,10 +4341,7 @@ static int __cred_pathless_has_perm(
 			int decision_rc;
 			int audit_rc;
 
-			rc = selinux_pathless_projection_resolve_sealed(
-				projection, crsec->state->label_domain, &resolved);
-			if (rc)
-				return rc;
+			resolved = line->level[crsec->state->label_domain->depth];
 			decision_rc = avc_has_perm_noaudit(
 				crsec->state, crsec->sid, resolved.sid,
 				tclass ? tclass : resolved.sclass, requested, 0,
@@ -4295,14 +4401,30 @@ int cred_pathless_relation_has_perm(
 		return -ENOMEM;
 	chain.policy = work->snapshots;
 	for (retry = 0; retry < SELINUX_AVC_CHAIN_RETRIES; retry++) {
+		struct selinux_pathless_chain_resolution *source_line
+			__free(selinux_pathless_chain_resolution_ptr_put) =
+			kzalloc_obj(*source_line, GFP_ATOMIC | __GFP_NOWARN);
+		struct selinux_pathless_chain_resolution *target_line
+			__free(selinux_pathless_chain_resolution_ptr_put) =
+			kzalloc_obj(*target_line, GFP_ATOMIC | __GFP_NOWARN);
 		struct selinux_avc_level *levels = work->levels;
 		struct av_decision *decisions = work->decisions;
 		int first_rc = 0;
 		u16 i;
 
+		if (!source_line || !target_line)
+			return -ENOMEM;
 		rc = selinux_avc_chain_snapshot_read(cred, &chain);
 		if (rc == -EAGAIN || rc == -ESTALE)
 			continue;
+		if (rc)
+			return rc;
+		rc = selinux_pathless_projection_resolve_cred_chain(
+			source, chain.cred, chain.policy, chain.count, source_line);
+		if (rc)
+			return rc;
+		rc = selinux_pathless_projection_resolve_cred_chain(
+			target, chain.cred, chain.policy, chain.count, target_line);
 		if (rc)
 			return rc;
 		for (i = 0; i < chain.count; i++) {
@@ -4313,16 +4435,10 @@ int cred_pathless_relation_has_perm(
 			struct av_decision decision;
 			int decision_rc;
 
-			rc = selinux_pathless_projection_resolve_sealed(
-				source, crsec->state->label_domain,
-				&source_resolved);
-			if (rc)
-				break;
-			rc = selinux_pathless_projection_resolve_sealed(
-				target, crsec->state->label_domain,
-				&target_resolved);
-			if (rc)
-				break;
+			source_resolved = source_line->level[
+				crsec->state->label_domain->depth];
+			target_resolved = target_line->level[
+				crsec->state->label_domain->depth];
 			if (source_resolved.sclass != source_tclass ||
 			    target_resolved.sclass != tclass) {
 				rc = -EOPNOTSUPP;
@@ -4340,6 +4456,8 @@ int cred_pathless_relation_has_perm(
 			selinux_avc_level_set_provenance(
 				&levels[i], &work->provenance[i], target->label,
 				target->view, target->source);
+			work->provenance[i].map_generation =
+				target_resolved.map_generation;
 			decisions[i] = decision;
 			if (decision.seqno != chain.policy[i].seqno ||
 			    !selinux_policy_snapshot_valid(crsec->state,
@@ -4374,14 +4492,10 @@ int cred_pathless_relation_has_perm(
 			int decision_rc;
 			int audit_rc;
 
-			rc = selinux_pathless_projection_resolve_sealed(
-				source, crsec->state->label_domain, &source_resolved);
-			if (rc)
-				return rc;
-			rc = selinux_pathless_projection_resolve_sealed(
-				target, crsec->state->label_domain, &target_resolved);
-			if (rc)
-				return rc;
+			source_resolved = source_line->level[
+				crsec->state->label_domain->depth];
+			target_resolved = target_line->level[
+				crsec->state->label_domain->depth];
 			if (source_resolved.sclass != source_tclass ||
 			    target_resolved.sclass != tclass)
 				return -EOPNOTSUPP;
@@ -4429,12 +4543,23 @@ int cred_pathless_has_perm_noaudit(
 	}
 	chain.policy = snapshots;
 	for (retry = 0; retry < SELINUX_AVC_CHAIN_RETRIES; retry++) {
+		struct selinux_pathless_chain_resolution *line
+			__free(selinux_pathless_chain_resolution_ptr_put) =
+			kzalloc_obj(*line, GFP_ATOMIC | __GFP_NOWARN);
 		bool first = true;
 		u16 i;
 
+		if (!line) {
+			rc = -ENOMEM;
+			break;
+		}
 		rc = selinux_avc_chain_snapshot_read(cred, &chain);
 		if (rc == -EAGAIN || rc == -ESTALE)
 			continue;
+		if (rc)
+			break;
+		rc = selinux_pathless_projection_resolve_cred_chain(
+			projection, chain.cred, chain.policy, chain.count, line);
 		if (rc)
 			break;
 		for (i = 0; i < chain.count; i++) {
@@ -4443,10 +4568,7 @@ int cred_pathless_has_perm_noaudit(
 			struct selinux_pathless_resolution resolved;
 			struct av_decision tmp_avd;
 
-			rc = selinux_pathless_projection_resolve_sealed(
-				projection, crsec->state->label_domain, &resolved);
-			if (rc)
-				break;
+			resolved = line->level[crsec->state->label_domain->depth];
 			rc = avc_has_perm_noaudit(
 				crsec->state, crsec->sid, resolved.sid,
 				resolved.sclass, requested, 0, &tmp_avd);
@@ -4497,15 +4619,24 @@ int cred_pathless_has_extended_perms(
 		return -ENOMEM;
 	chain.policy = work->snapshots;
 	for (retry = 0; retry < SELINUX_AVC_CHAIN_RETRIES; retry++) {
+		struct selinux_pathless_chain_resolution *line
+			__free(selinux_pathless_chain_resolution_ptr_put) =
+			kzalloc_obj(*line, GFP_ATOMIC | __GFP_NOWARN);
 		struct selinux_avc_level *levels = work->levels;
 		struct av_decision *decisions = work->decisions;
 		struct avc_xperms_audit_decision *xdecisions = work->xdecisions;
 		int first_rc = 0;
 		u16 i;
 
+		if (!line)
+			return -ENOMEM;
 		rc = selinux_avc_chain_snapshot_read(cred, &chain);
 		if (rc == -EAGAIN || rc == -ESTALE)
 			continue;
+		if (rc)
+			return rc;
+		rc = selinux_pathless_projection_resolve_cred_chain(
+			projection, chain.cred, chain.policy, chain.count, line);
 		if (rc)
 			return rc;
 		for (i = 0; i < chain.count; i++) {
@@ -4513,10 +4644,7 @@ int cred_pathless_has_extended_perms(
 				selinux_cred(chain.cred[i]);
 			struct selinux_pathless_resolution resolved;
 
-			rc = selinux_pathless_projection_resolve_sealed(
-				projection, crsec->state->label_domain, &resolved);
-			if (rc)
-				break;
+			resolved = line->level[crsec->state->label_domain->depth];
 			rc = avc_has_extended_perms_noaudit_internal(
 				crsec->state, &chain.policy[i], crsec->sid,
 				resolved.sid, resolved.sclass, requested, driver,
@@ -4530,6 +4658,7 @@ int cred_pathless_has_extended_perms(
 				&levels[i], &work->provenance[i], projection->label,
 				projection->view,
 				projection->source);
+			work->provenance[i].map_generation = resolved.map_generation;
 			decisions[i].allowed = requested & ~xdecisions[i].denied;
 			if (rc && !first_rc)
 				first_rc = rc;
@@ -4553,10 +4682,7 @@ int cred_pathless_has_extended_perms(
 			struct selinux_pathless_resolution resolved;
 			int audit_rc;
 
-			rc = selinux_pathless_projection_resolve_sealed(
-				projection, crsec->state->label_domain, &resolved);
-			if (rc)
-				return rc;
+			resolved = line->level[crsec->state->label_domain->depth];
 			audit_rc = avc_xperms_audit_decision(
 				crsec->state, crsec->sid, resolved.sid,
 				resolved.sclass, requested, &xdecisions[i], ad);
