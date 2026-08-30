@@ -326,6 +326,21 @@ static inline void selinux_mark_initialized(struct selinux_state *state)
 	smp_store_release(&state->initialized, true);
 }
 
+#ifdef CONFIG_SECURITY_SELINUX_NS
+static inline bool
+selinux_cred_chain_uninitialized(const struct cred *cred)
+{
+	while (cred) {
+		const struct cred_security_struct *crsec = selinux_cred(cred);
+
+		if (selinux_initialized(crsec->state))
+			return false;
+		cred = crsec->parent_cred;
+	}
+	return true;
+}
+#endif
+
 static inline bool selinux_state_active(const struct selinux_state *state)
 {
 	return smp_load_acquire(&state->active);

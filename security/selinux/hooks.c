@@ -4332,20 +4332,6 @@ static inline u32 signal_to_av(int sig)
 #error Fix SELinux to handle capabilities > 63.
 #endif
 
-#ifdef CONFIG_SECURITY_SELINUX_NS
-static bool selinux_cred_chain_uninitialized(const struct cred *cred)
-{
-	while (cred) {
-		const struct cred_security_struct *crsec = selinux_cred(cred);
-
-		if (selinux_initialized(crsec->state))
-			return false;
-		cred = crsec->parent_cred;
-	}
-	return true;
-}
-#endif
-
 /* Check whether a task is allowed to use a capability. */
 static int cred_has_capability(const struct cred *cred,
 			       int cap, unsigned int opts, bool initns)
@@ -4354,12 +4340,6 @@ static int cred_has_capability(const struct cred *cred,
 	u16 sclass;
 	u32 av = CAP_TO_MASK(cap);
 	int rc;
-
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	if (!selinux_initialized(selinux_cred(cred)->state))
-		return selinux_cred_chain_uninitialized(cred) ? 0 : -EACCES;
-#endif
-
 	ad.type = LSM_AUDIT_DATA_CAP;
 	ad.u.cap = cap;
 
@@ -4664,12 +4644,9 @@ static int __file_has_perm(const struct cred *cred, const struct file *file,
 	if (!opener)
 		return -EIO;
 #ifdef CONFIG_SECURITY_SELINUX_NS
-	{
-		const struct cred_security_struct *crsec = selinux_cred(cred);
-
-		if (!selinux_initialized(crsec->state))
-			return selinux_cred_chain_uninitialized(cred) ? 0 : -EACCES;
-	}
+	if (!selinux_initialized(selinux_cred(cred)->state) &&
+	    selinux_cred_chain_uninitialized(cred))
+		return 0;
 	return selinux_file_transfer_has_perm(
 		cred, file, opener, inode, view, pathless, av, &ad);
 #else
@@ -13009,6 +12986,7 @@ static int selinux_file_open(struct file *file)
 static int selinux_task_alloc(struct task_struct *task,
 			      u64 clone_flags)
 {
+	const struct cred *cred = current_cred();
 	struct task_security_struct *old_tsec = selinux_task(current);
 	struct task_security_struct *new_tsec = selinux_task(task);
 
@@ -13021,7 +12999,7 @@ static int selinux_task_alloc(struct task_struct *task,
 	new_tsec->create_plan_kunit_force = false;
 #endif
 #endif
-	return cred_self_has_perm(current_cred(), SECCLASS_PROCESS,
+	return cred_self_has_perm(cred, SECCLASS_PROCESS,
 				  PROCESS__FORK, NULL);
 }
 

@@ -3681,6 +3681,10 @@ int cred_self_has_perm(const struct cred *cred, u16 tclass, u32 requested,
 	struct selinux_avc_level levels[SELINUX_LABEL_RESOLUTION_MAX_DEPTH + 1] = {};
 	u16 count = 0;
 
+	if (!selinux_initialized(selinux_cred(cred)->state) &&
+	    selinux_cred_chain_uninitialized(cred))
+		return 0;
+
 	while (cred) {
 		struct cred_security_struct *crsec = selinux_cred(cred);
 
@@ -3736,6 +3740,12 @@ int cred_self_has_perm_noaudit(const struct cred *cred, u16 tclass,
 	u32 ssid;
 	struct av_decision avd;
 	int rc;
+
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	if (!selinux_initialized(selinux_cred(cred)->state) &&
+	    selinux_cred_chain_uninitialized(cred))
+		return 0;
+#endif
 
 	do {
 		crsec = selinux_cred(cred);
