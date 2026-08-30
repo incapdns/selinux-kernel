@@ -78,7 +78,6 @@ struct selinux_copy_up_carrier;
 #define ROOTCONTEXT_STR "rootcontext"
 #define DEFCONTEXT_STR	"defcontext"
 #define SECLABEL_STR	"seclabel"
-#define SELINUXNS_DEFER_STR "selinuxns_defer"
 #define SELINUXNS_FD_STR "selinuxns_fd"
 
 struct netlbl_lsm_secattr;

@@ -1225,8 +1225,7 @@ enum {
 	Opt_rootcontext = 3,
 	Opt_seclabel = 4,
 #ifdef CONFIG_SECURITY_SELINUX_NS
-	Opt_defer_to_userns = 5,
-	Opt_selinuxns_fd = 6,
+	Opt_selinuxns_fd = 5,
 #endif
 };
 
@@ -7723,7 +7722,6 @@ static const struct fs_parameter_spec selinux_fs_parameters[] = {
 	fsparam_string(ROOTCONTEXT_STR,	Opt_rootcontext),
 	fsparam_flag  (SECLABEL_STR,	Opt_seclabel),
 #ifdef CONFIG_SECURITY_SELINUX_NS
-	fsparam_flag (SELINUXNS_DEFER_STR,	Opt_defer_to_userns),
 	fsparam_fd (SELINUXNS_FD_STR,	Opt_selinuxns_fd),
 #endif
 	{}
@@ -7740,14 +7738,6 @@ static int selinux_fs_context_parse_param(struct fs_context *fc,
 		return opt;
 
 #ifdef CONFIG_SECURITY_SELINUX_NS
-	if (opt == Opt_defer_to_userns) {
-		/*
-		 * Ownership by user namespace is not enough to identify a SELinux
-		 * policy.  Keep this legacy spelling fail-closed until fs_context can
-		 * carry an activated, parent-authorized namespace control FD.
-		 */
-		return -EOPNOTSUPP;
-	}
 	if (opt == Opt_selinuxns_fd) {
 		struct selinux_ns_control *control;
 		struct selinux_mnt_opts *opts;
