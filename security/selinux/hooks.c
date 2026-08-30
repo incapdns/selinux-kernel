@@ -612,17 +612,24 @@ out_unlock:
 	return rc;
 }
 
-static void selinux_copy_up_carrier_put(struct selinux_copy_up_carrier *carrier)
+static void selinux_copy_up_carrier_free(struct work_struct *work)
 {
-	if (!carrier)
-		return;
-	iput(carrier->src_inode);
+	struct selinux_copy_up_carrier *carrier = container_of(
+		work, struct selinux_copy_up_carrier, free_work);
+
+	path_put(&carrier->src_path);
 	selinux_label_view_put(carrier->dst_view);
 	selinux_label_view_put(carrier->src_view);
 	global_sid_handle_put(carrier->create_handle);
 	global_sid_handle_put(carrier->sid_handle);
 	selinux_label_ref_put(carrier->label);
 	kfree(carrier);
+}
+
+static void selinux_copy_up_carrier_put(struct selinux_copy_up_carrier *carrier)
+{
+	if (carrier)
+		schedule_work(&carrier->free_work);
 }
 
 static int inode_security_take_task_sid_handle(
@@ -11298,6 +11305,137 @@ static void selinux_inode_getlsmprop(struct inode *inode, struct lsm_prop *prop)
 #endif
 }
 
+#ifdef CONFIG_SECURITY_SELINUX_NS
+/*
+ * Preserve the upstream pre-policy copy-up contract without treating an
+ * uninitialized inode tuple as a policy label.  The only identity accepted
+ * here is a strongly held kernel-initial SID, and every policy in the actor's
+ * chain must remain uninitialized through the final publication check.
+ */
+static int selinux_inode_copy_up_bootstrap(
+	const struct path *src, struct inode_security_struct *isec,
+	const struct selinux_label_view *src_view,
+	const struct selinux_label_view *dst_view, struct cred **new)
+{
+	struct selinux_policy_chain_snapshot *chain __free(kfree) = NULL;
+	struct selinux_copy_up_carrier *carrier = NULL;
+	struct selinux_global_sid_handle *cred_handle = NULL;
+	struct cred_security_struct *crsec;
+	struct cred *new_creds = *new;
+	bool allocated_creds = false;
+	u16 i;
+	int rc;
+
+	chain = kzalloc_obj(*chain, GFP_KERNEL);
+	if (!chain)
+		return -ENOMEM;
+	rc = selinux_policy_chain_snapshot_read(current_cred(), chain);
+	if (rc)
+		return rc;
+	for (i = 0; i < chain->count; i++)
+		if (chain->policy[i].initialized)
+			return -EACCES;
+	if (src_view->origin_domain != current_selinux_state->label_domain ||
+	    dst_view->origin_domain != current_selinux_state->label_domain)
+		return -EXDEV;
+
+	carrier = kzalloc_obj(*carrier, GFP_KERNEL_ACCOUNT);
+	if (!carrier)
+		return -ENOMEM;
+	INIT_WORK(&carrier->free_work, selinux_copy_up_carrier_free);
+	spin_lock(&isec->lock);
+	if (!isec->sid_handle ||
+	    global_sid_handle_sid(isec->sid_handle) != isec->sid) {
+		rc = -ESTALE;
+	} else {
+		carrier->sid_handle =
+			global_sid_handle_dup(isec->sid_handle);
+		rc = IS_ERR(carrier->sid_handle) ?
+			PTR_ERR(carrier->sid_handle) : 0;
+		if (IS_ERR(carrier->sid_handle))
+			carrier->sid_handle = NULL;
+		carrier->sid = isec->sid;
+		carrier->sclass = isec->sclass;
+		carrier->source = isec->label_source;
+	}
+	spin_unlock(&isec->lock);
+	if (rc)
+		goto out;
+
+	carrier->label =
+		global_sid_handle_label_get(carrier->sid_handle);
+	if (!carrier->label || !(carrier->label->domain->flags &
+			SELINUX_LABEL_DOMAIN_KERNEL_GLOBAL) ||
+	    carrier->sid > SECINITSID_NUM) {
+		rc = -EXDEV;
+		goto out;
+	}
+	carrier->create_handle =
+		global_sid_handle_dup(carrier->sid_handle);
+	if (IS_ERR(carrier->create_handle)) {
+		rc = PTR_ERR(carrier->create_handle);
+		carrier->create_handle = NULL;
+		goto out;
+	}
+	carrier->src_view = selinux_label_view_get(src_view);
+	carrier->dst_view = selinux_label_view_get(dst_view);
+	carrier->src_path = *src;
+	path_get(&carrier->src_path);
+	carrier->bootstrap = true;
+	if (!carrier->src_view || !carrier->dst_view) {
+		rc = -ESTALE;
+		goto out;
+	}
+
+	if (!new_creds) {
+		new_creds = prepare_creds();
+		if (!new_creds) {
+			rc = -ENOMEM;
+			goto out;
+		}
+		allocated_creds = true;
+	}
+	if (!selinux_policy_chain_snapshot_valid(chain)) {
+		rc = -ESTALE;
+		goto out;
+	}
+	spin_lock(&isec->lock);
+	if (isec->sid_handle != carrier->sid_handle ||
+	    isec->sid != carrier->sid || isec->sclass != carrier->sclass ||
+	    isec->label_source != carrier->source)
+		rc = -ESTALE;
+	spin_unlock(&isec->lock);
+	if (rc)
+		goto out;
+	crsec = selinux_cred(new_creds);
+	if (crsec->copy_up) {
+		rc = -EEXIST;
+		goto out;
+	}
+	cred_handle = global_sid_handle_dup(carrier->create_handle);
+	if (IS_ERR(cred_handle)) {
+		rc = PTR_ERR(cred_handle);
+		cred_handle = NULL;
+		goto out;
+	}
+	rc = selinux_cred_sid_take_handle(crsec, SELINUX_CRED_CREATE_SID,
+					  cred_handle);
+	cred_handle = NULL;
+	if (rc)
+		goto out;
+	crsec->copy_up = carrier;
+	carrier = NULL;
+	*new = new_creds;
+
+out:
+	if (rc && allocated_creds)
+		abort_creds(new_creds);
+	global_sid_handle_put(cred_handle);
+	selinux_copy_up_carrier_put(carrier);
+	return rc;
+}
+#endif
+
 static int selinux_inode_copy_up(const struct path *src,
 				 const struct vfsmount *dst_mnt,
 				 struct cred **new)
@@ -11315,7 +11453,6 @@ static int selinux_inode_copy_up(const struct path *src,
 	struct selinux_global_sid_handle *cred_handle = NULL;
 	struct selinux_global_sid_handle *create_handle = NULL;
 	struct selinux_inode_label_snapshot snapshot;
-	struct inode *src_inode;
 	u32 create_sid;
 	bool allocated_creds = false;
 	int rc;
@@ -11326,7 +11463,6 @@ static int selinux_inode_copy_up(const struct path *src,
 	isec = backing_inode_security(src->dentry);
 
 #ifdef CONFIG_SECURITY_SELINUX_NS
-	src_inode = d_backing_inode(src->dentry);
 	src_sec = selinux_mount_security(src->mnt);
 	dst_sec = selinux_mount_security(dst_mnt);
 	if (!src_sec || !dst_sec)
@@ -11338,6 +11474,9 @@ static int selinux_inode_copy_up(const struct path *src,
 	if ((src_view->flags | dst_view->flags) &
 	    SELINUX_LABEL_VIEW_ORIGIN_UNRESOLVED)
 		return -EOPNOTSUPP;
+	if (!selinux_initialized(current_selinux_state))
+		return selinux_inode_copy_up_bootstrap(
+			src, isec, src_view, dst_view, new);
 	/*
 	 * The create SID is interpreted by the current policy.  Until label
 	 * generation itself accepts an explicit destination domain, accepting a
@@ -11392,10 +11531,12 @@ out_view:
 		rc = -ENOMEM;
 		goto out_create;
 	}
+	INIT_WORK(&carrier->free_work, selinux_copy_up_carrier_free);
 	carrier->src_view = selinux_label_view_get(src_view);
 	carrier->dst_view = selinux_label_view_get(dst_view);
-	carrier->src_inode = igrab(src_inode);
-	if (!carrier->src_view || !carrier->dst_view || !carrier->src_inode) {
+	carrier->src_path = *src;
+	path_get(&carrier->src_path);
+	if (!carrier->src_view || !carrier->dst_view) {
 		rc = -ESTALE;
 		goto out_carrier;
 	}
@@ -11466,6 +11607,60 @@ out_snapshot:
 #endif
 }
 
+#ifdef CONFIG_SECURITY_SELINUX_NS
+static int selinux_inode_copy_up_bootstrap_post(
+	const struct path *src, struct dentry *dst,
+	const struct cred *copy_up_cred,
+	const struct selinux_copy_up_carrier *carrier)
+{
+	struct selinux_policy_chain_snapshot *chain __free(kfree) = NULL;
+	struct inode_security_struct *src_isec, *dst_isec;
+	u16 i;
+	int rc;
+
+	chain = kzalloc_obj(*chain, GFP_KERNEL);
+	if (!chain)
+		return -ENOMEM;
+	rc = selinux_policy_chain_snapshot_read(copy_up_cred, chain);
+	if (rc)
+		return rc;
+	for (i = 0; i < chain->count; i++)
+		if (chain->policy[i].initialized)
+			return -EACCES;
+
+	src_isec = backing_inode_security(src->dentry);
+	dst_isec = backing_inode_security(dst);
+	spin_lock(&src_isec->lock);
+	if (src_isec->initialized == LABEL_INITIALIZED ||
+	    src_isec->sid_handle != carrier->sid_handle ||
+	    src_isec->sid != carrier->sid ||
+	    src_isec->sclass != carrier->sclass ||
+	    src_isec->label_source != carrier->source ||
+	    rcu_dereference_protected(
+		    src_isec->label_ref,
+		    lockdep_is_held(&src_isec->lock)) != carrier->label)
+		rc = -ESTALE;
+	spin_unlock(&src_isec->lock);
+	if (rc)
+		return rc;
+
+	spin_lock(&dst_isec->lock);
+	if (dst_isec->initialized == LABEL_INITIALIZED ||
+	    dst_isec->sid_handle != carrier->create_handle ||
+	    dst_isec->sid !=
+		    global_sid_handle_sid(carrier->create_handle) ||
+	    dst_isec->sclass != carrier->sclass ||
+	    rcu_dereference_protected(
+		    dst_isec->label_ref,
+		    lockdep_is_held(&dst_isec->lock)) != carrier->label)
+		rc = -ESTALE;
+	spin_unlock(&dst_isec->lock);
+	if (rc)
+		return rc;
+	return selinux_policy_chain_snapshot_valid(chain) ? 0 : -ESTALE;
+}
+#endif
+
 static int selinux_inode_copy_up_post(const struct path *src,
 				      const struct vfsmount *dst_mnt,
 				      struct dentry *dst,
@@ -11499,8 +11694,11 @@ static int selinux_inode_copy_up_post(const struct path *src,
 	    SELINUX_LABEL_VIEW_ORIGIN_UNRESOLVED)
 		return -EOPNOTSUPP;
 	if (src_view != carrier->src_view || dst_view != carrier->dst_view ||
-	    d_backing_inode(src->dentry) != carrier->src_inode)
+	    !path_equal(src, &carrier->src_path))
 		return -ESTALE;
+	if (carrier->bootstrap)
+		return selinux_inode_copy_up_bootstrap_post(
+			src, dst, copy_up_cred, carrier);
 
 	src_isec = backing_inode_security(src->dentry);
 	dst_isec = backing_inode_security(dst);
@@ -14295,7 +14493,7 @@ static struct selinux_net_provenance *selinux_sk_provenance_create(
 		   sksec->state == init_selinux_state) {
 		/*
 		 * Core networking creates init_net kernel sockets before the
-		 * SELinux device initcall can register its per-net anchor.  Their
+		 * SELinux core initcall can register its per-net anchor.  Their
 		 * only possible lineage is the initial SELinux/user namespace.
 		 */
 		owner_userns = &init_user_ns;
@@ -26359,6 +26557,7 @@ DEFINE_LSM(selinux) = {
 	.enabled = &selinux_enabled_boot,
 	.blobs = &selinux_blob_sizes,
 	.init = selinux_init,
+	.initcall_core = selinux_initcall_core,
 	.initcall_device = selinux_initcall,
 };
 

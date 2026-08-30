@@ -14,6 +14,7 @@ int sel_netlink_init(void);
 int sel_ib_pkey_init(void);
 int selinux_nf_ip_init(void);
 
+int selinux_initcall_core(void);
 int selinux_initcall(void);
 
 #endif

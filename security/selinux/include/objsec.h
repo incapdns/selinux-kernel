@@ -25,6 +25,8 @@
 #include <linux/spinlock.h>
 #include <linux/lsm_hooks.h>
 #include <linux/msg.h>
+#include <linux/path.h>
+#include <linux/workqueue.h>
 #include <net/net_namespace.h>
 #include <linux/bpf.h>
 #include <linux/btf.h>
@@ -166,15 +168,17 @@ struct selinux_copy_up_assertion {
 
 /* Exact pre-create identity carried by the temporary copy-up credentials. */
 struct selinux_copy_up_carrier {
+	struct work_struct free_work;
 	struct selinux_label_ref *label;
 	const struct selinux_label_view *src_view;
 	const struct selinux_label_view *dst_view;
 	struct selinux_global_sid_handle *sid_handle;
 	struct selinux_global_sid_handle *create_handle;
-	struct inode *src_inode;
+	struct path src_path;
 	u32 sid;
 	u16 sclass;
 	u8 source;
+	bool bootstrap;
 };
 #endif
 
