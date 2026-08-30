@@ -568,7 +568,7 @@ int notify_change_mnt(struct mnt_idmap *idmap, const struct vfsmount *mnt,
 
 	if (!error) {
 		fsnotify_change(dentry, ia_valid);
-		security_inode_post_setattr(idmap, dentry, ia_valid);
+		security_inode_post_setattr(idmap, mnt, dentry, ia_valid);
 	}
 
 	return error;

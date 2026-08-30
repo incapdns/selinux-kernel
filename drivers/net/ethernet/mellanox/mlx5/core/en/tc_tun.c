@@ -453,7 +453,12 @@ static int mlx5e_route_lookup_ipv6_get(struct mlx5e_priv *priv,
 
 	if (tunnel && tunnel->get_remote_ifindex)
 		attr->fl.fl6.flowi6_oif = tunnel->get_remote_ifindex(dev);
-	dst = ip6_dst_lookup_flow(dev_net(dev), NULL, &attr->fl.fl6, NULL);
+	{
+		struct xfrm_flow_origin origin = xfrm_flow_origin_none();
+
+		dst = ip6_dst_lookup_flow_origin(dev_net(dev), NULL,
+						 &attr->fl.fl6, NULL, &origin);
+	}
 	if (IS_ERR(dst))
 		return PTR_ERR(dst);
 

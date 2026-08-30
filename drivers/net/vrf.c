@@ -433,7 +433,12 @@ static netdev_tx_t vrf_process_v6_outbound(struct sk_buff *skb,
 	fl6.flowi6_mark = skb->mark;
 	fl6.flowi6_proto = iph->nexthdr;
 
-	dst = ip6_dst_lookup_flow(net, NULL, &fl6, NULL);
+	{
+		struct xfrm_flow_origin origin = xfrm_flow_origin_none();
+
+		dst = ip6_dst_lookup_flow_origin(net, NULL, &fl6, NULL,
+						 &origin);
+	}
 	if (IS_ERR(dst) || dst == dst_null)
 		goto err;
 
@@ -511,7 +516,11 @@ static netdev_tx_t vrf_process_v4_outbound(struct sk_buff *skb,
 	fl4.daddr = ip4h->daddr;
 	fl4.saddr = ip4h->saddr;
 
-	rt = ip_route_output_flow(net, &fl4, NULL);
+	{
+		struct xfrm_flow_origin origin = xfrm_flow_origin_skb(skb);
+
+		rt = ip_route_output_flow_origin(net, &fl4, NULL, &origin);
+	}
 	if (IS_ERR(rt))
 		goto err;
 

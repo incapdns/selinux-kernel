@@ -130,7 +130,8 @@ retry:
 			goto mkdir_error;
 		ret = cachefiles_inject_write_error();
 		if (ret == 0) {
-			subdir = vfs_mkdir(&nop_mnt_idmap, d_inode(dir), subdir, 0700, NULL);
+			subdir = vfs_mkdir_mnt(&nop_mnt_idmap, cache->mnt,
+					       d_inode(dir), subdir, 0700, NULL);
 			if (IS_ERR(subdir))
 				ret = PTR_ERR(subdir);
 		} else {
@@ -248,7 +249,8 @@ static int cachefiles_unlink(struct cachefiles_cache *cache,
 
 	ret = cachefiles_inject_remove_error();
 	if (ret == 0) {
-		ret = vfs_unlink(&nop_mnt_idmap, d_backing_inode(dir), dentry, NULL);
+		ret = vfs_unlink_mnt(&nop_mnt_idmap, cache->mnt,
+				     d_backing_inode(dir), dentry, NULL);
 		if (ret == -EIO)
 			cachefiles_io_error(cache, "Unlink failed");
 	}
@@ -695,8 +697,9 @@ bool cachefiles_commit_tmpfile(struct cachefiles_cache *cache,
 
 	ret = cachefiles_inject_read_error();
 	if (ret == 0)
-		ret = vfs_link(object->file->f_path.dentry, &nop_mnt_idmap,
-			       d_inode(fan), dentry, NULL);
+		ret = vfs_link_mnt(object->file->f_path.mnt,
+				   object->file->f_path.dentry, &nop_mnt_idmap,
+				   volume->cache->mnt, d_inode(fan), dentry, NULL);
 	if (ret < 0) {
 		trace_cachefiles_vfs_error(object, d_inode(fan), ret,
 					   cachefiles_trace_link_error);

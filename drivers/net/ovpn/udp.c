@@ -174,7 +174,11 @@ static int ovpn_udp4_output(struct ovpn_peer *peer, struct ovpn_bind *bind,
 		dst_cache_reset(cache);
 	}
 
-	rt = ip_route_output_flow(sock_net(sk), &fl, sk);
+	{
+		struct xfrm_flow_origin origin = xfrm_flow_origin_skb(skb);
+
+		rt = ip_route_output_flow_origin(sock_net(sk), &fl, sk, &origin);
+	}
 	if (IS_ERR(rt) && PTR_ERR(rt) == -EINVAL) {
 		fl.saddr = 0;
 		spin_lock_bh(&peer->lock);
@@ -182,7 +186,12 @@ static int ovpn_udp4_output(struct ovpn_peer *peer, struct ovpn_bind *bind,
 		spin_unlock_bh(&peer->lock);
 		dst_cache_reset(cache);
 
-		rt = ip_route_output_flow(sock_net(sk), &fl, sk);
+		{
+			struct xfrm_flow_origin origin = xfrm_flow_origin_skb(skb);
+
+			rt = ip_route_output_flow_origin(sock_net(sk), &fl, sk,
+							 &origin);
+		}
 	}
 
 	if (IS_ERR(rt)) {
@@ -250,7 +259,12 @@ static int ovpn_udp6_output(struct ovpn_peer *peer, struct ovpn_bind *bind,
 		dst_cache_reset(cache);
 	}
 
-	dst = ip6_dst_lookup_flow(sock_net(sk), sk, &fl, NULL);
+	{
+		struct xfrm_flow_origin origin = xfrm_flow_origin_sock(sk);
+
+		dst = ip6_dst_lookup_flow_origin(sock_net(sk), sk, &fl, NULL,
+						 &origin);
+	}
 	if (IS_ERR(dst)) {
 		ret = PTR_ERR(dst);
 		net_dbg_ratelimited("%s: no route to host %pISpc: %d\n",

@@ -48,7 +48,7 @@ selinux_test_ns_control_alloc_cred(struct kunit *test, const struct cred *cred)
 	return control;
 }
 
-static struct selinux_ns_control *
+static __maybe_unused struct selinux_ns_control *
 selinux_test_ns_control_alloc(struct kunit *test)
 {
 	return selinux_test_ns_control_alloc_cred(test, current_cred());
@@ -162,7 +162,7 @@ static void selinux_ns_control_activation_test(struct kunit *test)
 	bool parent_matches;
 	int rc;
 
-	control = selinux_test_ns_control_alloc(test);
+	control = selinux_test_ns_control_alloc_cred(test, current_cred());
 	KUNIT_ASSERT_NOT_NULL(test, control);
 	KUNIT_EXPECT_FALSE(test, selinux_state_active(control->state));
 	KUNIT_EXPECT_TRUE(test, selinux_ns_control_parent(control, parent));
@@ -219,7 +219,7 @@ static void selinux_ns_control_no_partial_publish_test(struct kunit *test)
 	struct selinux_label_map *published;
 	int rc;
 
-	control = selinux_test_ns_control_alloc(test);
+	control = selinux_test_ns_control_alloc_cred(test, current_cred());
 	KUNIT_ASSERT_NOT_NULL(test, control);
 	selinux_mark_initialized(control->state);
 	rc = selinux_ns_control_activate(control, current_selinux_state);
@@ -240,7 +240,7 @@ static void selinux_ns_control_requires_bidirectional_map_test(struct kunit *tes
 	u32 parent_sid, child_sid;
 	int rc;
 
-	control = selinux_test_ns_control_alloc(test);
+	control = selinux_test_ns_control_alloc_cred(test, current_cred());
 	KUNIT_ASSERT_NOT_NULL(test, control);
 	parent_handle = selinux_test_ns_handle(
 		test, parent->label_domain, "u:r:parent_one_way_t:s0",
@@ -287,7 +287,7 @@ static void selinux_ns_nsfs_type_zero_handle_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, nsfs_kunit_handle_fields_valid(0, 314, 0));
 	KUNIT_EXPECT_TRUE(test, selinuxns_operations.is_current(
 		&current_selinux_state->ns_control->ns));
-	other = selinux_test_ns_control_alloc(test);
+	other = selinux_test_ns_control_alloc_cred(test, current_cred());
 	KUNIT_ASSERT_NOT_NULL(test, other);
 	KUNIT_EXPECT_FALSE(test, selinuxns_operations.is_current(&other->ns));
 }
@@ -297,7 +297,7 @@ static void selinux_ns_direct_child_dormant_rejected_test(struct kunit *test)
 	struct selinux_ns_control *control;
 	int parent_rc, child_rc;
 
-	control = selinux_test_ns_control_alloc(test);
+	control = selinux_test_ns_control_alloc_cred(test, current_cred());
 	KUNIT_ASSERT_NOT_NULL(test, control);
 	KUNIT_ASSERT_FALSE(test, selinux_state_active(control->state));
 	parent_rc = selinux_ns_control_authorize_parent(control,
@@ -316,12 +316,12 @@ static void selinux_ns_direct_child_relationship_test(struct kunit *test)
 	struct cred *self_cred, *sibling_cred, *grandchild_cred;
 	int rc;
 
-	target = selinux_test_ns_control_alloc(test);
+	target = selinux_test_ns_control_alloc_cred(test, current_cred());
 	KUNIT_ASSERT_NOT_NULL(test, target);
 	rc = selinux_test_ns_control_activate(test, target);
 	KUNIT_ASSERT_EQ(test, rc, 0);
 
-	sibling = selinux_test_ns_control_alloc(test);
+	sibling = selinux_test_ns_control_alloc_cred(test, current_cred());
 	KUNIT_ASSERT_NOT_NULL(test, sibling);
 	rc = selinux_test_ns_control_activate(test, sibling);
 	KUNIT_ASSERT_EQ(test, rc, 0);
@@ -363,7 +363,7 @@ static void selinux_ns_control_from_file_ref_test(struct kunit *test)
 	int ns_refs, state_refs;
 	int rc;
 
-	control = selinux_test_ns_control_alloc(test);
+	control = selinux_test_ns_control_alloc_cred(test, current_cred());
 	KUNIT_ASSERT_NOT_NULL(test, control);
 	KUNIT_ASSERT_FALSE(test, selinux_state_active(control->state));
 
@@ -393,13 +393,13 @@ static void selinux_ns_control_nsfs_security_unwind_test(struct kunit *test)
 	struct file *nsfile;
 	int ns_refs, state_refs;
 
-	control = selinux_test_ns_control_alloc(test);
+	control = selinux_test_ns_control_alloc_cred(test, current_cred());
 	KUNIT_ASSERT_NOT_NULL(test, control);
 	ns_refs = __ns_ref_read(&control->ns);
 	state_refs = refcount_read(&control->state->count);
 
 	/* A different nsfs materialization must not consume this scoped fault. */
-	other = selinux_test_ns_control_alloc(test);
+	other = selinux_test_ns_control_alloc_cred(test, current_cred());
 	KUNIT_ASSERT_NOT_NULL(test, other);
 	nsfs_kunit_fail_security_init_once(&control->ns, -ENOMEM);
 	selinux_ns_control_get(other);
@@ -476,7 +476,7 @@ static void selinux_ns_restore_mismatch_is_not_published_test(struct kunit *test
 	u8 map_digest[SHA256_DIGEST_SIZE];
 	int rc;
 
-	control = selinux_test_ns_control_alloc(test);
+	control = selinux_test_ns_control_alloc_cred(test, current_cred());
 	KUNIT_ASSERT_NOT_NULL(test, control);
 	selinux_mark_initialized(control->state);
 	control->parent_chain_epoch =
@@ -559,7 +559,7 @@ static void selinux_ns_restore_id_reservation_test(struct kunit *test)
 	struct selinux_ns_control *stale;
 	u64 gap_id;
 
-	base = selinux_test_ns_control_alloc(test);
+	base = selinux_test_ns_control_alloc_cred(test, current_cred());
 	KUNIT_ASSERT_NOT_NULL(test, base);
 	gap_id = base->ns.ns_id + 100;
 	restored = selinux_ns_control_alloc_unassigned(current_cred());
@@ -605,7 +605,7 @@ static void selinux_policy_resource_accounting_test(struct kunit *test)
 	u64 baseline, bytes_baseline;
 	int rc;
 
-	control = selinux_test_ns_control_alloc(test);
+	control = selinux_test_ns_control_alloc_cred(test, current_cred());
 	KUNIT_ASSERT_NOT_NULL(test, control);
 	resources = control->state->label_domain->resources;
 	baseline = selinux_kunit_resource_objects(resources,
@@ -716,7 +716,7 @@ static void selinux_audit_host_reserve_lifetime_test(struct kunit *test)
 	u64 baseline, bytes_baseline, host_before;
 	int rc;
 
-	control = selinux_test_ns_control_alloc(test);
+	control = selinux_test_ns_control_alloc_cred(test, current_cred());
 	KUNIT_ASSERT_NOT_NULL(test, control);
 	resources = control->state->label_domain->resources;
 	baseline = selinux_kunit_resource_objects(resources,

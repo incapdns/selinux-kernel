@@ -1196,7 +1196,7 @@ static int audit_log_pid_context(struct audit_context *context, pid_t pid,
 
 	audit_log_format(ab, " ocomm=");
 	audit_log_untrustedstring(ab, comm);
-	audit_log_end(ab);
+	(void)audit_log_end_status(ab);
 
 	return rc;
 }
@@ -1309,7 +1309,7 @@ static void audit_log_execve_info(struct audit_context *context,
 			 *       a new buffer */
 			if ((sizeof(abuf) + 8) > len_rem) {
 				len_rem = len_max;
-				audit_log_end(*ab);
+				(void)audit_log_end_status(*ab);
 				*ab = audit_log_start(context,
 						      GFP_KERNEL, AUDIT_EXECVE);
 				if (!*ab)
@@ -1369,7 +1369,7 @@ static void audit_log_execve_info(struct audit_context *context,
 		}
 	} while (arg < context->execve.argc);
 
-	/* NOTE: the caller handles the final audit_log_end() call */
+	/* NOTE: the caller handles the final (void)audit_log_end_status() call */
 
 out:
 	kfree(buf_head);
@@ -1426,7 +1426,7 @@ static void audit_log_time(struct audit_context *context, struct audit_buffer **
 						 ntp_name[type],
 						 ntp->vals[type].oldval,
 						 ntp->vals[type].newval);
-				audit_log_end(*ab);
+				(void)audit_log_end_status(*ab);
 				*ab = NULL;
 			}
 		}
@@ -1440,7 +1440,7 @@ static void audit_log_time(struct audit_context *context, struct audit_buffer **
 		}
 		audit_log_format(*ab, "sec=%lli nsec=%li",
 				 (long long)tk->tv_sec, tk->tv_nsec);
-		audit_log_end(*ab);
+		(void)audit_log_end_status(*ab);
 		*ab = NULL;
 	}
 }
@@ -1477,7 +1477,7 @@ static void show_special(struct audit_context *context, int *call_panic)
 				*call_panic = 1;
 		}
 		if (context->ipc.has_perm) {
-			audit_log_end(ab);
+			(void)audit_log_end_status(ab);
 			ab = audit_log_start(context, GFP_KERNEL,
 					     AUDIT_IPC_SET_PERM);
 			if (unlikely(!ab))
@@ -1560,7 +1560,7 @@ static void show_special(struct audit_context *context, int *call_panic)
 		audit_log_time(context, &ab);
 		break;
 	}
-	audit_log_end(ab);
+	(void)audit_log_end_status(ab);
 }
 
 static inline int audit_proctitle_rtrim(char *proctitle, int len)
@@ -1656,7 +1656,7 @@ static void audit_log_name(struct audit_context *context, struct audit_names *n,
 	}
 
 	audit_log_fcaps(ab, n);
-	audit_log_end(ab);
+	(void)audit_log_end_status(ab);
 }
 
 static void audit_log_proctitle(void)
@@ -1697,7 +1697,7 @@ static void audit_log_proctitle(void)
 	len = context->proctitle.len;
 out:
 	audit_log_n_untrustedstring(ab, msg, len);
-	audit_log_end(ab);
+	(void)audit_log_end_status(ab);
 }
 
 /**
@@ -1735,7 +1735,7 @@ static void audit_log_uring(struct audit_context *ctx)
 			 from_kgid(&init_user_ns, cred->fsgid));
 	audit_log_task_context(ab);
 	audit_log_key(ab, ctx->filterkey);
-	audit_log_end(ab);
+	(void)audit_log_end_status(ab);
 }
 
 static void audit_log_exit(void)
@@ -1771,7 +1771,7 @@ static void audit_log_exit(void)
 				 context->name_count);
 		audit_log_task_info(ab);
 		audit_log_key(ab, context->filterkey);
-		audit_log_end(ab);
+		(void)audit_log_end_status(ab);
 		break;
 	case AUDIT_CTX_URING:
 		audit_log_uring(context);
@@ -1810,7 +1810,7 @@ static void audit_log_exit(void)
 			break; }
 
 		}
-		audit_log_end(ab);
+		(void)audit_log_end_status(ab);
 	}
 
 	if (context->type)
@@ -1821,7 +1821,7 @@ static void audit_log_exit(void)
 		if (ab) {
 			audit_log_format(ab, "fd0=%d fd1=%d",
 					context->fds[0], context->fds[1]);
-			audit_log_end(ab);
+			(void)audit_log_end_status(ab);
 		}
 	}
 
@@ -1831,7 +1831,7 @@ static void audit_log_exit(void)
 			audit_log_format(ab, "saddr=");
 			audit_log_n_hex(ab, (void *)context->sockaddr,
 					context->sockaddr_len);
-			audit_log_end(ab);
+			(void)audit_log_end_status(ab);
 		}
 	}
 
@@ -1860,7 +1860,7 @@ static void audit_log_exit(void)
 		ab = audit_log_start(context, GFP_KERNEL, AUDIT_CWD);
 		if (ab) {
 			audit_log_d_path(ab, "cwd=", &context->pwd);
-			audit_log_end(ab);
+			(void)audit_log_end_status(ab);
 		}
 	}
 
@@ -1877,7 +1877,7 @@ static void audit_log_exit(void)
 	/* Send end of event record to help user space know we are finished */
 	ab = audit_log_start(context, GFP_KERNEL, AUDIT_EOE);
 	if (ab)
-		audit_log_end(ab);
+		(void)audit_log_end_status(ab);
 	if (call_panic)
 		audit_panic("error in audit_log_exit()");
 }
@@ -2984,7 +2984,7 @@ void __audit_log_nfcfg(const char *name, u8 af, unsigned int nentries,
 	audit_log_task_context(ab); /* subj= */
 	audit_log_format(ab, " comm=");
 	audit_log_untrustedstring(ab, get_task_comm(comm, current));
-	audit_log_end(ab);
+	(void)audit_log_end_status(ab);
 }
 EXPORT_SYMBOL_GPL(__audit_log_nfcfg);
 
@@ -3032,7 +3032,7 @@ void audit_core_dumps(long signr)
 		return;
 	audit_log_task(ab);
 	audit_log_format(ab, " sig=%ld res=1", signr);
-	audit_log_end(ab);
+	(void)audit_log_end_status(ab);
 }
 
 /**
@@ -3058,7 +3058,7 @@ void audit_seccomp(unsigned long syscall, long signr, int code)
 	audit_log_format(ab, " sig=%ld arch=%x syscall=%ld compat=%d ip=0x%lx code=0x%x",
 			 signr, syscall_get_arch(current), syscall,
 			 in_compat_syscall(), KSTK_EIP(current), code);
-	audit_log_end(ab);
+	(void)audit_log_end_status(ab);
 }
 
 void audit_seccomp_actions_logged(const char *names, const char *old_names,
@@ -3077,7 +3077,7 @@ void audit_seccomp_actions_logged(const char *names, const char *old_names,
 	audit_log_format(ab,
 			 "op=seccomp-logging actions=%s old-actions=%s res=%d",
 			 names, old_names, res);
-	audit_log_end(ab);
+	(void)audit_log_end_status(ab);
 }
 
 struct list_head *audit_killed_trees(void)

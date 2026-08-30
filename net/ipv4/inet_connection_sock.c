@@ -1576,7 +1576,11 @@ static struct dst_entry *inet_csk_rebuild_route(struct sock *sk, struct flowi *f
 	rcu_read_lock();
 	fl4 = &fl->u.ip4;
 	inet_sk_init_flowi4(inet, fl4);
-	rt = ip_route_output_flow(sock_net(sk), fl4, sk);
+	{
+		struct xfrm_flow_origin origin = xfrm_flow_origin_sock(sk);
+
+		rt = ip_route_output_flow_origin(sock_net(sk), fl4, sk, &origin);
+	}
 	if (IS_ERR(rt))
 		rt = NULL;
 	if (rt)

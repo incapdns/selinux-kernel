@@ -1145,7 +1145,7 @@ retry_deleg:
 		error = -EIO;
 	if (!error) {
 		fsnotify_xattr(dentry);
-		security_inode_post_set_acl(dentry, acl_name, kacl);
+		security_inode_post_set_acl(mnt, dentry, acl_name, kacl);
 	}
 
 out_inode_unlock:
@@ -1270,7 +1270,7 @@ retry_deleg:
 		error = -EIO;
 	if (!error) {
 		fsnotify_xattr(dentry);
-		security_inode_post_remove_acl(idmap, dentry, acl_name);
+		security_inode_post_remove_acl(idmap, mnt, dentry, acl_name);
 	}
 
 out_inode_unlock:

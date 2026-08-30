@@ -499,7 +499,7 @@ unlhsh_add_return:
 			security_release_secctx(&ctx);
 		}
 		audit_log_format(audit_buf, " res=%u", ret_val == 0 ? 1 : 0);
-		audit_log_end(audit_buf);
+		(void)audit_log_end_status(audit_buf);
 	}
 	return ret_val;
 }
@@ -596,7 +596,7 @@ static int netlbl_unlhsh_remove_addr4(struct net *net,
 			security_release_secctx(&ctx);
 		}
 		audit_log_format(audit_buf, " res=%u", entry != NULL ? 1 : 0);
-		audit_log_end(audit_buf);
+		(void)audit_log_end_status(audit_buf);
 	}
 
 	if (entry == NULL)
@@ -656,7 +656,7 @@ static int netlbl_unlhsh_remove_addr6(struct net *net,
 			security_release_secctx(&ctx);
 		}
 		audit_log_format(audit_buf, " res=%u", entry != NULL ? 1 : 0);
-		audit_log_end(audit_buf);
+		(void)audit_log_end_status(audit_buf);
 	}
 
 	if (entry == NULL)
@@ -839,7 +839,7 @@ static void netlbl_unlabel_acceptflg_set(u8 value,
 	if (audit_buf != NULL) {
 		audit_log_format(audit_buf,
 				 " unlbl_accept=%u old=%u", value, old_val);
-		audit_log_end(audit_buf);
+		(void)audit_log_end_status(audit_buf);
 	}
 }
 

@@ -1303,7 +1303,8 @@ struct dst_entry *ip6_dst_lookup_flow_origin(
 }
 EXPORT_SYMBOL_GPL(ip6_dst_lookup_flow_origin);
 
-struct dst_entry *ip6_dst_lookup_flow(struct net *net, const struct sock *sk,
+struct dst_entry *ip6_dst_lookup_flow(
+				      struct net *net, const struct sock *sk,
 				      struct flowi6 *fl6,
 				      const struct in6_addr *final_dst)
 {
@@ -1341,7 +1342,12 @@ struct dst_entry *ip6_sk_dst_lookup_flow(struct sock *sk, struct flowi6 *fl6,
 	if (dst)
 		return dst;
 
-	dst = ip6_dst_lookup_flow(sock_net(sk), sk, fl6, final_dst);
+	{
+		struct xfrm_flow_origin origin = xfrm_flow_origin_sock(sk);
+
+		dst = ip6_dst_lookup_flow_origin(sock_net(sk), sk, fl6,
+						 final_dst, &origin);
+	}
 	if (connected && !IS_ERR(dst))
 		ip6_sk_dst_store_flow(sk, dst_clone(dst), fl6);
 

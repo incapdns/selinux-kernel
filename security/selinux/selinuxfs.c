@@ -817,7 +817,8 @@ static int selinux_ns_parent_authority_cred(
 				  PROCESS2__UNSHARE_SELINUXNS, NULL);
 }
 
-static int selinux_ns_parent_authority(struct selinux_ns_control *control)
+static __maybe_unused int selinux_ns_parent_authority(
+	struct selinux_ns_control *control)
 {
 	return selinux_ns_parent_authority_cred(control, current_cred());
 }
@@ -1217,7 +1218,7 @@ static long selinux_nsfd_activate_restore(struct selinux_ns_control *control,
 long selinux_ns_control_ioctl(struct selinux_ns_control *control,
 			      unsigned int cmd, unsigned long arg)
 {
-	int rc = selinux_ns_parent_authority(control);
+	int rc = selinux_ns_parent_authority_cred(control, current_cred());
 
 	if (rc)
 		return rc;

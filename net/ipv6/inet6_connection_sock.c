@@ -90,7 +90,12 @@ struct dst_entry *inet6_csk_route_socket(struct sock *sk,
 	final_p = fl6_update_dst(fl6, rcu_dereference(np->opt), &np->final);
 	rcu_read_unlock();
 
-	dst = ip6_dst_lookup_flow(sock_net(sk), sk, fl6, final_p);
+	{
+		struct xfrm_flow_origin origin = xfrm_flow_origin_sock(sk);
+
+		dst = ip6_dst_lookup_flow_origin(sock_net(sk), sk, fl6,
+						 final_p, &origin);
+	}
 
 	if (!IS_ERR(dst))
 		ip6_dst_store(sk, dst, false, false);

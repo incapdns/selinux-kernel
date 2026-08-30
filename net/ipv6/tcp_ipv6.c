@@ -285,7 +285,12 @@ static int tcp_v6_connect(struct sock *sk, struct sockaddr_unsized *uaddr,
 	 */
 	ip6_ecmp_set_mp_hash(net, fl6, sk->sk_txhash);
 
-	dst = ip6_dst_lookup_flow(net, sk, fl6, final_p);
+	{
+		struct xfrm_flow_origin origin = xfrm_flow_origin_sock(sk);
+
+		dst = ip6_dst_lookup_flow_origin(net, sk, fl6, final_p,
+						 &origin);
+	}
 	if (IS_ERR(dst)) {
 		err = PTR_ERR(dst);
 		goto failure;

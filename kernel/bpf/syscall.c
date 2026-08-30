@@ -2442,7 +2442,7 @@ static void bpf_audit_prog(const struct bpf_prog *prog, unsigned int op)
 		return;
 	audit_log_format(ab, "prog-id=%u op=%s",
 			 prog->aux->id, bpf_audit_str[op]);
-	audit_log_end(ab);
+	(void)audit_log_end_status(ab);
 }
 
 static int bpf_prog_alloc_id(struct bpf_prog *prog)

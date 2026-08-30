@@ -1171,7 +1171,12 @@ void ipv4_sk_update_pmtu(struct sk_buff *skb, struct sock *sk, u32 mtu)
 
 	rt = dst_rtable(odst);
 	if (READ_ONCE(odst->obsolete) && !odst->ops->check(odst, 0)) {
-		rt = ip_route_output_flow(sock_net(sk), &fl4, sk);
+		{
+			struct xfrm_flow_origin origin = xfrm_flow_origin_skb(skb);
+
+			rt = ip_route_output_flow_origin(sock_net(sk), &fl4, sk,
+							 &origin);
+		}
 		if (IS_ERR(rt))
 			goto out;
 
@@ -1184,7 +1189,12 @@ void ipv4_sk_update_pmtu(struct sk_buff *skb, struct sock *sk, u32 mtu)
 		if (new)
 			dst_release(&rt->dst);
 
-		rt = ip_route_output_flow(sock_net(sk), &fl4, sk);
+		{
+			struct xfrm_flow_origin origin = xfrm_flow_origin_skb(skb);
+
+			rt = ip_route_output_flow_origin(sock_net(sk), &fl4, sk,
+							 &origin);
+		}
 		if (IS_ERR(rt))
 			goto out;
 
@@ -2981,8 +2991,9 @@ struct rtable *ip_route_output_flow_origin(
 }
 EXPORT_SYMBOL_GPL(ip_route_output_flow_origin);
 
-struct rtable *ip_route_output_flow(struct net *net, struct flowi4 *flp4,
-				    const struct sock *sk)
+struct rtable *ip_route_output_flow(struct net *net,
+					     struct flowi4 *flp4,
+					     const struct sock *sk)
 {
 	struct xfrm_flow_origin origin = xfrm_flow_origin_sock(sk);
 

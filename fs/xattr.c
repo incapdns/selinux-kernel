@@ -226,10 +226,11 @@ __vfs_setxattr(struct mnt_idmap *idmap, struct dentry *dentry,
 EXPORT_SYMBOL(__vfs_setxattr);
 
 /**
- *  __vfs_setxattr_noperm - perform setxattr operation without performing
+ *  __vfs_setxattr_noperm_mnt - perform setxattr without permission checks
  *  permission checks.
  *
  *  @idmap: idmap of the mount the inode was found from
+ *  @mnt: mount selecting the LSM label view, or NULL for a raw object
  *  @dentry: object to perform setxattr on
  *  @name: xattr name to set
  *  @value: value to set @name to
@@ -242,9 +243,10 @@ EXPORT_SYMBOL(__vfs_setxattr);
  *  is executed. It also assumes that the caller will make the appropriate
  *  permission checks.
  */
-int __vfs_setxattr_noperm(struct mnt_idmap *idmap,
-			  struct dentry *dentry, const char *name,
-			  const void *value, size_t size, int flags)
+int __vfs_setxattr_noperm_mnt(struct mnt_idmap *idmap,
+			      const struct vfsmount *mnt,
+			      struct dentry *dentry, const char *name,
+			      const void *value, size_t size, int flags)
 {
 	struct inode *inode = dentry->d_inode;
 	int error = -EAGAIN;
@@ -258,7 +260,7 @@ int __vfs_setxattr_noperm(struct mnt_idmap *idmap,
 				       size, flags);
 		if (!error) {
 			fsnotify_xattr(dentry);
-			security_inode_post_setxattr(dentry, name, value,
+			security_inode_post_setxattr(mnt, dentry, name, value,
 						     size, flags);
 		}
 	} else {
@@ -279,6 +281,14 @@ int __vfs_setxattr_noperm(struct mnt_idmap *idmap,
 	}
 
 	return error;
+}
+
+int __vfs_setxattr_noperm(struct mnt_idmap *idmap,
+				   struct dentry *dentry, const char *name,
+				   const void *value, size_t size, int flags)
+{
+	return __vfs_setxattr_noperm_mnt(idmap, NULL, dentry, name, value,
+					 size, flags);
 }
 
 /**
@@ -322,8 +332,8 @@ int __vfs_setxattr_locked_mnt(struct mnt_idmap *idmap,
 	if (error)
 		goto out;
 
-	error = __vfs_setxattr_noperm(idmap, dentry, name, value,
-				      size, flags);
+	error = __vfs_setxattr_noperm_mnt(idmap, mnt, dentry, name, value,
+					  size, flags);
 
 out:
 	return security_inode_setxattr_plan_finish(plan, error);
@@ -631,7 +641,7 @@ int __vfs_removexattr_locked_mnt(struct mnt_idmap *idmap,
 		return error;
 
 	fsnotify_xattr(dentry);
-	security_inode_post_removexattr(dentry, name);
+	security_inode_post_removexattr(mnt, dentry, name);
 
 out:
 	return error;

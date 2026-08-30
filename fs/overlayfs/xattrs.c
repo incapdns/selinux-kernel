@@ -107,15 +107,17 @@ static bool ovl_can_list(struct super_block *sb, const char *s)
 
 ssize_t ovl_listxattr(struct dentry *dentry, char *list, size_t size)
 {
-	struct dentry *realdentry = ovl_dentry_real(dentry);
 	struct ovl_fs *ofs = OVL_FS(dentry->d_sb);
+	struct path realpath;
 	ssize_t res;
 	size_t len;
 	char *s;
 	size_t prefix_len, name_len;
 
+	ovl_path_real(dentry, &realpath);
 	with_ovl_creds(dentry->d_sb)
-		res = vfs_listxattr(realdentry, list, size);
+		res = vfs_listxattr_mnt(realpath.mnt, realpath.dentry,
+					   list, size);
 	if (res <= 0 || size == 0)
 		return res;
 

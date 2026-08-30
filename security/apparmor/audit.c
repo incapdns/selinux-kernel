@@ -149,7 +149,7 @@ void aa_audit_msg(int type, struct apparmor_audit_data *ad,
 		  void (*cb) (struct audit_buffer *, void *))
 {
 	ad->type = type;
-	common_lsm_audit(&ad->common, audit_pre, cb);
+	(void)common_lsm_audit_status(&ad->common, audit_pre, cb);
 }
 
 /**

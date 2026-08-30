@@ -326,11 +326,14 @@ static const char *ovl_get_link(struct dentry *dentry,
 				struct inode *inode,
 				struct delayed_call *done)
 {
+	struct path realpath;
+
 	if (!dentry)
 		return ERR_PTR(-ECHILD);
 
+	ovl_path_real(dentry, &realpath);
 	with_ovl_creds(dentry->d_sb)
-		return vfs_get_link(ovl_dentry_real(dentry), done);
+		return vfs_get_link_mnt(realpath.mnt, realpath.dentry, done);
 }
 
 #ifdef CONFIG_FS_POSIX_ACL

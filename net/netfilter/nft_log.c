@@ -42,7 +42,7 @@ static void nft_log_eval_audit(const struct nft_pktinfo *pkt)
 
 	audit_log_nf_skb(ab, skb, nft_pf(pkt));
 
-	audit_log_end(ab);
+	(void)audit_log_end_status(ab);
 }
 
 static void nft_log_eval(const struct nft_expr *expr,

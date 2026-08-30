@@ -1144,10 +1144,18 @@ selinux_test_net_provenance_alloc(
 {
 	struct selinux_net_provenance *provenance;
 	struct selinux_net_assertion *assertion;
+	struct selinux_global_sid_handle *sid_handle;
 	int rc;
 
-	assertion = selinux_net_assertion_alloc(label, sid, semantic_class,
-						source, 0, GFP_KERNEL);
+	sid_handle = global_sid_handle_get(sid);
+	if (IS_ERR(sid_handle)) {
+		KUNIT_FAIL(test, "network SID handle acquisition failed: %ld",
+			   PTR_ERR(sid_handle));
+		return NULL;
+	}
+	assertion = selinux_net_assertion_alloc_handle(
+		sid_handle, semantic_class, source, 0, GFP_KERNEL);
+	global_sid_handle_put(sid_handle);
 	if (IS_ERR(assertion)) {
 		KUNIT_FAIL(test, "network assertion allocation failed: %ld",
 			   PTR_ERR(assertion));
@@ -3016,6 +3024,7 @@ static void selinux_net_carrier_lifetime_test(struct kunit *test)
 	struct selinux_net_provenance __rcu *published;
 	struct selinux_net_provenance *provenance, *held;
 	struct selinux_net_assertion *assertion;
+	struct selinux_global_sid_handle *sid_handle;
 	struct selinux_label_domain *domain;
 	struct selinux_label_ref *label;
 	const struct selinux_label_view *view;
@@ -3041,9 +3050,12 @@ static void selinux_net_carrier_lifetime_test(struct kunit *test)
 	state->label_domain = domain;
 	label_refs = refcount_read(&label->refs);
 
-	assertion = selinux_net_assertion_alloc(
-		label, sid, SECCLASS_PACKET,
+	sid_handle = global_sid_handle_get(sid);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, sid_handle);
+	assertion = selinux_net_assertion_alloc_handle(
+		sid_handle, SECCLASS_PACKET,
 		SELINUX_NET_ASSERTION_SOURCE_SECMARK, 0, GFP_KERNEL);
+	global_sid_handle_put(sid_handle);
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, assertion);
 	rc = kunit_add_action_or_reset(test, selinux_test_net_assertion_put,
 				       assertion);
@@ -3111,7 +3123,7 @@ static void selinux_net_assertion_sid_lifetime_test(struct kunit *test)
 	struct selinux_global_sid_handle *producer, *stale;
 	struct selinux_net_assertion *assertion, *wrong;
 	struct selinux_label_domain *domain;
-	struct selinux_label_ref *canonical, *label, *wrong_label;
+	struct selinux_label_ref *canonical, *label;
 	struct selinux_state state;
 	u32 sid;
 	int rc;
@@ -3120,16 +3132,6 @@ static void selinux_net_assertion_sid_lifetime_test(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, domain);
 	label = selinux_test_global_label(test, &state, domain, context, &sid);
 	KUNIT_ASSERT_NOT_NULL(test, label);
-	wrong_label = global_sid_to_label_ref(SECINITSID_KERNEL);
-	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, wrong_label);
-	rc = kunit_add_action_or_reset(test, selinux_test_label_ref_put,
-				       wrong_label);
-	KUNIT_ASSERT_EQ(test, rc, 0);
-	wrong = selinux_net_assertion_alloc(
-		wrong_label, sid, SECCLASS_PACKET,
-		SELINUX_NET_ASSERTION_SOURCE_SOCKET, 0, GFP_KERNEL);
-	KUNIT_ASSERT_TRUE(test, IS_ERR(wrong));
-	KUNIT_EXPECT_EQ(test, PTR_ERR(wrong), -EINVAL);
 	wrong = selinux_net_assertion_alloc_handle(
 		NULL, SECCLASS_PACKET, SELINUX_NET_ASSERTION_SOURCE_SOCKET,
 		0, GFP_KERNEL);
@@ -3749,16 +3751,17 @@ static void selinux_global_sid_initial_alias_test(struct kunit *test)
 
 static void selinux_net_peersid_null_sentinel_test(struct kunit *test)
 {
+	struct selinux_global_sid_handle *handle;
 	struct selinux_state state;
 	u32 peer_sid = SECSID_WILD;
 
 	selinux_test_state_init(&state, 1);
 	smp_store_release(&state.initialized, true);
-	KUNIT_EXPECT_EQ(test,
-			security_net_peersid_resolve(&state, SECSID_NULL, 0,
-						    SECSID_NULL, &peer_sid),
-			0);
+	handle = security_net_peersid_resolve_handle(
+		&state, SECSID_NULL, 0, SECSID_NULL, &peer_sid);
+	KUNIT_EXPECT_FALSE(test, IS_ERR(handle));
 	KUNIT_EXPECT_EQ(test, peer_sid, (u32)SECSID_NULL);
+	global_sid_handle_put(handle);
 }
 
 static void selinux_prop_ref_scalar_metadata_lifetime_test(struct kunit *test)
@@ -4131,6 +4134,7 @@ static void selinux_netlbl_canonical_cache_test(struct kunit *test)
 
 	/* A captured source must outlive the parser-owned secattr/cache ref. */
 	{
+		struct selinux_global_sid_handle *source_handle;
 		struct selinux_netlbl_source source;
 
 		secattr = selinux_test_netlbl_cache_alloc(test, global_sid);
@@ -4144,10 +4148,13 @@ static void selinux_netlbl_canonical_cache_test(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, refcount_read(&label->refs),
 				baseline_refs + 1);
 		sid = SECSID_WILD;
-		KUNIT_EXPECT_EQ(test,
-				selinux_netlbl_source_sid(&first, &source, &sid),
-				0);
-		KUNIT_EXPECT_EQ(test, sid, global_sid);
+		source_handle = selinux_netlbl_source_sid_handle(
+			&first, &source, &sid);
+		KUNIT_EXPECT_NOT_ERR_OR_NULL(test, source_handle);
+		if (!IS_ERR_OR_NULL(source_handle)) {
+			KUNIT_EXPECT_EQ(test, sid, global_sid);
+			global_sid_handle_put(source_handle);
+		}
 		selinux_netlbl_source_put(&source);
 		KUNIT_EXPECT_PTR_EQ(test, source.cache, NULL);
 		KUNIT_EXPECT_EQ(test, source.type, (u32)NETLBL_NLTYPE_NONE);
@@ -4203,6 +4210,7 @@ static void selinux_netlbl_canonical_cache_test(struct kunit *test)
 		struct selinux_label_domain *child;
 		struct selinux_label_ref *child_label;
 		struct selinux_label_map *map;
+		struct selinux_global_sid_handle *sid_handle;
 		const struct selinux_label_view *view;
 		struct selinux_state child_state;
 		u32 child_sid;
@@ -4235,10 +4243,11 @@ static void selinux_netlbl_canonical_cache_test(struct kunit *test)
 		secattr = selinux_test_netlbl_cache_alloc(test, global_sid);
 		KUNIT_ASSERT_NOT_NULL(test, secattr);
 		sid = SECSID_WILD;
-		KUNIT_EXPECT_EQ(test,
-				security_netlbl_secattr_to_sid_view(
-					&child_state, view, secattr, &sid),
-				0);
+		sid_handle = security_netlbl_secattr_to_sid_view_handle(
+			&child_state, view, secattr, &sid);
+		KUNIT_EXPECT_NOT_ERR_OR_NULL(test, sid_handle);
+		if (!IS_ERR_OR_NULL(sid_handle))
+			global_sid_handle_put(sid_handle);
 		KUNIT_EXPECT_EQ(test, sid, child_sid);
 		kunit_release_action(test, selinux_test_netlbl_secattr_destroy,
 				     secattr);

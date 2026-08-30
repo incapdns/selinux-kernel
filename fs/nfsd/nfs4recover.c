@@ -161,7 +161,8 @@ nfsd4_create_clid_dir(struct nfs4_client *clp)
 		 * as well be forgiving and just succeed silently.
 		 */
 		goto out_end;
-	dentry = vfs_mkdir(&nop_mnt_idmap, d_inode(dir), dentry, 0700, NULL);
+	dentry = vfs_mkdir_mnt(&nop_mnt_idmap, nn->rec_file->f_path.mnt,
+			       d_inode(dir), dentry, 0700, NULL);
 	if (IS_ERR(dentry))
 		status = PTR_ERR(dentry);
 out_end:
@@ -268,7 +269,8 @@ nfsd4_unlink_clid_dir(char *name, struct nfsd_net *nn)
 	if (IS_ERR(dentry))
 		return PTR_ERR(dentry);
 
-	status = vfs_rmdir(&nop_mnt_idmap, d_inode(dir), dentry, NULL);
+	status = vfs_rmdir_mnt(&nop_mnt_idmap, nn->rec_file->f_path.mnt,
+			       d_inode(dir), dentry, NULL);
 	end_removing(dentry);
 	return status;
 }
@@ -356,7 +358,9 @@ purge_old(struct dentry *parent, char *cname, struct nfsd_net *nn)
 
 	child = start_removing_noperm(parent, &QSTR(cname));
 	if (!IS_ERR(child)) {
-		status = vfs_rmdir(&nop_mnt_idmap, d_inode(parent), child, NULL);
+		status = vfs_rmdir_mnt(&nop_mnt_idmap,
+				       nn->rec_file->f_path.mnt,
+				       d_inode(parent), child, NULL);
 		if (status)
 			printk("failed to remove client recovery directory %pd\n",
 			       child);

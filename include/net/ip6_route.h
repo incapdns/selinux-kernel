@@ -173,7 +173,8 @@ u32 rt6_multipath_hash(const struct net *net, const struct flowi6 *fl6,
 		       const struct sk_buff *skb, struct flow_keys *hkeys);
 
 struct xfrm_flow_origin;
-struct dst_entry *icmp6_dst_alloc(struct net_device *dev, struct flowi6 *fl6);
+struct dst_entry *icmp6_dst_alloc(struct net_device *dev,
+					   struct flowi6 *fl6);
 struct dst_entry *icmp6_dst_alloc_origin(
 	struct net_device *dev, struct flowi6 *fl6,
 	const struct xfrm_flow_origin *origin);

@@ -495,7 +495,7 @@ static int audit_log_config_change(char *function_name, u32 new, u32 old,
 	if (rc)
 		allow_changes = 0; /* Something weird, deny request */
 	audit_log_format(ab, " res=%d", allow_changes);
-	audit_log_end(ab);
+	(void)audit_log_end_status(ab);
 	return rc;
 }
 
@@ -1239,7 +1239,7 @@ static void audit_log_feature_change(int which, u32 old_feature, u32 new_feature
 	audit_log_format(ab, " feature=%s old=%u new=%u old_lock=%u new_lock=%u res=%d",
 			 audit_feature_names[which], !!old_feature, !!new_feature,
 			 !!old_lock, !!new_lock, res);
-	audit_log_end(ab);
+	(void)audit_log_end_status(ab);
 }
 
 static int audit_set_feature(struct audit_features *uaf)
@@ -1503,7 +1503,7 @@ static int audit_receive_msg(struct sk_buff *skb, struct nlmsghdr *nlh,
 					data_len--;
 				audit_log_n_untrustedstring(ab, str, data_len);
 			}
-			audit_log_end(ab);
+			(void)audit_log_end_status(ab);
 		}
 		break;
 	case AUDIT_ADD_RULE:
@@ -1517,7 +1517,7 @@ static int audit_receive_msg(struct sk_buff *skb, struct nlmsghdr *nlh,
 					 msg_type == AUDIT_ADD_RULE ?
 						"add_rule" : "remove_rule",
 					 audit_enabled);
-			audit_log_end(ab);
+			(void)audit_log_end_status(ab);
 			return -EPERM;
 		}
 		err = audit_rule_change(msg_type, seq, data, data_len);
@@ -1532,7 +1532,7 @@ static int audit_receive_msg(struct sk_buff *skb, struct nlmsghdr *nlh,
 		audit_log_common_recv_msg(audit_context(), &ab,
 					  AUDIT_CONFIG_CHANGE);
 		audit_log_format(ab, " op=trim res=1");
-		audit_log_end(ab);
+		(void)audit_log_end_status(ab);
 		break;
 	case AUDIT_MAKE_EQUIV: {
 		void *bufp = data;
@@ -1569,7 +1569,7 @@ static int audit_receive_msg(struct sk_buff *skb, struct nlmsghdr *nlh,
 		audit_log_format(ab, " new=");
 		audit_log_untrustedstring(ab, new);
 		audit_log_format(ab, " res=%d", !err);
-		audit_log_end(ab);
+		(void)audit_log_end_status(ab);
 		kfree(old);
 		kfree(new);
 		break;
@@ -1652,7 +1652,7 @@ static int audit_receive_msg(struct sk_buff *skb, struct nlmsghdr *nlh,
 				 " old-log_passwd=%d new-log_passwd=%d res=%d",
 				 old.enabled, s.enabled, old.log_passwd,
 				 s.log_passwd, !err);
-		audit_log_end(ab);
+		(void)audit_log_end_status(ab);
 		break;
 	}
 	default:
@@ -1742,7 +1742,7 @@ static void audit_log_multicast(int group, const char *op, int err)
 	audit_log_untrustedstring(ab, get_task_comm(comm, current));
 	audit_log_d_path_exe(ab, current->mm); /* exe= */
 	audit_log_format(ab, " nl-mcgrp=%d op=%s res=%d", group, op, !err);
-	audit_log_end(ab);
+	(void)audit_log_end_status(ab);
 }
 
 /* Run custom bind function on netlink socket group connect or bind requests. */
@@ -2589,7 +2589,7 @@ void audit_log_path_denied(int type, const char *operation)
 	audit_log_format(ab, "op=%s", operation);
 	audit_log_task_info(ab);
 	audit_log_format(ab, " res=0");
-	audit_log_end(ab);
+	(void)audit_log_end_status(ab);
 }
 
 int audit_log_nf_skb(struct audit_buffer *ab,
@@ -2795,7 +2795,7 @@ static void audit_log_set_loginuid(kuid_t koldloginuid, kuid_t kloginuid,
 			 oldloginuid, loginuid, tty ? tty_name(tty) : "(none)",
 			 oldsessionid, sessionid, !rc);
 	audit_put_tty(tty);
-	audit_log_end(ab);
+	(void)audit_log_end_status(ab);
 }
 
 /**
@@ -3040,7 +3040,7 @@ void audit_log(struct audit_context *ctx, gfp_t gfp_mask, int type,
 		va_start(args, fmt);
 		audit_log_vformat(ab, fmt, args);
 		va_end(args);
-		audit_log_end(ab);
+		(void)audit_log_end_status(ab);
 	}
 }
 

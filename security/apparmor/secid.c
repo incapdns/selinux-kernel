@@ -101,9 +101,12 @@ static int apparmor_label_to_secctx(struct aa_label *label,
 
 int apparmor_secid_to_secctx(u32 secid, struct lsm_context *cp)
 {
-	struct aa_label *label = aa_secid_to_label(secid);
+	struct aa_label *label = aa_secid_to_label_ref(secid);
+	int ret;
 
-	return apparmor_label_to_secctx(label, cp);
+	ret = apparmor_label_to_secctx(label, cp);
+	aa_put_label(label);
+	return ret;
 }
 
 int apparmor_lsmprop_to_secctx(const struct lsm_prop *prop,

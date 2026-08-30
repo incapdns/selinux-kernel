@@ -492,7 +492,11 @@ int __ip_queue_xmit(struct sock *sk, struct sk_buff *skb, struct flowi *fl,
 		 * keep trying until route appears or the connection times
 		 * itself out.
 		 */
-		rt = ip_route_output_flow(net, fl4, sk);
+		{
+			struct xfrm_flow_origin origin = xfrm_flow_origin_skb(skb);
+
+			rt = ip_route_output_flow_origin(net, fl4, sk, &origin);
+		}
 		if (IS_ERR(rt))
 			goto no_route;
 		sk_setup_caps(sk, &rt->dst);

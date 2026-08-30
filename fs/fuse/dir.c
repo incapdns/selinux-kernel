@@ -513,7 +513,8 @@ static struct vfsmount *fuse_dentry_automount(struct path *path)
 	struct vfsmount *mnt;
 	struct fuse_inode *mp_fi = get_fuse_inode(d_inode(path->dentry));
 
-	fsc = fs_context_for_submount(path->mnt->mnt_sb->s_type, path);
+	fsc = fs_context_for_submount_cred(path->mnt->mnt_sb->s_type, path,
+					   current_cred());
 	if (IS_ERR(fsc))
 		return ERR_CAST(fsc);
 

@@ -2594,7 +2594,7 @@ int dquot_quota_on_mount(struct super_block *sb, char *qf_name,
 	 * legacy NULL-view call explicit: a namespaced LSM must fail closed rather
 	 * than infer a mount from the dentry or reinterpret a derived view.
 	 */
-	error = security_quota_on(dentry);
+	error = security_quota_on_mnt(NULL, dentry);
 	if (!error)
 		error = dquot_load_quota_inode(d_inode(dentry), type, format_id,
 				DQUOT_USAGE_ENABLED | DQUOT_LIMITS_ENABLED);

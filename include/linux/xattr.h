@@ -88,8 +88,11 @@ ssize_t vfs_listxattr_mnt(const struct vfsmount *mnt, struct dentry *d,
 			  char *list, size_t size);
 int __vfs_setxattr(struct mnt_idmap *, struct dentry *, struct inode *,
 		   const char *, const void *, size_t, int);
+int __vfs_setxattr_noperm_mnt(struct mnt_idmap *, const struct vfsmount *,
+			      struct dentry *, const char *, const void *,
+			      size_t, int);
 int __vfs_setxattr_noperm(struct mnt_idmap *, struct dentry *,
-			  const char *, const void *, size_t, int);
+				   const char *, const void *, size_t, int);
 int __vfs_setxattr_locked(struct mnt_idmap *, struct dentry *,
 			  const char *, const void *, size_t, int,
 			  struct delegated_inode *);

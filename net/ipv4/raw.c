@@ -633,7 +633,11 @@ static int raw_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 	}
 
 	security_sk_classify_flow(sk, flowi4_to_flowi_common(&fl4));
-	rt = ip_route_output_flow(net, &fl4, sk);
+	{
+		struct xfrm_flow_origin origin = xfrm_flow_origin_sock(sk);
+
+		rt = ip_route_output_flow_origin(net, &fl4, sk, &origin);
+	}
 	if (IS_ERR(rt)) {
 		err = PTR_ERR(rt);
 		rt = NULL;

@@ -472,7 +472,8 @@ int sel_netnode_sid(struct selinux_state *state, const void *addr, u16 family,
 			continue;
 		if (rc)
 			return rc;
-		rc = sel_netnode_sid_snapshot(state, &snapshot, addr, family, sid);
+		rc = sel_netnode_sid_snapshot(state, &snapshot, addr, family,
+					       sid);
 		if (rc != -ESTALE)
 			return rc;
 	}

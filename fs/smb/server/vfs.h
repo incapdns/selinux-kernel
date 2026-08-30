@@ -100,13 +100,13 @@ int ksmbd_vfs_copy_file_ranges(struct ksmbd_work *work,
 			       unsigned int *chunk_count_written,
 			       unsigned int *chunk_size_written,
 			       loff_t  *total_size_written);
-ssize_t ksmbd_vfs_listxattr(struct dentry *dentry, char **list);
+ssize_t ksmbd_vfs_listxattr(const struct path *path, char **list);
 ssize_t ksmbd_vfs_getxattr(struct mnt_idmap *idmap,
-			   struct dentry *dentry,
+			   const struct path *path,
 			   char *xattr_name,
 			   char **xattr_buf);
 ssize_t ksmbd_vfs_casexattr_len(struct mnt_idmap *idmap,
-				struct dentry *dentry, char *attr_name,
+				const struct path *path, char *attr_name,
 				int attr_name_len);
 int ksmbd_vfs_setxattr(struct mnt_idmap *idmap,
 		       const struct path *path, const char *attr_name,
@@ -154,14 +154,14 @@ int ksmbd_vfs_set_sd_xattr(struct ksmbd_conn *conn,
 			   bool get_write);
 int ksmbd_vfs_get_sd_xattr(struct ksmbd_conn *conn,
 			   struct mnt_idmap *idmap,
-			   struct dentry *dentry,
+			   const struct path *path,
 			   struct smb_ntsd **pntsd);
 int ksmbd_vfs_set_dos_attrib_xattr(struct mnt_idmap *idmap,
 				   const struct path *path,
 				   struct xattr_dos_attrib *da,
 				   bool get_write);
 int ksmbd_vfs_get_dos_attrib_xattr(struct mnt_idmap *idmap,
-				   struct dentry *dentry,
+				   const struct path *path,
 				   struct xattr_dos_attrib *da);
 int ksmbd_vfs_set_init_posix_acl(struct mnt_idmap *idmap,
 				 const struct path *path);

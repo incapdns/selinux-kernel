@@ -174,7 +174,8 @@ static inline int selinux_netlbl_skbuff_get_source_view(
 	const struct selinux_label_view *view,
 	struct selinux_netlbl_source *source, u32 *sid)
 {
-	return selinux_netlbl_skbuff_get_source(skb, family, state, source, sid);
+	return selinux_netlbl_skbuff_get_source(
+		skb, family, state, source, sid);
 }
 #ifdef CONFIG_SECURITY_SELINUX_NS
 static inline struct selinux_global_sid_handle *

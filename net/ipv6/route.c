@@ -3371,7 +3371,8 @@ out:
 	return dst;
 }
 
-struct dst_entry *icmp6_dst_alloc(struct net_device *dev, struct flowi6 *fl6)
+struct dst_entry *icmp6_dst_alloc(struct net_device *dev,
+					   struct flowi6 *fl6)
 {
 	struct xfrm_flow_origin origin = xfrm_flow_origin_none();
 

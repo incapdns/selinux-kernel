@@ -2686,7 +2686,7 @@ static int smb2_set_ea(struct smb2_ea_info *eabuf, unsigned int buf_len,
 
 		if (!eabuf->EaValueLength) {
 			rc = ksmbd_vfs_casexattr_len(idmap,
-						     path->dentry,
+						     path,
 						     attr_name,
 						     XATTR_USER_PREFIX_LEN +
 						     eabuf->EaNameLength);
@@ -2763,7 +2763,7 @@ static noinline int smb2_set_stream_name_xattr(const struct path *path,
 
 	/* Check if there is stream prefix in xattr space */
 	rc = ksmbd_vfs_casexattr_len(idmap,
-				     path->dentry,
+				     path,
 				     xattr_stream_name,
 				     xattr_stream_size);
 	if (rc >= 0)
@@ -2787,7 +2787,7 @@ static int smb2_remove_smb_xattrs(const struct path *path)
 	ssize_t xattr_list_len;
 	int err = 0;
 
-	xattr_list_len = ksmbd_vfs_listxattr(path->dentry, &xattr_list);
+	xattr_list_len = ksmbd_vfs_listxattr(path, &xattr_list);
 	if (xattr_list_len < 0) {
 		goto out;
 	} else if (!xattr_list_len) {
@@ -2868,7 +2868,7 @@ static void smb2_update_xattrs(struct ksmbd_tree_connect *tcon,
 		return;
 
 	rc = ksmbd_vfs_get_dos_attrib_xattr(mnt_idmap(path->mnt),
-					    path->dentry, &da);
+					    path, &da);
 	if (rc > 0) {
 		fp->f_ci->m_fattr = cpu_to_le32(da.attr);
 		fp->create_time = da.create_time;
@@ -5167,7 +5167,7 @@ static int smb2_get_ea(struct ksmbd_work *work, struct ksmbd_file *fp,
 	if (buf_free_len < 0)
 		return -EINVAL;
 
-	rc = ksmbd_vfs_listxattr(path->dentry, &xattr_list);
+	rc = ksmbd_vfs_listxattr(path, &xattr_list);
 	if (rc < 0) {
 		rsp->hdr.Status = STATUS_INVALID_HANDLE;
 		goto out;
@@ -5217,7 +5217,7 @@ static int smb2_get_ea(struct ksmbd_work *work, struct ksmbd_file *fp,
 		buf_free_len -= (offsetof(struct smb2_ea_info, name) +
 				name_len + 1);
 		/* bailout if xattr can't fit in buf_free_len */
-		value_len = ksmbd_vfs_getxattr(idmap, path->dentry,
+		value_len = ksmbd_vfs_getxattr(idmap, path,
 					       name, &buf);
 		if (value_len <= 0) {
 			rc = -ENOENT;
@@ -5506,7 +5506,7 @@ static int get_file_stream_info(struct ksmbd_work *work,
 	if (buf_free_len < 0)
 		goto out;
 
-	xattr_list_len = ksmbd_vfs_listxattr(path->dentry, &xattr_list);
+	xattr_list_len = ksmbd_vfs_listxattr(path, &xattr_list);
 	if (xattr_list_len < 0) {
 		goto out;
 	} else if (!xattr_list_len) {
@@ -6230,7 +6230,7 @@ static int smb2_get_info_sec(struct ksmbd_work *work,
 	if (test_share_config_flag(work->tcon->share_conf,
 				   KSMBD_SHARE_FLAG_ACL_XATTR))
 		ppntsd_size = ksmbd_vfs_get_sd_xattr(work->conn, idmap,
-						     fp->filp->f_path.dentry,
+						     &fp->filp->f_path,
 						     &ppntsd);
 
 	/* Check if sd buffer size exceeds response buffer size */
@@ -8824,7 +8824,7 @@ static inline int fsctl_set_sparse(struct ksmbd_work *work, u64 id,
 		struct xattr_dos_attrib da;
 
 		ret = ksmbd_vfs_get_dos_attrib_xattr(idmap,
-						     fp->filp->f_path.dentry, &da);
+						     &fp->filp->f_path, &da);
 		if (ret <= 0)
 			goto out;
 

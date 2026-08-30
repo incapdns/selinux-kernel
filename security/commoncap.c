@@ -432,17 +432,15 @@ int cap_inode_getsecurity(struct mnt_idmap *idmap,
 	struct dentry *dentry;
 	struct user_namespace *fs_ns;
 
-	/* Capability xattr conversion is selected by @idmap, not an LSM view. */
-	(void)mnt;
-
 	if (strcmp(name, "capability") != 0)
 		return -EOPNOTSUPP;
 
 	dentry = d_find_any_alias(inode);
 	if (!dentry)
 		return -EINVAL;
-	size = vfs_getxattr_alloc(idmap, dentry, XATTR_NAME_CAPS, &tmpbuf,
-				  sizeof(struct vfs_ns_cap_data), GFP_NOFS);
+	size = vfs_getxattr_alloc_mnt(idmap, mnt, dentry, XATTR_NAME_CAPS,
+				      &tmpbuf, sizeof(struct vfs_ns_cap_data),
+				      GFP_NOFS);
 	dput(dentry);
 	/* gcc11 complains if we don't check for !tmpbuf */
 	if (size < 0 || !tmpbuf)

@@ -5335,17 +5335,24 @@ static int cgroup_procs_show(struct seq_file *s, void *v)
 static int cgroup_may_write(const struct cgroup *cgrp, struct super_block *sb,
 			    const struct vfsmount *mnt)
 {
+	struct dentry *dentry;
 	int ret;
-	struct inode *inode;
 
 	lockdep_assert_held(&cgroup_mutex);
 
-	inode = kernfs_get_inode(sb, cgrp->procs_file.kn);
-	if (!inode)
-		return -ENOMEM;
+	/*
+	 * Obtain the cgroup.procs inode through its dentry so LSMs which label
+	 * kernfs objects by genfs path can initialize the inode before the
+	 * permission check.  kernfs_get_inode() alone can create an unhashed
+	 * inode which has no path from which to derive that label.
+	 */
+	dentry = kernfs_node_dentry(cgrp->procs_file.kn, sb);
+	if (IS_ERR(dentry))
+		return PTR_ERR(dentry);
 
-	ret = inode_permission_mnt(&nop_mnt_idmap, mnt, inode, MAY_WRITE);
-	iput(inode);
+	ret = inode_permission_mnt(&nop_mnt_idmap, mnt, d_inode(dentry),
+				   MAY_WRITE);
+	dput(dentry);
 	return ret;
 }
 

@@ -663,7 +663,8 @@ int inode_permission_mnt(struct mnt_idmap *idmap, const struct vfsmount *mnt,
 }
 EXPORT_SYMBOL(inode_permission_mnt);
 
-int inode_permission(struct mnt_idmap *idmap, struct inode *inode, int mask)
+int inode_permission(struct mnt_idmap *idmap, struct inode *inode,
+			      int mask)
 {
 	return inode_permission_mnt(idmap, NULL, inode, mask);
 }
@@ -3267,7 +3268,8 @@ struct dentry *lookup_one_unlocked_mnt(struct mnt_idmap *idmap,
 EXPORT_SYMBOL(lookup_one_unlocked_mnt);
 
 /* Legacy inode-only interface; namespaced LSMs fail closed if ambiguous. */
-struct dentry *lookup_one_unlocked(struct mnt_idmap *idmap, struct qstr *name,
+struct dentry *lookup_one_unlocked(struct mnt_idmap *idmap,
+				    struct qstr *name,
 				   struct dentry *base)
 {
 	return lookup_one_unlocked_mnt(idmap, NULL, name, base);
@@ -3468,7 +3470,8 @@ struct dentry *start_creating_mnt(struct mnt_idmap *idmap,
 EXPORT_SYMBOL(start_creating_mnt);
 
 /* Legacy inode-only interface; namespaced LSMs fail closed if ambiguous. */
-struct dentry *start_creating(struct mnt_idmap *idmap, struct dentry *parent,
+struct dentry *start_creating(struct mnt_idmap *idmap,
+			       struct dentry *parent,
 			      struct qstr *name)
 {
 	return start_creating_mnt(idmap, NULL, parent, name);
@@ -3505,7 +3508,8 @@ struct dentry *start_removing_mnt(struct mnt_idmap *idmap,
 EXPORT_SYMBOL(start_removing_mnt);
 
 /* Legacy inode-only interface; namespaced LSMs fail closed if ambiguous. */
-struct dentry *start_removing(struct mnt_idmap *idmap, struct dentry *parent,
+struct dentry *start_removing(struct mnt_idmap *idmap,
+			       struct dentry *parent,
 			      struct qstr *name)
 {
 	return start_removing_mnt(idmap, NULL, parent, name);
@@ -4340,7 +4344,8 @@ out_plan:
 }
 EXPORT_SYMBOL(vfs_create_mnt);
 
-int vfs_create(struct mnt_idmap *idmap, struct dentry *dentry, umode_t mode,
+int vfs_create(struct mnt_idmap *idmap, struct dentry *dentry,
+			umode_t mode,
 	       struct delegated_inode *di)
 {
 	return vfs_create_mnt(idmap, NULL, dentry, mode, di);
@@ -4464,7 +4469,7 @@ static int handle_truncate(struct mnt_idmap *idmap, struct file *filp)
 
 	error = security_file_truncate(filp);
 	if (!error) {
-		error = do_truncate(idmap, path->dentry, 0,
+		error = do_truncate_mnt(idmap, path->mnt, path->dentry, 0,
 				    ATTR_MTIME|ATTR_CTIME|ATTR_OPEN,
 				    filp);
 	}
@@ -6678,7 +6683,8 @@ const char *vfs_get_link_mnt(const struct vfsmount *mnt,
 }
 EXPORT_SYMBOL(vfs_get_link_mnt);
 
-const char *vfs_get_link(struct dentry *dentry, struct delayed_call *done)
+const char *vfs_get_link(struct dentry *dentry,
+				  struct delayed_call *done)
 {
 	return vfs_get_link_mnt(NULL, dentry, done);
 }

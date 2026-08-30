@@ -83,7 +83,7 @@ int ovl_copy_xattr(struct super_block *sb, const struct path *oldpath, struct de
 	if (!old->d_inode->i_op->listxattr || !new->d_inode->i_op->listxattr)
 		return 0;
 
-	list_size = vfs_listxattr(old, NULL, 0);
+	list_size = vfs_listxattr_mnt(oldpath->mnt, old, NULL, 0);
 	if (list_size <= 0) {
 		if (list_size == -EOPNOTSUPP)
 			return 0;
@@ -94,7 +94,7 @@ int ovl_copy_xattr(struct super_block *sb, const struct path *oldpath, struct de
 	if (!buf)
 		return -ENOMEM;
 
-	list_size = vfs_listxattr(old, buf, list_size);
+	list_size = vfs_listxattr_mnt(oldpath->mnt, old, buf, list_size);
 	if (list_size <= 0) {
 		error = list_size;
 		goto out;
@@ -113,7 +113,7 @@ int ovl_copy_xattr(struct super_block *sb, const struct path *oldpath, struct de
 		if (ovl_is_private_xattr(sb, name))
 			continue;
 
-		error = security_inode_copy_up_xattr(old, name);
+		error = security_inode_copy_up_xattr(oldpath->mnt, old, name);
 		if (error == -ECANCELED) {
 			error = 0;
 			continue; /* Discard */

@@ -119,6 +119,11 @@
 
 #define SELINUX_INODE_INIT_XATTRS 1
 
+#ifdef CONFIG_SECURITY_SELINUX_NS
+DEFINE_FREE(selinux_sid_handle, struct selinux_global_sid_handle *,
+	    if (!IS_ERR_OR_NULL(_T)) global_sid_handle_put(_T))
+#endif
+
 /* SECMARK reference count */
 static atomic_t selinux_secmark_refcount = ATOMIC_INIT(0);
 
@@ -4554,7 +4559,8 @@ static int bpf_fd_pass_add(
 #endif
 static int selinux_bpf_link_access_cred(const struct cred *cred,
 					struct bpf_link *link, enum bpf_cmd cmd);
-static int selinux_bpf_link_access(struct bpf_link *link, enum bpf_cmd cmd);
+static int selinux_bpf_link_access(struct bpf_link *link,
+					    enum bpf_cmd cmd);
 static u32 selinux_bpf_link_cmd_perm(enum bpf_cmd cmd);
 static int selinux_bpf_btf_cred(const struct cred *cred,
 				const struct btf *btf);
@@ -5678,9 +5684,9 @@ static inline int may_rename(const struct vfsmount *old_mnt,
 
 /* Check whether a task can perform a filesystem operation. */
 static int superblock_has_perm(const struct cred *cred,
-			       const struct super_block *sb,
-			       u32 perms,
-			       struct common_audit_data *ad)
+					const struct super_block *sb,
+					u32 perms,
+					struct common_audit_data *ad)
 {
 	struct superblock_security_struct *sbsec;
 
@@ -6240,7 +6246,13 @@ static int selinux_quotactl(int cmds, int type, int id, const struct super_block
 	case Q_XQUOTAOFF:
 	case Q_XQUOTAON:
 	case Q_XSETQLIM:
-		rc = superblock_has_perm(cred, sb, FILESYSTEM__QUOTAMOD, NULL);
+#ifdef CONFIG_SECURITY_SELINUX_NS
+		rc = superblock_has_perm_mnt(
+			cred, sb, NULL, FILESYSTEM__QUOTAMOD, NULL);
+#else
+		rc = superblock_has_perm(
+			cred, sb, FILESYSTEM__QUOTAMOD, NULL);
+#endif
 		break;
 	case Q_GETFMT:
 	case Q_GETINFO:
@@ -6249,7 +6261,13 @@ static int selinux_quotactl(int cmds, int type, int id, const struct super_block
 	case Q_XGETQSTAT:
 	case Q_XGETQSTATV:
 	case Q_XGETNEXTQUOTA:
-		rc = superblock_has_perm(cred, sb, FILESYSTEM__QUOTAGET, NULL);
+#ifdef CONFIG_SECURITY_SELINUX_NS
+		rc = superblock_has_perm_mnt(
+			cred, sb, NULL, FILESYSTEM__QUOTAGET, NULL);
+#else
+		rc = superblock_has_perm(
+			cred, sb, FILESYSTEM__QUOTAGET, NULL);
+#endif
 		break;
 	default:
 		rc = 0;  /* let the kernel handle invalid cmds */
@@ -7280,7 +7298,8 @@ static int selinux_sb_kern_mount(const struct super_block *sb,
 	ad.u.dentry = sb->s_root;
 #ifdef CONFIG_SECURITY_SELINUX_NS
 	if (!opts || !opts->observer_control)
-		return superblock_has_perm(cred, sb, FILESYSTEM__MOUNT, &ad);
+		return superblock_has_perm_mnt(
+			cred, sb, NULL, FILESYSTEM__MOUNT, &ad);
 	if (opts->actor != cred)
 		return -EXDEV;
 	control = opts->observer_control;
@@ -7474,7 +7493,8 @@ static int selinux_sb_statfs(struct dentry *dentry,
 	return superblock_has_perm_mnt(cred, dentry->d_sb, mnt,
 				       FILESYSTEM__GETATTR, &ad);
 #else
-	return superblock_has_perm(cred, dentry->d_sb, FILESYSTEM__GETATTR, &ad);
+	return superblock_has_perm(
+		cred, dentry->d_sb, FILESYSTEM__GETATTR, &ad);
 #endif
 }
 
@@ -7492,8 +7512,8 @@ static int selinux_mount(const char *dev_name,
 			cred, path->dentry->d_sb, path->mnt,
 			FILESYSTEM__REMOUNT, NULL);
 #else
-		return superblock_has_perm(cred, path->dentry->d_sb,
-					   FILESYSTEM__REMOUNT, NULL);
+		return superblock_has_perm(
+			cred, path->dentry->d_sb, FILESYSTEM__REMOUNT, NULL);
 #endif
 	else
 		return path_has_perm(cred, path, FILE__MOUNTON);
@@ -7515,7 +7535,8 @@ static int selinux_umount(struct vfsmount *mnt, int flags)
 	return superblock_has_perm_mnt(cred, mnt->mnt_sb, mnt,
 				       FILESYSTEM__UNMOUNT, NULL);
 #else
-	return superblock_has_perm(cred, mnt->mnt_sb, FILESYSTEM__UNMOUNT, NULL);
+	return superblock_has_perm(
+		cred, mnt->mnt_sb, FILESYSTEM__UNMOUNT, NULL);
 #endif
 }
 
@@ -9662,7 +9683,7 @@ static void selinux_audit_setxattr_invalid_context(const void *value,
 		audit_log_n_untrustedstring(ab, value, audit_size);
 	else
 		audit_log_format(ab, "(null)");
-	audit_log_end(ab);
+	(void)audit_log_end_status(ab);
 }
 
 static struct selinux_inode_relabel_marker *
@@ -10599,7 +10620,7 @@ static int selinux_inode_setxattr(struct mnt_idmap *idmap,
 				return rc;
 			audit_log_format(ab, "op=setxattr invalid_context=");
 			audit_log_n_untrustedstring(ab, value, audit_size);
-			audit_log_end(ab);
+			(void)audit_log_end_status(ab);
 
 			return rc;
 		}
@@ -10650,9 +10671,9 @@ static int selinux_inode_remove_acl(struct mnt_idmap *idmap,
 	return dentry_has_perm_mnt(current_cred(), mnt, dentry, FILE__SETATTR);
 }
 
-static void selinux_inode_post_setxattr(struct dentry *dentry, const char *name,
-					const void *value, size_t size,
-					int flags)
+static void selinux_inode_post_setxattr(const struct vfsmount *mnt,
+					struct dentry *dentry, const char *name,
+					const void *value, size_t size, int flags)
 {
 	struct inode *inode = d_backing_inode(dentry);
 	struct inode_security_struct *isec;
@@ -10671,7 +10692,9 @@ static void selinux_inode_post_setxattr(struct dentry *dentry, const char *name,
 		struct inode_security_struct *inode_isec = selinux_inode(inode);
 		int commit_rc;
 
-		if (!plan || plan->inode != inode || value != plan->xattr_value ||
+		if (!plan || !mnt ||
+		    plan->view != selinux_mnt_label_view(mnt) ||
+		    plan->inode != inode || value != plan->xattr_value ||
 		    size != plan->xattr_value_len || flags != plan->flags ||
 		    plan->committed) {
 			spin_lock(&inode_isec->lock);
@@ -10834,8 +10857,9 @@ static int selinux_path_notify(const struct path *path, u64 mask,
 			current_cred(), path->dentry->d_sb, path->mnt,
 			FILESYSTEM__WATCH, &ad);
 #else
-		ret = superblock_has_perm(current_cred(), path->dentry->d_sb,
-						FILESYSTEM__WATCH, &ad);
+		ret = superblock_has_perm(
+			current_cred(), path->dentry->d_sb,
+			FILESYSTEM__WATCH, &ad);
 #endif
 		if (ret)
 			return ret;
@@ -11763,8 +11787,11 @@ out_src:
 	return 0;
 }
 
-static int selinux_inode_copy_up_xattr(struct dentry *dentry, const char *name)
+static int selinux_inode_copy_up_xattr(const struct vfsmount *src_mnt,
+				       struct dentry *dentry, const char *name)
 {
+	/* Filtering this well-known xattr is independent of the source view. */
+	(void)src_mnt;
 	/* The copy_up hook above sets the initial context on an inode, but we
 	 * don't then want to overwrite it by blindly copying all the lower
 	 * xattrs up.  Instead, filter out SELinux-related xattrs following
@@ -12989,6 +13016,7 @@ static int selinux_task_alloc(struct task_struct *task,
 	const struct cred *cred = current_cred();
 	struct task_security_struct *old_tsec = selinux_task(current);
 	struct task_security_struct *new_tsec = selinux_task(task);
+	int rc;
 
 	*new_tsec = *old_tsec;
 #ifdef CONFIG_SECURITY_SELINUX_NS
@@ -12999,8 +13027,8 @@ static int selinux_task_alloc(struct task_struct *task,
 	new_tsec->create_plan_kunit_force = false;
 #endif
 #endif
-	return cred_self_has_perm(cred, SECCLASS_PROCESS,
-				  PROCESS__FORK, NULL);
+	rc = cred_self_has_perm(cred, SECCLASS_PROCESS, PROCESS__FORK, NULL);
+	return rc;
 }
 
 static void selinux_task_free(struct task_struct *task)
@@ -13036,6 +13064,7 @@ static int selinux_cred_prepare(struct cred *new, const struct cred *old,
 {
 	const struct cred_security_struct *old_crsec = selinux_cred(old);
 	struct cred_security_struct *crsec = selinux_cred(new);
+	int rc;
 
 
 	*crsec = *old_crsec;
@@ -13046,7 +13075,8 @@ static int selinux_cred_prepare(struct cred *new, const struct cred *old,
 	if (old_crsec->parent_cred)
 		crsec->parent_cred = get_cred(old_crsec->parent_cred);
 #ifdef CONFIG_SECURITY_SELINUX_NS
-	return selinux_cred_sid_handles_dup(crsec, old_crsec);
+	rc = selinux_cred_sid_handles_dup(crsec, old_crsec);
+	return rc;
 #else
 	return 0;
 #endif
@@ -13083,7 +13113,9 @@ static void selinux_cred_getlsmprop(const struct cred *c, struct lsm_prop *prop)
 	prop->selinux.secid = cred_sid(c);
 }
 
-static int selinux_kernel_act_as(struct cred *new, u32 secid);
+static int __maybe_unused selinux_kernel_act_as(struct cred *new,
+							  u32 secid);
+static int selinux_kernel_act_as_sid(struct cred *new, u32 secid);
 
 static int selinux_prop_ref_publish(struct lsm_prop_ref *ref, u32 sid)
 {
@@ -13606,7 +13638,7 @@ static int selinux_kernel_act_as_ref(struct cred *new,
 		newsec, SELINUX_CRED_SOCKCREATE_SID, NULL));
 	return 0;
 #else
-	return selinux_kernel_act_as(new, rsec->sid);
+	return selinux_kernel_act_as_sid(new, rsec->sid);
 #endif
 }
 
@@ -13614,7 +13646,7 @@ static int selinux_kernel_act_as_ref(struct cred *new,
  * set the security data for a kernel service
  * - all the creation contexts are set to unlabelled
  */
-static int selinux_kernel_act_as(struct cred *new, u32 secid)
+static int selinux_kernel_act_as_sid(struct cred *new, u32 secid)
 {
 	struct cred_security_struct *crsec = selinux_cred(new);
 	int ret;
@@ -13641,6 +13673,12 @@ static int selinux_kernel_act_as(struct cred *new, u32 secid)
 #endif
 	}
 	return ret;
+}
+
+static int __maybe_unused selinux_kernel_act_as(struct cred *new,
+							  u32 secid)
+{
+	return selinux_kernel_act_as_sid(new, secid);
 }
 
 /*
@@ -14191,12 +14229,23 @@ static int __selinux_peer_sources_capture(
 	const struct selinux_label_view *view,
 	struct selinux_peer_sources *sources, bool allow_egress_xfrm)
 {
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	struct selinux_global_sid_handle *seed_handle;
+#endif
 	int err;
 	u32 seed_sid;
 
 	selinux_peer_sources_init(sources);
+#ifdef CONFIG_SECURITY_SELINUX_NS
+	seed_handle = selinux_netlbl_skbuff_get_source_view_handle(
+		skb, family, state, view, &sources->netlabel, &seed_sid);
+	err = IS_ERR(seed_handle) ? PTR_ERR(seed_handle) : 0;
+	if (!IS_ERR(seed_handle))
+		global_sid_handle_put(seed_handle);
+#else
 	err = selinux_netlbl_skbuff_get_source_view(
 		skb, family, state, view, &sources->netlabel, &seed_sid);
+#endif
 	if (unlikely(err))
 		goto fail;
 	if (allow_egress_xfrm)
@@ -14237,6 +14286,49 @@ static int selinux_peer_sources_capture_postroute(
 }
 #endif
 
+#ifdef CONFIG_SECURITY_SELINUX_NS
+static struct selinux_global_sid_handle *
+selinux_peer_sources_sid_handle(
+	const struct selinux_peer_sources *sources, struct selinux_state *state,
+	u32 *peer_sid)
+{
+	struct selinux_global_sid_handle *nlbl_handle;
+	struct selinux_global_sid_handle *peer_handle;
+	u32 xfrm_sid = SECSID_NULL;
+	u32 nlbl_sid;
+	int err;
+
+	nlbl_handle = selinux_netlbl_source_sid_handle(
+		state, &sources->netlabel, &nlbl_sid);
+	if (IS_ERR(nlbl_handle))
+		return nlbl_handle;
+	if (sources->xfrm) {
+		const struct selinux_net_provenance *provenance = sources->xfrm;
+
+		if (!provenance->subject || !provenance->subject->label ||
+		    !provenance->view) {
+			peer_handle = ERR_PTR(-EACCES);
+			goto out_nlbl;
+		}
+		err = selinux_label_view_resolve(
+			provenance->view, state->label_domain,
+			provenance->subject->label, provenance->subject->sid,
+			&xfrm_sid);
+		if (err) {
+			peer_handle = ERR_PTR(err);
+			goto out_nlbl;
+		}
+	}
+	peer_handle = security_net_peersid_resolve_handle(
+		state, nlbl_sid, sources->netlabel.type, xfrm_sid, peer_sid);
+	if (IS_ERR(peer_handle))
+		pr_warn_ratelimited(
+			"SELinux: unable to determine packet peer label\n");
+out_nlbl:
+	global_sid_handle_put(nlbl_handle);
+	return peer_handle;
+}
+#else
 static int selinux_peer_sources_resolve(
 	const struct selinux_peer_sources *sources, struct selinux_state *state,
 	u32 *netlabel_sid, u32 *xfrm_sid_out, u32 *peer_sid)
@@ -14245,7 +14337,8 @@ static int selinux_peer_sources_resolve(
 	u32 nlbl_sid;
 	int err;
 
-	err = selinux_netlbl_source_sid(state, &sources->netlabel, &nlbl_sid);
+	err = selinux_netlbl_source_sid(
+		state, &sources->netlabel, &nlbl_sid);
 	if (unlikely(err))
 		return err;
 #ifdef CONFIG_SECURITY_SELINUX_NS
@@ -14316,9 +14409,10 @@ static int selinux_skb_peerlbl_sid(struct sk_buff *skb, u16 family,
 	selinux_peer_sources_put(&sources);
 	return err;
 }
+#endif
 
-/**
- * selinux_conn_sid - Determine the child socket label for a connection
+/*
+ * Determine the child socket label for a connection.
  * @sk_sid: the parent socket's SID
  * @skb_sid: the packet's SID
  * @state: the SELinux state
@@ -14330,6 +14424,19 @@ static int selinux_skb_peerlbl_sid(struct sk_buff *skb, u16 family,
  * of @sk_sid.  Returns zero on success, negative values on failure.
  *
  */
+#ifdef CONFIG_SECURITY_SELINUX_NS
+static struct selinux_global_sid_handle *
+selinux_conn_sid_handle(u32 sk_sid, u32 skb_sid,
+			struct selinux_state *state, u32 *conn_sid)
+{
+	if (skb_sid != SECSID_NULL)
+		return security_sid_mls_copy_handle(state, sk_sid, skb_sid,
+					    conn_sid);
+
+	*conn_sid = sk_sid;
+	return global_sid_handle_get(sk_sid);
+}
+#else
 static int selinux_conn_sid(u32 sk_sid, u32 skb_sid,
 			    struct selinux_state *state, u32 *conn_sid)
 {
@@ -14342,6 +14449,7 @@ static int selinux_conn_sid(u32 sk_sid, u32 skb_sid,
 
 	return err;
 }
+#endif
 
 /* socket security operations */
 
@@ -14356,6 +14464,7 @@ selinux_net_provenance_create_view(
 	const struct selinux_label_view *view;
 	struct selinux_label_resolution resolution;
 	struct selinux_label_ref *label;
+	struct selinux_global_sid_handle *sid_handle;
 	int rc;
 
 	if (!state || !state->label_domain || !source_view)
@@ -14369,8 +14478,14 @@ selinux_net_provenance_create_view(
 	rc = selinux_label_view_resolve_chain(view, label, sid, &resolution);
 	if (rc)
 		goto out_label;
-	assertion = selinux_net_assertion_alloc(label, sid, sclass, source, 0,
-						 gfp);
+	sid_handle = global_sid_handle_get(sid);
+	if (IS_ERR(sid_handle)) {
+		rc = PTR_ERR(sid_handle);
+		goto out_label;
+	}
+	assertion = selinux_net_assertion_alloc_handle(sid_handle, sclass,
+						       source, 0, gfp);
+	global_sid_handle_put(sid_handle);
 	if (IS_ERR(assertion)) {
 		rc = PTR_ERR(assertion);
 		goto out_label;
@@ -14514,8 +14629,8 @@ static struct selinux_net_provenance *selinux_net_provenance_derive_handle(
 		provenance = ERR_PTR(rc);
 		goto out_label;
 	}
-	assertion = selinux_net_assertion_alloc(label, sid, sclass, source, 0,
-						 gfp);
+	assertion = selinux_net_assertion_alloc_handle(sid_handle, sclass,
+						       source, 0, gfp);
 	if (IS_ERR(assertion)) {
 		provenance = ERR_CAST(assertion);
 		goto out_label;
@@ -14896,47 +15011,36 @@ out_handle:
 	return rc;
 }
 
-static int selinux_net_avc_transaction_peer_sources_resolve(
+static struct selinux_global_sid_handle *
+selinux_net_avc_transaction_peer_sources_native_handle(
 	struct selinux_net_avc_transaction *transaction,
 	const struct selinux_peer_sources *sources, struct selinux_state *state,
-	u32 *netlabel_sid, u32 *xfrm_sid_out, u32 *peer_sid)
+	u32 *netlabel_sid, u32 *xfrm_sid_out)
 {
+	struct selinux_global_sid_handle *nlbl_handle;
 	u32 xfrm_sid = SECSID_NULL;
 	u32 nlbl_sid;
 	int rc;
 
 	if (!transaction || !sources || !state || !state->label_domain)
-		return -EOPNOTSUPP;
-	rc = selinux_netlbl_source_sid(state, &sources->netlabel, &nlbl_sid);
-	if (rc)
-		return rc;
+		return ERR_PTR(-EOPNOTSUPP);
+	nlbl_handle = selinux_netlbl_source_sid_handle(
+		state, &sources->netlabel, &nlbl_sid);
+	if (IS_ERR(nlbl_handle))
+		return nlbl_handle;
 	if (sources->xfrm) {
 		rc = selinux_net_avc_transaction_provenance_sid(
 			transaction, sources->xfrm, state->label_domain, &xfrm_sid);
-		if (rc)
-			return rc;
-	}
-	if (peer_sid) {
-		rc = security_net_peersid_resolve(state, nlbl_sid,
-					  sources->netlabel.type, xfrm_sid,
-					  peer_sid);
-		if (rc)
-			return rc;
+		if (rc) {
+			global_sid_handle_put(nlbl_handle);
+			return ERR_PTR(rc);
+		}
 	}
 	if (netlabel_sid)
 		*netlabel_sid = nlbl_sid;
 	if (xfrm_sid_out)
 		*xfrm_sid_out = xfrm_sid;
-	return 0;
-}
-
-static int selinux_net_avc_transaction_peer_sources_sid(
-	struct selinux_net_avc_transaction *transaction,
-	const struct selinux_peer_sources *sources, struct selinux_state *state,
-	u32 *sid)
-{
-	return selinux_net_avc_transaction_peer_sources_resolve(
-		transaction, sources, state, NULL, NULL, sid);
+	return nlbl_handle;
 }
 
 static struct selinux_global_sid_handle *
@@ -14945,15 +15049,18 @@ selinux_net_avc_transaction_peer_sources_handle(
 	const struct selinux_peer_sources *sources, struct selinux_state *state,
 	u32 *sid)
 {
+	struct selinux_global_sid_handle *nlbl_handle;
+	struct selinux_global_sid_handle *peer_handle;
 	u32 xfrm_sid, nlbl_sid;
-	int rc;
 
-	rc = selinux_net_avc_transaction_peer_sources_resolve(
-		transaction, sources, state, &nlbl_sid, &xfrm_sid, NULL);
-	if (rc)
-		return ERR_PTR(rc);
-	return security_net_peersid_resolve_handle(
+	nlbl_handle = selinux_net_avc_transaction_peer_sources_native_handle(
+		transaction, sources, state, &nlbl_sid, &xfrm_sid);
+	if (IS_ERR(nlbl_handle))
+		return nlbl_handle;
+	peer_handle = security_net_peersid_resolve_handle(
 		state, nlbl_sid, sources->netlabel.type, xfrm_sid, sid);
+	global_sid_handle_put(nlbl_handle);
+	return peer_handle;
 }
 
 /* Keep a policy generation in the atomic validation set when it has no ACL. */
@@ -16581,12 +16688,13 @@ static int selinux_socket_unix_stream_connect(struct sock *sock,
 	{
 		struct selinux_net_provenance *sock_provenance, *other_provenance;
 		struct selinux_net_provenance *child = NULL;
-		struct selinux_global_sid_handle *child_handle = NULL;
 		struct {
 			struct selinux_policy_chain_snapshot access_chain;
 			struct selinux_policy_state_chain_snapshot child_chain;
 			struct selinux_net_avc_transaction transaction;
 			u32 child_sid[SELINUX_LABEL_RESOLUTION_MAX_DEPTH + 1];
+			struct selinux_global_sid_handle
+				*child_handle[SELINUX_LABEL_RESOLUTION_MAX_DEPTH + 1];
 		} *scratch __free(kfree) = NULL;
 		struct selinux_avc_transaction_workspace *workspace
 			__free(kvfree) = NULL;
@@ -16621,8 +16729,10 @@ static int selinux_socket_unix_stream_connect(struct sock *sock,
 		for (retry = 0; retry < SELINUX_POLICY_OPERATION_RETRIES; retry++) {
 			u16 i;
 
-			global_sid_handle_put(child_handle);
-			child_handle = NULL;
+			for (i = 0; i < ARRAY_SIZE(scratch->child_handle); i++) {
+				global_sid_handle_put(scratch->child_handle[i]);
+				scratch->child_handle[i] = NULL;
+			}
 			selinux_net_provenance_put(child);
 			child = NULL;
 			selinux_net_avc_transaction_reset(&scratch->transaction);
@@ -16690,29 +16800,22 @@ static int selinux_socket_unix_stream_connect(struct sock *sock,
 					policy_state->label_domain, &server_sid);
 				if (err)
 					break;
-				if (!i) {
-					child_handle = security_sid_mls_copy_handle(
-						policy_state, server_sid, client_sid,
-						&scratch->child_sid[i]);
-					if (IS_ERR(child_handle)) {
-						err = PTR_ERR(child_handle);
-						child_handle = NULL;
-						break;
-					}
-				} else {
-					err = selinux_conn_sid(
-						server_sid, client_sid, policy_state,
-						&scratch->child_sid[i]);
-					if (err)
-						break;
+				scratch->child_handle[i] = selinux_conn_sid_handle(
+					server_sid, client_sid, policy_state,
+					&scratch->child_sid[i]);
+				if (IS_ERR(scratch->child_handle[i])) {
+					err = PTR_ERR(scratch->child_handle[i]);
+					scratch->child_handle[i] = NULL;
+					break;
 				}
 			}
 			if (err)
 				goto retry_unix;
 			child = selinux_net_provenance_derive_handle(
-				other_provenance, child_handle, sksec_other->sclass,
+				other_provenance, scratch->child_handle[0],
+				sksec_other->sclass,
 				SELINUX_NET_ASSERTION_SOURCE_SOCKET, GFP_ATOMIC);
-			child_handle = NULL;
+			scratch->child_handle[0] = NULL;
 			if (IS_ERR(child)) {
 				err = PTR_ERR(child);
 				child = NULL;
@@ -16756,7 +16859,12 @@ retry_unix:
 
 out_unix_candidate:
 		selinux_net_avc_transaction_reset(&scratch->transaction);
-		global_sid_handle_put(child_handle);
+		{
+			u16 i;
+
+			for (i = 0; i < ARRAY_SIZE(scratch->child_handle); i++)
+				global_sid_handle_put(scratch->child_handle[i]);
+		}
 		selinux_net_provenance_put(child);
 out_unix_provenance:
 		selinux_net_provenance_put(other_provenance);
@@ -17090,12 +17198,15 @@ static int selinux_socket_sock_rcv_skb_policy(
 	}
 
 	/* Legacy policies authorize the two native label sources separately. */
-	err = selinux_net_avc_transaction_peer_sources_resolve(
-		transaction, sources, state, &nlbl_sid, &xfrm_sid, NULL);
-	if (err)
-		return err;
+	{
+		struct selinux_global_sid_handle *nlbl_handle;
+
+		nlbl_handle =
+			selinux_net_avc_transaction_peer_sources_native_handle(
+				transaction, sources, state, &nlbl_sid, &xfrm_sid);
+		if (IS_ERR(nlbl_handle))
+			return PTR_ERR(nlbl_handle);
 	if (netlbl_enabled()) {
-		struct selinux_global_sid_handle *nlbl_handle = NULL;
 		u16 sclass = socket_class_for_snapshot(
 			snapshot, sk->sk_family, sk->sk_type, sk->sk_protocol);
 		u32 perm;
@@ -17114,17 +17225,10 @@ static int selinux_socket_sock_rcv_skb_policy(
 			break;
 		}
 		if (sources->netlabel.cache) {
-			u32 pinned_sid;
+			struct selinux_global_sid_handle *consumed = nlbl_handle;
 
-			nlbl_handle = selinux_netlbl_source_sid_handle(
-				state, &sources->netlabel, &pinned_sid);
-			if (IS_ERR(nlbl_handle))
-				err = PTR_ERR(nlbl_handle);
-			else if (!nlbl_handle || pinned_sid != nlbl_sid) {
-				global_sid_handle_put(nlbl_handle);
-				err = -ESTALE;
-			} else
-				err = selinux_net_avc_transaction_add_handle(
+			nlbl_handle = NULL;
+			err = selinux_net_avc_transaction_add_handle(
 					transaction,
 					&(struct selinux_avc_level) {
 						.state = state,
@@ -17132,7 +17236,7 @@ static int selinux_socket_sock_rcv_skb_policy(
 						.tsid = nlbl_sid,
 						.requested = perm,
 						.tclass = sclass,
-					}, snapshot, nlbl_handle,
+					}, snapshot, consumed,
 					sources->netlabel.view,
 					SELINUX_NET_ASSERTION_SOURCE_NETLABEL);
 		} else {
@@ -17147,12 +17251,15 @@ static int selinux_socket_sock_rcv_skb_policy(
 				}, snapshot, NULL);
 		}
 		if (err) {
+			global_sid_handle_put(nlbl_handle);
 			if (sources->netlabel.cache)
 				*netlbl_checked = true;
 			return err;
 		}
 		if (sources->netlabel.cache)
 			*netlbl_checked = true;
+	}
+		global_sid_handle_put(nlbl_handle);
 	}
 	if (IS_ENABLED(CONFIG_SECURITY_NETWORK_XFRM)) {
 		if (!sources->xfrm)
@@ -17438,9 +17545,37 @@ static int selinux_socket_getpeersec_dgram(struct socket *sock,
 		struct inode_security_struct *isec;
 		isec = inode_security_novalidate(SOCK_INODE(sock));
 		peer_secid = isec->sid;
-	} else if (skb)
+	} else if (skb) {
+#ifdef CONFIG_SECURITY_SELINUX_NS
+		struct selinux_global_sid_handle *peer_handle;
+		struct selinux_peer_sources sources;
+		const struct selinux_label_view *view = NULL;
+		int rc;
+
+		if (sock) {
+			const struct selinux_netns_security *netsec =
+				selinux_netns(sock_net(sock->sk));
+
+			if (netsec)
+				view = netsec->view;
+		}
+		rc = selinux_peer_sources_capture(
+			skb, family, current_selinux_state, view, &sources);
+		if (!rc) {
+			peer_handle = selinux_peer_sources_sid_handle(
+				&sources, current_selinux_state, &peer_secid);
+			rc = IS_ERR(peer_handle) ? PTR_ERR(peer_handle) : 0;
+			if (!IS_ERR(peer_handle))
+				global_sid_handle_put(peer_handle);
+			selinux_peer_sources_put(&sources);
+		}
+		if (rc)
+			return rc;
+#else
 		selinux_skb_peerlbl_sid(skb, family, current_selinux_state,
 					&peer_secid);
+#endif
+	}
 
 	*secid = peer_secid;
 	if (peer_secid == SECSID_NULL)
@@ -17576,6 +17711,7 @@ static int selinux_socket_getpeersec_dgram_ctx(struct sock *observer,
 		goto out_provenance;
 
 	for (retry = 0; retry < SELINUX_POLICY_OPERATION_RETRIES; retry++) {
+		struct selinux_global_sid_handle *peer_handle;
 		struct lsm_context candidate = { };
 
 		rc = selinux_policy_snapshot_read(observer_state, &snapshot);
@@ -17583,31 +17719,39 @@ static int selinux_socket_getpeersec_dgram_ctx(struct sock *observer,
 			continue;
 		if (rc)
 			break;
-		rc = selinux_peer_sources_sid(&sources, observer_state,
-					      &peer_sid);
+		peer_handle = selinux_peer_sources_sid_handle(
+			&sources, observer_state, &peer_sid);
+		rc = IS_ERR(peer_handle) ? PTR_ERR(peer_handle) : 0;
 		if (rc == -EAGAIN || rc == -ESTALE)
 			continue;
 		if (rc)
 			break;
 		if (peer_sid == SECSID_NULL) {
+			global_sid_handle_put(peer_handle);
 			rc = -ENOPROTOOPT;
 			break;
 		}
 		rc = selinux_peer_sid_to_secctx(
 			observer_state, &snapshot, peer_sid, &candidate);
-		if (rc == -ESTALE)
+		if (rc == -ESTALE) {
+			global_sid_handle_put(peer_handle);
 			continue;
-		if (rc)
+		}
+		if (rc) {
+			global_sid_handle_put(peer_handle);
 			break;
+		}
 		if (READ_ONCE(sksec->state) != socket_state ||
 		    READ_ONCE(sksec->sid) != socket_sid ||
 		    rcu_access_pointer(sksec->provenance) != socket_provenance ||
 		    !selinux_policy_snapshot_valid(observer_state, &snapshot)) {
 			kfree(candidate.context);
+			global_sid_handle_put(peer_handle);
 			rc = -ESTALE;
 			continue;
 		}
 		*cp = candidate;
+		global_sid_handle_put(peer_handle);
 		rc = 0;
 		goto out_sources;
 	}
@@ -18104,6 +18248,7 @@ selinux_sctp_process_new_assoc(struct sctp_association *asoc,
 static int selinux_sctp_assoc_set_provenance(struct sctp_association *asoc,
 					     u32 subject_sid, u32 peer_sid)
 {
+	struct selinux_global_sid_handle *subject_handle, *peer_handle;
 	struct sctp_assoc_security_struct *assocsec = selinux_sctp_assoc(asoc);
 	struct selinux_net_provenance *base, *subject, *peer;
 	struct selinux_net_provenance *old_subject, *old_peer;
@@ -18111,15 +18256,26 @@ static int selinux_sctp_assoc_set_provenance(struct sctp_association *asoc,
 	base = selinux_net_provenance_get_rcu(&assocsec->provenance);
 	if (!base)
 		return -EACCES;
-	subject = selinux_net_provenance_derive(
-		base, subject_sid, SECCLASS_SCTP_SOCKET,
+	subject_handle = global_sid_handle_get(subject_sid);
+	if (IS_ERR(subject_handle)) {
+		selinux_net_provenance_put(base);
+		return PTR_ERR(subject_handle);
+	}
+	subject = selinux_net_provenance_derive_handle(
+		base, subject_handle, SECCLASS_SCTP_SOCKET,
 		SELINUX_NET_ASSERTION_SOURCE_SOCKET, GFP_ATOMIC);
 	if (IS_ERR(subject)) {
 		selinux_net_provenance_put(base);
 		return PTR_ERR(subject);
 	}
-	peer = selinux_net_provenance_derive(
-		base, peer_sid, SECCLASS_PEER,
+	peer_handle = global_sid_handle_get(peer_sid);
+	if (IS_ERR(peer_handle)) {
+		selinux_net_provenance_put(subject);
+		selinux_net_provenance_put(base);
+		return PTR_ERR(peer_handle);
+	}
+	peer = selinux_net_provenance_derive_handle(
+		base, peer_handle, SECCLASS_PEER,
 		SELINUX_NET_ASSERTION_SOURCE_PEER_RESOLVED, GFP_ATOMIC);
 	if (IS_ERR(peer)) {
 		selinux_net_provenance_put(subject);
@@ -18374,6 +18530,10 @@ static int selinux_sctp_prepare_candidate(
 			break;
 
 		for (i = 0, err = 0; i < chain->count; i++) {
+			struct selinux_global_sid_handle *level_peer
+				__free(selinux_sid_handle) = NULL;
+			struct selinux_global_sid_handle *level_subject
+				__free(selinux_sid_handle) = NULL;
 			struct selinux_state *state = chain->state[i];
 			const struct selinux_policy_snapshot *snapshot =
 				&chain->policy[i];
@@ -18396,9 +18556,11 @@ static int selinux_sctp_prepare_candidate(
 						break;
 					}
 				} else {
-					err = selinux_net_avc_transaction_peer_sources_sid(
+					level_peer =
+						selinux_net_avc_transaction_peer_sources_handle(
 						transaction, &candidate->sources, state,
 						&peer_sid[i]);
+					err = IS_ERR(level_peer) ? PTR_ERR(level_peer) : 0;
 					if (err)
 						break;
 				}
@@ -18412,6 +18574,13 @@ static int selinux_sctp_prepare_candidate(
 							peer_handle = NULL;
 							break;
 						}
+					} else {
+						level_peer = global_sid_handle_get(
+							peer_sid[i]);
+						if (IS_ERR(level_peer)) {
+							err = PTR_ERR(level_peer);
+							break;
+						}
 					}
 				}
 			} else {
@@ -18421,6 +18590,12 @@ static int selinux_sctp_prepare_candidate(
 					if (IS_ERR(peer_handle)) {
 						err = PTR_ERR(peer_handle);
 						peer_handle = NULL;
+						break;
+					}
+				} else {
+					level_peer = global_sid_handle_get(peer_sid[i]);
+					if (IS_ERR(level_peer)) {
+						err = PTR_ERR(level_peer);
 						break;
 					}
 				}
@@ -18435,8 +18610,19 @@ static int selinux_sctp_prepare_candidate(
 						subject_handle = NULL;
 					}
 				} else {
-					err = selinux_conn_sid(socket_sid, peer_sid[i], state,
-							       &subject_sid[i]);
+					if (peer_sid[i] == SECSID_NULL) {
+						subject_sid[i] = socket_sid;
+						level_subject =
+							global_sid_handle_get(socket_sid);
+					} else {
+						level_subject =
+							security_sid_mls_copy_handle(
+								state, socket_sid,
+								peer_sid[i],
+								&subject_sid[i]);
+					}
+					err = IS_ERR(level_subject) ?
+						PTR_ERR(level_subject) : 0;
 				}
 			} else {
 				subject_sid[i] = socket_sid;
@@ -18996,6 +19182,10 @@ static int selinux_inet_peer_candidate_prepare(
 			break;
 
 		for (i = 0; i < chain->count; i++) {
+			struct selinux_global_sid_handle *level_connection
+				__free(selinux_sid_handle) = NULL;
+			struct selinux_global_sid_handle *level_peer
+				__free(selinux_sid_handle) = NULL;
 			struct selinux_state *state = chain->state[i];
 			u32 base_sid;
 
@@ -19014,8 +19204,10 @@ static int selinux_inet_peer_candidate_prepare(
 					break;
 				}
 			} else {
-				rc = selinux_net_avc_transaction_peer_sources_sid(
+				level_peer =
+					selinux_net_avc_transaction_peer_sources_handle(
 					transaction, &sources, state, &peer_sid[i]);
+				rc = IS_ERR(level_peer) ? PTR_ERR(level_peer) : 0;
 				if (rc)
 					break;
 			}
@@ -19037,8 +19229,16 @@ static int selinux_inet_peer_candidate_prepare(
 					break;
 				}
 			} else {
-				rc = selinux_conn_sid(base_sid, peer_sid[i], state,
-						      &connection_sid[i]);
+				if (peer_sid[i] == SECSID_NULL) {
+					connection_sid[i] = base_sid;
+					level_connection = global_sid_handle_get(base_sid);
+				} else {
+					level_connection = security_sid_mls_copy_handle(
+						state, base_sid, peer_sid[i],
+						&connection_sid[i]);
+				}
+				rc = IS_ERR(level_connection) ?
+					PTR_ERR(level_connection) : 0;
 				if (rc)
 					break;
 			}
@@ -19818,8 +20018,10 @@ static int selinux_ip_forward_policy(
 	const struct selinux_label_view *view,
 	struct selinux_net_avc_transaction *transaction,
 	struct common_audit_data *ad, u32 *peer_sid_out,
+	struct selinux_global_sid_handle **peer_handle_out,
 	bool *netlbl_checked)
 {
+	struct selinux_global_sid_handle *peer_handle;
 	u32 peer_sid;
 	char *addrp;
 	int ifindex, err;
@@ -19827,14 +20029,16 @@ static int selinux_ip_forward_policy(
 
 	if (!selinux_policy_snapshot_has_cap(snapshot, POLICYDB_CAP_NETPEER)) {
 		*peer_sid_out = SECSID_NULL;
+		*peer_handle_out = NULL;
 		return 0;
 	}
 	family = hook_state->pf;
-	err = selinux_net_avc_transaction_peer_sources_sid(
+	peer_handle = selinux_net_avc_transaction_peer_sources_handle(
 		transaction, sources, state, &peer_sid);
-	if (err)
-		return err;
+	if (IS_ERR(peer_handle))
+		return PTR_ERR(peer_handle);
 	*peer_sid_out = peer_sid;
+	*peer_handle_out = peer_handle;
 	ifindex = hook_state->in->ifindex;
 	err = selinux_parse_skb(skb, ad, &addrp, 1, NULL);
 	if (err)
@@ -19878,6 +20082,8 @@ static unsigned int selinux_ip_forward(void *priv, struct sk_buff *skb,
 	struct {
 		struct selinux_policy_state_chain_snapshot chain;
 		struct selinux_net_avc_transaction transaction;
+		struct selinux_global_sid_handle
+			*peer_handle[SELINUX_LABEL_RESOLUTION_MAX_DEPTH + 1];
 	} *scratch __free(kfree) = NULL;
 	struct selinux_avc_transaction_workspace *workspace __free(kvfree) = NULL;
 	struct selinux_policy_state_chain_snapshot *chain;
@@ -19913,6 +20119,10 @@ static unsigned int selinux_ip_forward(void *priv, struct sk_buff *skb,
 		bool netlbl_checked = false;
 		u16 i;
 
+		for (i = 0; i < ARRAY_SIZE(scratch->peer_handle); i++) {
+			global_sid_handle_put(scratch->peer_handle[i]);
+			scratch->peer_handle[i] = NULL;
+		}
 		selinux_net_avc_transaction_reset(&scratch->transaction);
 		err = selinux_policy_state_chain_snapshot_read(netsec->state,
 							       chain);
@@ -19929,7 +20139,7 @@ static unsigned int selinux_ip_forward(void *priv, struct sk_buff *skb,
 			err = selinux_ip_forward_policy(
 				skb, hook_state, chain->state[i], &chain->policy[i],
 				&sources, netsec->view, &scratch->transaction, &ad,
-				&peer_sid, &netlbl_checked);
+				&peer_sid, &scratch->peer_handle[i], &netlbl_checked);
 			if (err)
 				break;
 			err = selinux_net_avc_transaction_add_guard(
@@ -19953,6 +20163,8 @@ static unsigned int selinux_ip_forward(void *priv, struct sk_buff *skb,
 				origin_peer_sid);
 		break;
 	}
+	for (retry = 0; retry < ARRAY_SIZE(scratch->peer_handle); retry++)
+		global_sid_handle_put(scratch->peer_handle[retry]);
 	selinux_net_avc_transaction_reset(&scratch->transaction);
 	selinux_peer_sources_put(&sources);
 	return err ? NF_DROP : NF_ACCEPT;
@@ -20348,10 +20560,14 @@ static int selinux_ip_postroute_policy_ns(
 	const struct selinux_label_resolution *subject_resolution,
 	const struct selinux_peer_sources *sources, bool xfrm_pending,
 	char *addrp, const struct selinux_label_view *view,
-	struct selinux_net_avc_transaction *transaction)
+	struct selinux_net_avc_transaction *transaction,
+	struct selinux_global_sid_handle **subject_handle_out)
 {
+	struct selinux_global_sid_handle *subject_handle = NULL;
 	u32 subject_sid, socket_sid = SECSID_NULL;
 	int err;
+
+	*subject_handle_out = NULL;
 
 	if (origin == SELINUX_POSTROUTE_SOCKET ||
 	    origin == SELINUX_POSTROUTE_LISTENER) {
@@ -20378,6 +20594,7 @@ static int selinux_ip_postroute_policy_ns(
 		subject_sid = socket_sid;
 		break;
 	case SELINUX_POSTROUTE_LISTENER: {
+		struct selinux_global_sid_handle *peer_handle;
 		u32 peer_sid;
 
 		/*
@@ -20391,20 +20608,24 @@ static int selinux_ip_postroute_policy_ns(
 		if (selinux_ip_postroute_xfrm_transformed(skb, hook_state->pf) &&
 		    !sources->netlabel.cache && !sources->xfrm)
 			return -EOPNOTSUPP;
-		err = selinux_net_avc_transaction_peer_sources_sid(
+		peer_handle = selinux_net_avc_transaction_peer_sources_handle(
 			transaction, sources, state, &peer_sid);
-		if (err)
-			return err;
-		err = selinux_conn_sid(socket_sid, peer_sid, state, &subject_sid);
-		if (err)
-			return err;
+		if (IS_ERR(peer_handle))
+			return PTR_ERR(peer_handle);
+		subject_handle = selinux_conn_sid_handle(
+			socket_sid, peer_sid, state, &subject_sid);
+		global_sid_handle_put(peer_handle);
+		if (IS_ERR(subject_handle))
+			return PTR_ERR(subject_handle);
+		*subject_handle_out = subject_handle;
 		break;
 	}
 	case SELINUX_POSTROUTE_FORWARDED:
-		err = selinux_net_avc_transaction_peer_sources_sid(
+		subject_handle = selinux_net_avc_transaction_peer_sources_handle(
 			transaction, sources, state, &subject_sid);
-		if (err)
-			return err;
+		if (IS_ERR(subject_handle))
+			return PTR_ERR(subject_handle);
+		*subject_handle_out = subject_handle;
 		break;
 	case SELINUX_POSTROUTE_KERNEL:
 		err = selinux_ip_postroute_resolution_sid(subject_resolution, state,
@@ -20498,6 +20719,8 @@ static unsigned int selinux_ip_postroute(void *priv, struct sk_buff *skb,
 	struct {
 		struct selinux_policy_state_chain_snapshot chain;
 		struct selinux_net_avc_transaction transaction;
+		struct selinux_global_sid_handle
+			*subject_handle[SELINUX_LABEL_RESOLUTION_MAX_DEPTH + 1];
 	} *scratch __free(kfree) = NULL;
 	struct selinux_avc_transaction_workspace *workspace __free(kvfree) = NULL;
 	struct selinux_label_resolution subject_resolution = {};
@@ -20591,6 +20814,10 @@ static unsigned int selinux_ip_postroute(void *priv, struct sk_buff *skb,
 		bool needs_parse = false;
 		u16 i;
 
+		for (i = 0; i < ARRAY_SIZE(scratch->subject_handle); i++) {
+			global_sid_handle_put(scratch->subject_handle[i]);
+			scratch->subject_handle[i] = NULL;
+		}
 		selinux_net_avc_transaction_reset(&scratch->transaction);
 		err = selinux_policy_state_chain_snapshot_read(
 			origin_state, &scratch->chain);
@@ -20617,7 +20844,8 @@ static unsigned int selinux_ip_postroute(void *priv, struct sk_buff *skb,
 				&scratch->chain.policy[i],
 				origin, &subject_resolution,
 				sources_captured ? &sources : NULL, xfrm_pending,
-				addrp, view, &scratch->transaction);
+				addrp, view, &scratch->transaction,
+				&scratch->subject_handle[i]);
 			if (err)
 				break;
 			err = selinux_net_avc_transaction_add_guard(
@@ -20637,6 +20865,9 @@ static unsigned int selinux_ip_postroute(void *priv, struct sk_buff *skb,
 	err = -ESTALE;
 
 out:
+	for (retry = 0; scratch &&
+		     retry < ARRAY_SIZE(scratch->subject_handle); retry++)
+		global_sid_handle_put(scratch->subject_handle[retry]);
 	selinux_net_avc_transaction_reset(&scratch->transaction);
 	if (sources_captured)
 		selinux_peer_sources_put(&sources);
@@ -22022,7 +22253,7 @@ static int selinux_lsm_setattr(u64 attr, void *value, size_t size)
 				audit_log_format(ab, "op=fscreate invalid_context=");
 				audit_log_n_untrustedstring(ab, value,
 							    audit_size);
-				audit_log_end(ab);
+				(void)audit_log_end_status(ab);
 
 				return error;
 			}
@@ -22454,8 +22685,10 @@ static int selinux_inode_notifysecctx(struct inode *inode, void *ctx, u32 ctxlen
  */
 static int selinux_inode_setsecctx(struct dentry *dentry, void *ctx, u32 ctxlen)
 {
-	return __vfs_setxattr_locked(&nop_mnt_idmap, dentry, XATTR_NAME_SELINUX,
-				     ctx, ctxlen, 0, NULL);
+	/* This intrinsic inode hook has no path from which to obtain a mount. */
+	return __vfs_setxattr_locked_mnt(&nop_mnt_idmap, NULL, dentry,
+					 XATTR_NAME_SELINUX, ctx, ctxlen, 0,
+					 NULL);
 }
 
 static int selinux_inode_getsecctx(struct inode *inode, struct lsm_context *cp)
@@ -23941,13 +24174,14 @@ static int selinux_bpf_map_create(struct bpf_map *map, union bpf_attr *attr,
 			    selinux_policycap_enabled(
 				    current_selinux_state,
 				    POLICYDB_CAP_BPF_OBJECT_PERMS))
-				rc = selinux_bpf_btf(inner_map->btf);
+				rc = selinux_bpf_btf_cred(current_cred(),
+							 inner_map->btf);
 		}
 
 		if (!rc && map->btf &&
 		    selinux_policycap_enabled(current_selinux_state,
 					      POLICYDB_CAP_BPF_OBJECT_PERMS))
-			rc = selinux_bpf_btf(map->btf);
+			rc = selinux_bpf_btf_cred(current_cred(), map->btf);
 		return rc;
 	}
 #endif
@@ -24150,17 +24384,19 @@ static int selinux_bpf_prog_commit(struct bpf_prog *prog)
 				       POLICYDB_CAP_BPF_OBJECT_PERMS))
 		return 0;
 	if (prog->aux->btf) {
-		rc = selinux_bpf_btf(prog->aux->btf);
+		rc = selinux_bpf_btf_cred(current_cred(), prog->aux->btf);
 		if (rc)
 			return rc;
 	}
 	if (prog->aux->attach_btf) {
-		rc = selinux_bpf_btf(prog->aux->attach_btf);
+		rc = selinux_bpf_btf_cred(current_cred(),
+					 prog->aux->attach_btf);
 		if (rc)
 			return rc;
 	}
 	for (i = 0; i < prog->aux->used_btf_cnt; i++) {
-		rc = selinux_bpf_btf(prog->aux->used_btfs[i].btf);
+		rc = selinux_bpf_btf_cred(current_cred(),
+					 prog->aux->used_btfs[i].btf);
 		if (rc)
 			return rc;
 	}
@@ -24579,7 +24815,8 @@ static int selinux_bpf_link_access_cred(const struct cred *cred,
 	return -ESTALE;
 }
 
-static int selinux_bpf_link_access(struct bpf_link *link, enum bpf_cmd cmd)
+static int selinux_bpf_link_access(struct bpf_link *link,
+					    enum bpf_cmd cmd)
 {
 	return selinux_bpf_link_access_cred(current_cred(), link, cmd);
 }
@@ -24870,7 +25107,8 @@ static int selinux_bpf_link_access_cred(const struct cred *cred,
 				SECCLASS_BPF, requested, NULL);
 }
 
-static int selinux_bpf_link_access(struct bpf_link *link, enum bpf_cmd cmd)
+static int selinux_bpf_link_access(struct bpf_link *link,
+					    enum bpf_cmd cmd)
 {
 	return selinux_bpf_link_access_cred(current_cred(), link, cmd);
 }
@@ -24883,7 +25121,8 @@ static int selinux_bpf_link_update(struct bpf_link *link,
 {
 	int rc;
 
-	rc = selinux_bpf_link_access(link, BPF_LINK_UPDATE);
+	rc = selinux_bpf_link_access_cred(current_cred(), link,
+					  BPF_LINK_UPDATE);
 	if (rc)
 		return rc;
 	if (new_prog) {
@@ -25733,7 +25972,6 @@ static struct security_hook_list selinux_hooks[] __ro_after_init = {
 	LSM_HOOK_INIT(prop_ref_free, selinux_prop_ref_free),
 	LSM_HOOK_INIT(prop_ref_to_secctx, selinux_prop_ref_to_secctx),
 	LSM_HOOK_INIT(kernel_act_as_ref, selinux_kernel_act_as_ref),
-	LSM_HOOK_INIT(kernel_act_as, selinux_kernel_act_as),
 	LSM_HOOK_INIT(kernel_create_files_as, selinux_kernel_create_files_as),
 	LSM_HOOK_INIT(kernel_module_request, selinux_kernel_module_request),
 	LSM_HOOK_INIT(kernel_load_data, selinux_kernel_load_data),

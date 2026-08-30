@@ -3367,11 +3367,15 @@ EXPORT_SYMBOL(xfrm_lookup_with_ifid);
  * At the moment we eat a raw IP route. Mostly to speed up lookups
  * on interfaces with disabled IPsec.
  */
-struct dst_entry *xfrm_lookup(struct net *net, struct dst_entry *dst_orig,
+struct dst_entry *xfrm_lookup(struct net *net,
+			      struct dst_entry *dst_orig,
 			      const struct flowi *fl, const struct sock *sk,
 			      int flags)
 {
-	return xfrm_lookup_with_ifid(net, dst_orig, fl, sk, flags, 0);
+	struct xfrm_flow_origin origin = xfrm_flow_origin_sock(sk);
+
+	return xfrm_lookup_with_ifid_origin(net, dst_orig, fl, sk, &origin,
+					      flags, 0);
 }
 EXPORT_SYMBOL(xfrm_lookup);
 
@@ -3390,7 +3394,8 @@ EXPORT_SYMBOL(xfrm_lookup_origin);
 /* Callers of xfrm_lookup_route() must ensure a call to dst_output().
  * Otherwise we may send out blackholed packets.
  */
-struct dst_entry *xfrm_lookup_route(struct net *net, struct dst_entry *dst_orig,
+struct dst_entry *xfrm_lookup_route(
+				    struct net *net, struct dst_entry *dst_orig,
 				    const struct flowi *fl,
 				    const struct sock *sk, int flags)
 {
@@ -4542,7 +4547,7 @@ void xfrm_audit_policy_add(struct xfrm_policy *xp, int result, bool task_valid)
 	xfrm_audit_helper_usrinfo(task_valid, audit_buf);
 	audit_log_format(audit_buf, " res=%u", result);
 	xfrm_audit_common_policyinfo(xp, audit_buf);
-	audit_log_end(audit_buf);
+	(void)audit_log_end_status(audit_buf);
 }
 EXPORT_SYMBOL_GPL(xfrm_audit_policy_add);
 
@@ -4557,7 +4562,7 @@ void xfrm_audit_policy_delete(struct xfrm_policy *xp, int result,
 	xfrm_audit_helper_usrinfo(task_valid, audit_buf);
 	audit_log_format(audit_buf, " res=%u", result);
 	xfrm_audit_common_policyinfo(xp, audit_buf);
-	audit_log_end(audit_buf);
+	(void)audit_log_end_status(audit_buf);
 }
 EXPORT_SYMBOL_GPL(xfrm_audit_policy_delete);
 #endif

@@ -229,7 +229,7 @@ int nfsd_mountpoint(struct dentry *dentry, struct svc_export *exp)
 		return 0;
 	if (exp->ex_flags & NFSEXP_V4ROOT)
 		return 1;
-	if (nfsd4_is_junction(dentry))
+	if (nfsd4_is_junction(exp->ex_path.mnt, dentry))
 		return 1;
 	if (d_managed(dentry))
 		/*
@@ -664,7 +664,7 @@ out:
  * Returns 1 if "dentry" appears to contain NFS junction information.
  * Otherwise 0 is returned.
  */
-int nfsd4_is_junction(struct dentry *dentry)
+int nfsd4_is_junction(const struct vfsmount *mnt, struct dentry *dentry)
 {
 	struct inode *inode = d_inode(dentry);
 
@@ -674,8 +674,8 @@ int nfsd4_is_junction(struct dentry *dentry)
 		return 0;
 	if (!(inode->i_mode & S_ISVTX))
 		return 0;
-	if (vfs_getxattr(&nop_mnt_idmap, dentry, NFSD_JUNCTION_XATTR_NAME,
-			 NULL, 0) <= 0)
+	if (vfs_getxattr_mnt(&nop_mnt_idmap, mnt, dentry,
+			     NFSD_JUNCTION_XATTR_NAME, NULL, 0) <= 0)
 		return 0;
 	return 1;
 }
@@ -2752,7 +2752,7 @@ nfsd_listxattr(struct svc_rqst *rqstp, struct svc_fh *fhp, char **bufp,
 
 	inode_lock_shared(inode);
 
-	len = vfs_listxattr(dentry, NULL, 0);
+	len = vfs_listxattr_mnt(fhp->fh_export->ex_path.mnt, dentry, NULL, 0);
 	if (len <= 0) {
 		err = nfsd_xattr_errno(len);
 		goto out;
@@ -2769,7 +2769,7 @@ nfsd_listxattr(struct svc_rqst *rqstp, struct svc_fh *fhp, char **bufp,
 		goto out;
 	}
 
-	len = vfs_listxattr(dentry, buf, len);
+	len = vfs_listxattr_mnt(fhp->fh_export->ex_path.mnt, dentry, buf, len);
 	if (len <= 0) {
 		kvfree(buf);
 		err = nfsd_xattr_errno(len);

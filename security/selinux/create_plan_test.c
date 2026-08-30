@@ -500,7 +500,7 @@ static void selinux_setxattr_plan_commit_test(struct kunit *test)
 	/* Simulate a reload after authorization but before the filesystem post. */
 	selinux_chain_epoch_bump(selinux_cred(current_cred())->state);
 	security_inode_post_setxattr(
-		mnt->mnt_root, XATTR_NAME_SELINUX, value, size, 0);
+		mnt, mnt->mnt_root, XATTR_NAME_SELINUX, value, size, 0);
 	rc = security_inode_setxattr_plan_finish(plan, 0);
 	KUNIT_EXPECT_EQ(test, rc, 0);
 	spin_lock(&isec->lock);
@@ -646,7 +646,7 @@ static void selinux_setxattr_plan_post_rebind_failure_test(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, rc, 0);
 	selinux_kunit_inode_setxattr_plan_rebind_fail();
 	security_inode_post_setxattr(
-		mnt->mnt_root, XATTR_NAME_SELINUX, value, size, 0);
+		mnt, mnt->mnt_root, XATTR_NAME_SELINUX, value, size, 0);
 	rc = security_inode_setxattr_plan_finish(plan, 0);
 	KUNIT_EXPECT_EQ(test, rc, 0);
 	spin_lock(&isec->lock);

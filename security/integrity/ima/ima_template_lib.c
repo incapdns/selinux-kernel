@@ -617,9 +617,10 @@ int ima_eventevmsig_init(struct ima_event_data *event_data,
 	if (!event_data->file)
 		return 0;
 
-	rc = vfs_getxattr_alloc(&nop_mnt_idmap, file_dentry(event_data->file),
-				XATTR_NAME_EVM, (char **)&xattr_data, 0,
-				GFP_NOFS);
+	rc = vfs_getxattr_alloc_mnt(&nop_mnt_idmap,
+				    event_data->file->f_path.mnt,
+				    file_dentry(event_data->file), XATTR_NAME_EVM,
+				    (char **)&xattr_data, 0, GFP_NOFS);
 	if (rc <= 0 || xattr_data->type != EVM_XATTR_PORTABLE_DIGSIG) {
 		rc = 0;
 		goto out;

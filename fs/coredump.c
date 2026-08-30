@@ -964,7 +964,8 @@ static bool coredump_file(struct core_name *cn, struct coredump_params *cprm,
 	}
 	if (!(file->f_mode & FMODE_CAN_WRITE))
 		return false;
-	if (do_truncate(idmap, file->f_path.dentry, 0, 0, file))
+	if (do_truncate_mnt(idmap, file->f_path.mnt, file->f_path.dentry,
+			    0, 0, file))
 		return false;
 
 	cprm->file = no_free_ptr(file);

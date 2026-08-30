@@ -29,6 +29,7 @@
 #include <net/ndisc.h>
 #include <net/inet_dscp.h>
 #include <net/sock.h>
+#include <net/xfrm_origin.h>
 #include <linux/in_route.h>
 #include <linux/rtnetlink.h>
 #include <linux/rcupdate.h>
@@ -170,7 +171,7 @@ static inline struct rtable *__ip_route_output_key(struct net *net,
 }
 
 struct rtable *ip_route_output_flow(struct net *, struct flowi4 *flp,
-				    const struct sock *sk);
+					     const struct sock *sk);
 struct rtable *ip_route_output_flow_origin(
 				    struct net *net, struct flowi4 *flp,
 				    const struct sock *sk,
@@ -185,7 +186,9 @@ struct dst_entry *ipv4_blackhole_route(struct net *net,
 
 static inline struct rtable *ip_route_output_key(struct net *net, struct flowi4 *flp)
 {
-	return ip_route_output_flow(net, flp, NULL);
+	struct xfrm_flow_origin origin = xfrm_flow_origin_none();
+
+	return ip_route_output_flow_origin(net, flp, NULL, &origin);
 }
 
 /* Simplistic IPv4 route lookup function.
@@ -213,13 +216,15 @@ static inline struct rtable *ip_route_output_ports(struct net *net, struct flowi
 						   __be16 dport, __be16 sport,
 						   __u8 proto, __u8 tos, int oif)
 {
+	struct xfrm_flow_origin origin = xfrm_flow_origin_sock(sk);
+
 	flowi4_init_output(fl4, oif, sk ? READ_ONCE(sk->sk_mark) : 0, tos,
 			   sk ? ip_sock_rt_scope(sk) : RT_SCOPE_UNIVERSE,
 			   proto, sk ? inet_sk_flowi_flags(sk) : 0,
 			   daddr, saddr, dport, sport, sock_net_uid(net, sk));
 	if (sk)
 		security_sk_classify_flow(sk, flowi4_to_flowi_common(fl4));
-	return ip_route_output_flow(net, fl4, sk);
+	return ip_route_output_flow_origin(net, fl4, sk, &origin);
 }
 
 enum skb_drop_reason
@@ -351,6 +356,7 @@ static inline struct rtable *ip_route_connect(struct flowi4 *fl4, __be32 dst,
 					      const struct sock *sk)
 {
 	struct net *net = sock_net(sk);
+	struct xfrm_flow_origin origin = xfrm_flow_origin_sock(sk);
 	struct rtable *rt;
 
 	ip_route_connect_init(fl4, dst, src, oif, protocol, sport, dport, sk);
@@ -363,7 +369,7 @@ static inline struct rtable *ip_route_connect(struct flowi4 *fl4, __be32 dst,
 		flowi4_update_output(fl4, oif, fl4->daddr, fl4->saddr);
 	}
 	security_sk_classify_flow(sk, flowi4_to_flowi_common(fl4));
-	return ip_route_output_flow(net, fl4, sk);
+	return ip_route_output_flow_origin(net, fl4, sk, &origin);
 }
 
 static inline struct rtable *ip_route_newports(struct flowi4 *fl4, struct rtable *rt,
@@ -371,6 +377,8 @@ static inline struct rtable *ip_route_newports(struct flowi4 *fl4, struct rtable
 					       __be16 sport, __be16 dport,
 					       const struct sock *sk)
 {
+	struct xfrm_flow_origin origin = xfrm_flow_origin_sock(sk);
+
 	if (sport != orig_sport || dport != orig_dport) {
 		fl4->fl4_dport = dport;
 		fl4->fl4_sport = sport;
@@ -378,7 +386,8 @@ static inline struct rtable *ip_route_newports(struct flowi4 *fl4, struct rtable
 		flowi4_update_output(fl4, sk->sk_bound_dev_if, fl4->daddr,
 				     fl4->saddr);
 		security_sk_classify_flow(sk, flowi4_to_flowi_common(fl4));
-		return ip_route_output_flow(sock_net(sk), fl4, sk);
+		return ip_route_output_flow_origin(sock_net(sk), fl4, sk,
+						   &origin);
 	}
 	return rt;
 }

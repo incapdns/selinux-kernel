@@ -8984,7 +8984,7 @@ static struct vfsmount *trace_automount(const struct path *path, void *ingore)
 	if (!type)
 		return NULL;
 
-	fc = fs_context_for_submount(type, path);
+	fc = fs_context_for_submount_cred(type, path, current_cred());
 	put_filesystem(type);
 	if (IS_ERR(fc))
 		return ERR_CAST(fc);

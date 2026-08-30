@@ -642,7 +642,7 @@ static void security_dump_masked_av(struct policydb *policydb,
 				 ? permission_names[index] : "????");
 		need_comma = true;
 	}
-	audit_log_end(ab);
+	(void)audit_log_end_status(ab);
 }
 
 /*
@@ -1916,7 +1916,7 @@ static int compute_sid_handle_invalid_context(
 	audit_log_n_untrustedstring(ab, newcontext->str, newcontext->len - 1);
 	audit_log_format(ab, " scontext=%s tcontext=%s tclass=%s",
 			 s, t, sym_name(policydb, SYM_CLASSES, tclass-1));
-	audit_log_end(ab);
+	(void)audit_log_end_status(ab);
 out:
 	if (!enforcing_enabled(state))
 		return 0;
@@ -3478,7 +3478,7 @@ retry:
 					 "op=security_sid_mls_copy invalid_context=");
 			/* don't record NUL with untrusted strings */
 			audit_log_n_untrustedstring(ab, s, len - 1);
-			audit_log_end(ab);
+			(void)audit_log_end_status(ab);
 			goto out_unlock;
 		}
 	}
@@ -4149,8 +4149,8 @@ int selinux_kunit_audit_rule_match(const struct lsm_prop *prop, u32 field,
  * Cache a SID when the security server has a single global policy.  Namespace
  * builds publish a canonical global identity from global_sidtab.c instead.
  */
-static void security_netlbl_cache_add(struct netlbl_lsm_secattr *secattr,
-				      u32 sid)
+static void security_netlbl_cache_add(
+	struct netlbl_lsm_secattr *secattr, u32 sid)
 {
 	u32 *sid_cache;
 

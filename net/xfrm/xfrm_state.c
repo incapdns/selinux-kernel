@@ -3472,7 +3472,7 @@ void xfrm_audit_state_add(struct xfrm_state *x, int result, bool task_valid)
 	xfrm_audit_helper_usrinfo(task_valid, audit_buf);
 	xfrm_audit_helper_sainfo(x, audit_buf);
 	audit_log_format(audit_buf, " res=%u", result);
-	audit_log_end(audit_buf);
+	(void)audit_log_end_status(audit_buf);
 }
 EXPORT_SYMBOL_GPL(xfrm_audit_state_add);
 
@@ -3486,7 +3486,7 @@ void xfrm_audit_state_delete(struct xfrm_state *x, int result, bool task_valid)
 	xfrm_audit_helper_usrinfo(task_valid, audit_buf);
 	xfrm_audit_helper_sainfo(x, audit_buf);
 	audit_log_format(audit_buf, " res=%u", result);
-	audit_log_end(audit_buf);
+	(void)audit_log_end_status(audit_buf);
 }
 EXPORT_SYMBOL_GPL(xfrm_audit_state_delete);
 
@@ -3504,7 +3504,7 @@ void xfrm_audit_state_replay_overflow(struct xfrm_state *x,
 	 * of audit message */
 	spi = ntohl(x->id.spi);
 	audit_log_format(audit_buf, " spi=%u(0x%x)", spi, spi);
-	audit_log_end(audit_buf);
+	(void)audit_log_end_status(audit_buf);
 }
 EXPORT_SYMBOL_GPL(xfrm_audit_state_replay_overflow);
 
@@ -3521,7 +3521,7 @@ void xfrm_audit_state_replay(struct xfrm_state *x,
 	spi = ntohl(x->id.spi);
 	audit_log_format(audit_buf, " spi=%u(0x%x) seqno=%u",
 			 spi, spi, ntohl(net_seq));
-	audit_log_end(audit_buf);
+	(void)audit_log_end_status(audit_buf);
 }
 EXPORT_SYMBOL_GPL(xfrm_audit_state_replay);
 
@@ -3533,7 +3533,7 @@ void xfrm_audit_state_notfound_simple(struct sk_buff *skb, u16 family)
 	if (audit_buf == NULL)
 		return;
 	xfrm_audit_helper_pktinfo(skb, family, audit_buf);
-	audit_log_end(audit_buf);
+	(void)audit_log_end_status(audit_buf);
 }
 EXPORT_SYMBOL_GPL(xfrm_audit_state_notfound_simple);
 
@@ -3550,7 +3550,7 @@ void xfrm_audit_state_notfound(struct sk_buff *skb, u16 family,
 	spi = ntohl(net_spi);
 	audit_log_format(audit_buf, " spi=%u(0x%x) seqno=%u",
 			 spi, spi, ntohl(net_seq));
-	audit_log_end(audit_buf);
+	(void)audit_log_end_status(audit_buf);
 }
 EXPORT_SYMBOL_GPL(xfrm_audit_state_notfound);
 
@@ -3570,7 +3570,7 @@ void xfrm_audit_state_icvfail(struct xfrm_state *x,
 		audit_log_format(audit_buf, " spi=%u(0x%x) seqno=%u",
 				 spi, spi, ntohl(net_seq));
 	}
-	audit_log_end(audit_buf);
+	(void)audit_log_end_status(audit_buf);
 }
 EXPORT_SYMBOL_GPL(xfrm_audit_state_icvfail);
 #endif /* CONFIG_AUDITSYSCALL */

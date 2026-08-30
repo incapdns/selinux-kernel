@@ -1394,7 +1394,9 @@ static int unix_bind_bsd(struct sock *sk, struct sockaddr_un *sunaddr,
 	idmap = mnt_idmap(parent.mnt);
 	err = security_path_mknod(&parent, dentry, mode, 0);
 	if (!err)
-		err = vfs_mknod(idmap, d_inode(parent.dentry), dentry, mode, 0, NULL);
+		err = vfs_mknod_mnt(idmap, parent.mnt,
+				    d_inode(parent.dentry), dentry,
+				    mode, 0, NULL);
 	if (err)
 		goto out_path;
 	err = mutex_lock_interruptible(&u->bindlock);
@@ -1420,7 +1422,7 @@ out_unlock:
 	err = -EINVAL;
 out_unlink:
 	/* failed after successful mknod?  unlink what we'd created... */
-	vfs_unlink(idmap, d_inode(parent.dentry), dentry, NULL);
+	vfs_unlink_mnt(idmap, parent.mnt, d_inode(parent.dentry), dentry, NULL);
 out_path:
 	end_creating_path(&parent, dentry);
 out:

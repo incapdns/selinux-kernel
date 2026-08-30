@@ -43,7 +43,7 @@ audit_tg(struct sk_buff *skb, const struct xt_action_param *par)
 
 	audit_log_nf_skb(ab, skb, xt_family(par));
 
-	audit_log_end(ab);
+	(void)audit_log_end_status(ab);
 
 errout:
 	return XT_CONTINUE;

@@ -542,7 +542,8 @@ int security_inode_init_security_nsfs(struct inode *inode,
 				      struct ns_common *ns);
 int security_inode_create_mnt(const struct vfsmount *mnt, struct inode *dir,
 			      struct dentry *dentry, umode_t mode);
-int security_inode_create(struct inode *dir, struct dentry *dentry, umode_t mode);
+int security_inode_create(struct inode *dir, struct dentry *dentry,
+				   umode_t mode);
 void security_inode_post_create_tmpfile(struct mnt_idmap *idmap,
 					struct inode *inode);
 int security_inode_link_mnt(const struct vfsmount *old_mnt,
@@ -560,19 +561,22 @@ int security_inode_symlink(struct inode *dir, struct dentry *dentry,
 			   const char *old_name);
 int security_inode_mkdir_mnt(const struct vfsmount *mnt, struct inode *dir,
 			     struct dentry *dentry, umode_t mode);
-int security_inode_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode);
+int security_inode_mkdir(struct inode *dir, struct dentry *dentry,
+				  umode_t mode);
 int security_inode_rmdir_mnt(const struct vfsmount *mnt, struct inode *dir,
 			     struct dentry *dentry);
 int security_inode_rmdir(struct inode *dir, struct dentry *dentry);
 int security_inode_mknod_mnt(const struct vfsmount *mnt, struct inode *dir,
 			     struct dentry *dentry, umode_t mode, dev_t dev);
-int security_inode_mknod(struct inode *dir, struct dentry *dentry, umode_t mode, dev_t dev);
+int security_inode_mknod(struct inode *dir, struct dentry *dentry,
+				  umode_t mode, dev_t dev);
 int security_inode_rename_mnt(const struct vfsmount *old_mnt,
 			      struct inode *old_dir, struct dentry *old_dentry,
 			      const struct vfsmount *new_mnt,
 			      struct inode *new_dir, struct dentry *new_dentry,
 			      unsigned int flags);
-int security_inode_rename(struct inode *old_dir, struct dentry *old_dentry,
+int security_inode_rename(struct inode *old_dir,
+				   struct dentry *old_dentry,
 			  struct inode *new_dir, struct dentry *new_dentry,
 			  unsigned int flags);
 int security_inode_readlink_mnt(const struct vfsmount *mnt,
@@ -581,7 +585,8 @@ int security_inode_readlink(struct dentry *dentry);
 int security_inode_follow_link_mnt(const struct vfsmount *mnt,
 				   struct dentry *dentry,
 				   struct inode *inode, bool rcu);
-int security_inode_follow_link(struct dentry *dentry, struct inode *inode,
+int security_inode_follow_link(struct dentry *dentry,
+					struct inode *inode,
 			       bool rcu);
 int security_inode_permission(const struct vfsmount *mnt, struct inode *inode,
 			      int mask);
@@ -590,8 +595,9 @@ int security_inode_setattr_mnt(struct mnt_idmap *idmap,
 			       struct dentry *dentry, struct iattr *attr);
 int security_inode_setattr(struct mnt_idmap *idmap,
 			   struct dentry *dentry, struct iattr *attr);
-void security_inode_post_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
-				 int ia_valid);
+void security_inode_post_setattr(struct mnt_idmap *idmap,
+				 const struct vfsmount *mnt,
+				 struct dentry *dentry, int ia_valid);
 int security_inode_getattr(const struct path *path);
 int security_inode_setxattr_mnt(struct mnt_idmap *idmap,
 				const struct vfsmount *mnt,
@@ -607,7 +613,8 @@ int security_inode_set_acl_mnt(struct mnt_idmap *idmap,
 int security_inode_set_acl(struct mnt_idmap *idmap,
 			   struct dentry *dentry, const char *acl_name,
 			   struct posix_acl *kacl);
-void security_inode_post_set_acl(struct dentry *dentry, const char *acl_name,
+void security_inode_post_set_acl(const struct vfsmount *mnt,
+				 struct dentry *dentry, const char *acl_name,
 				 struct posix_acl *kacl);
 int security_inode_get_acl_mnt(struct mnt_idmap *idmap,
 			       const struct vfsmount *mnt,
@@ -621,9 +628,11 @@ int security_inode_remove_acl_mnt(struct mnt_idmap *idmap,
 int security_inode_remove_acl(struct mnt_idmap *idmap,
 			      struct dentry *dentry, const char *acl_name);
 void security_inode_post_remove_acl(struct mnt_idmap *idmap,
+				    const struct vfsmount *mnt,
 				    struct dentry *dentry,
 				    const char *acl_name);
-void security_inode_post_setxattr(struct dentry *dentry, const char *name,
+void security_inode_post_setxattr(const struct vfsmount *mnt,
+				  struct dentry *dentry, const char *name,
 				  const void *value, size_t size, int flags);
 int security_inode_getxattr_mnt(const struct vfsmount *mnt,
 				struct dentry *dentry, const char *name);
@@ -636,7 +645,8 @@ int security_inode_removexattr_mnt(struct mnt_idmap *idmap,
 				   struct dentry *dentry, const char *name);
 int security_inode_removexattr(struct mnt_idmap *idmap,
 			       struct dentry *dentry, const char *name);
-void security_inode_post_removexattr(struct dentry *dentry, const char *name);
+void security_inode_post_removexattr(const struct vfsmount *mnt,
+				     struct dentry *dentry, const char *name);
 int security_inode_file_setattr_mnt(const struct vfsmount *mnt,
 				    struct dentry *dentry,
 				    struct file_kattr *fa);
@@ -654,14 +664,16 @@ int security_inode_getsecurity(struct mnt_idmap *idmap,
 			       const char *name, void **buffer, bool alloc);
 int security_inode_setsecurity(struct inode *inode, const char *name, const void *value, size_t size, int flags);
 int security_inode_listsecurity(struct inode *inode, char **buffer, ssize_t *remaining_size);
-void security_inode_getlsmprop(struct inode *inode, struct lsm_prop *prop);
+void security_inode_getlsmprop(struct inode *inode,
+					struct lsm_prop *prop);
 int security_inode_copy_up(const struct path *src,
 			   const struct vfsmount *dst_mnt, struct cred **new);
 int security_inode_copy_up_post(const struct path *src,
 				const struct vfsmount *dst_mnt,
 				struct dentry *dst,
 				const struct cred *copy_up_cred);
-int security_inode_copy_up_xattr(struct dentry *src, const char *name);
+int security_inode_copy_up_xattr(const struct vfsmount *src_mnt,
+				 struct dentry *src, const char *name);
 int security_inode_setintegrity(const struct inode *inode,
 				enum lsm_integrity_type type, const void *value,
 				size_t size);
@@ -709,7 +721,8 @@ void security_cred_free(struct cred *cred);
 int security_prepare_creds(struct cred *new, const struct cred *old, gfp_t gfp);
 void security_transfer_creds(struct cred *new, const struct cred *old);
 void security_cred_getsecid(const struct cred *c, u32 *secid);
-void security_cred_getlsmprop(const struct cred *c, struct lsm_prop *prop);
+void security_cred_getlsmprop(const struct cred *c,
+				       struct lsm_prop *prop);
 struct lsm_prop_ref *
 security_lsm_prop_ref_get(struct lsm_prop_ref *ref);
 void security_lsm_prop_ref_put(struct lsm_prop_ref *ref);
@@ -793,7 +806,8 @@ int security_ipc_namespace_create_gate(struct ipc_namespace *ns,
 				       const struct cred *cred);
 void security_ipc_namespace_object_published(struct ipc_namespace *ns);
 int security_ipc_permission(struct kern_ipc_perm *ipcp, short flag);
-void security_ipc_getlsmprop(struct kern_ipc_perm *ipcp, struct lsm_prop *prop);
+void security_ipc_getlsmprop(struct kern_ipc_perm *ipcp,
+				      struct lsm_prop *prop);
 int security_msg_msg_alloc(struct msg_msg *msg);
 void security_msg_msg_free(struct msg_msg *msg);
 int security_msg_queue_alloc(struct ipc_namespace *ns,
@@ -1422,8 +1436,9 @@ static inline int security_inode_setattr(struct mnt_idmap *idmap,
 }
 
 static inline void
-security_inode_post_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
-			    int ia_valid)
+security_inode_post_setattr(struct mnt_idmap *idmap,
+			    const struct vfsmount *mnt,
+			    struct dentry *dentry, int ia_valid)
 { }
 
 static inline int security_inode_getattr(const struct path *path)
@@ -1463,7 +1478,8 @@ static inline int security_inode_set_acl(struct mnt_idmap *idmap,
 	return security_inode_set_acl_mnt(idmap, NULL, dentry, acl_name, kacl);
 }
 
-static inline void security_inode_post_set_acl(struct dentry *dentry,
+static inline void security_inode_post_set_acl(const struct vfsmount *mnt,
+					       struct dentry *dentry,
 					       const char *acl_name,
 					       struct posix_acl *kacl)
 { }
@@ -1499,12 +1515,14 @@ static inline int security_inode_remove_acl(struct mnt_idmap *idmap,
 }
 
 static inline void security_inode_post_remove_acl(struct mnt_idmap *idmap,
+						  const struct vfsmount *mnt,
 						  struct dentry *dentry,
 						  const char *acl_name)
 { }
 
-static inline void security_inode_post_setxattr(struct dentry *dentry,
-		const char *name, const void *value, size_t size, int flags)
+static inline void security_inode_post_setxattr(const struct vfsmount *mnt,
+		struct dentry *dentry, const char *name, const void *value,
+		size_t size, int flags)
 { }
 
 static inline int security_inode_getxattr_mnt(const struct vfsmount *mnt,
@@ -1546,7 +1564,8 @@ static inline int security_inode_removexattr(struct mnt_idmap *idmap,
 	return security_inode_removexattr_mnt(idmap, NULL, dentry, name);
 }
 
-static inline void security_inode_post_removexattr(struct dentry *dentry,
+static inline void security_inode_post_removexattr(const struct vfsmount *mnt,
+						   struct dentry *dentry,
 						   const char *name)
 { }
 
@@ -1607,8 +1626,8 @@ static inline int security_inode_listsecurity(struct inode *inode,
 	return 0;
 }
 
-static inline void security_inode_getlsmprop(struct inode *inode,
-					     struct lsm_prop *prop)
+static inline void security_inode_getlsmprop(
+	struct inode *inode, struct lsm_prop *prop)
 {
 	lsmprop_init(prop);
 }
@@ -1658,7 +1677,9 @@ static inline int security_kernfs_init_security(struct kernfs_node *kn_dir,
 	return 0;
 }
 
-static inline int security_inode_copy_up_xattr(struct dentry *src, const char *name)
+static inline int security_inode_copy_up_xattr(const struct vfsmount *src_mnt,
+					       struct dentry *src,
+					       const char *name)
 {
 	return -EOPNOTSUPP;
 }
@@ -1818,8 +1839,8 @@ static inline void security_cred_getsecid(const struct cred *c, u32 *secid)
 	*secid = 0;
 }
 
-static inline void security_cred_getlsmprop(const struct cred *c,
-					    struct lsm_prop *prop)
+static inline void security_cred_getlsmprop(
+	const struct cred *c, struct lsm_prop *prop)
 { }
 
 static inline struct lsm_prop_ref *
@@ -2128,8 +2149,8 @@ static inline int security_ipc_permission(struct kern_ipc_perm *ipcp,
 	return 0;
 }
 
-static inline void security_ipc_getlsmprop(struct kern_ipc_perm *ipcp,
-					   struct lsm_prop *prop)
+static inline void security_ipc_getlsmprop(
+	struct kern_ipc_perm *ipcp, struct lsm_prop *prop)
 {
 	lsmprop_init(prop);
 }
@@ -3030,8 +3051,8 @@ static inline void security_key_post_create_or_update(struct key *keyring,
 int security_audit_rule_init(u32 field, u32 op, char *rulestr, void **lsmrule,
 			     gfp_t gfp);
 int security_audit_rule_known(struct audit_krule *krule);
-int security_audit_rule_match(const struct lsm_prop *prop, u32 field, u32 op,
-			      void *lsmrule);
+int security_audit_rule_match(const struct lsm_prop *prop, u32 field,
+				       u32 op, void *lsmrule);
 int security_audit_rule_match_ref(const struct lsm_prop_ref *ref, int status,
 				  u32 field, u32 op, void *lsmrule);
 void security_audit_rule_free(void *lsmrule);
@@ -3049,9 +3070,8 @@ static inline int security_audit_rule_known(struct audit_krule *krule)
 	return 0;
 }
 
-static inline int security_audit_rule_match(const struct lsm_prop *prop,
-					    u32 field, u32 op,
-					    void *lsmrule)
+static inline int security_audit_rule_match(
+	const struct lsm_prop *prop, u32 field, u32 op, void *lsmrule)
 {
 	return 0;
 }

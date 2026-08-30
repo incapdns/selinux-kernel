@@ -100,7 +100,11 @@ static int nat_keepalive_send_ipv6(struct sk_buff *skb,
 	local_lock_nested_bh(&nat_keepalive_sk_ipv6.bh_lock);
 	sk = this_cpu_read(nat_keepalive_sk_ipv6.sock);
 	sock_net_set(sk, net);
-	dst = ip6_dst_lookup_flow(net, sk, &fl6, NULL);
+	{
+		struct xfrm_flow_origin origin = xfrm_flow_origin_skb(skb);
+
+		dst = ip6_dst_lookup_flow_origin(net, sk, &fl6, NULL, &origin);
+	}
 	if (IS_ERR(dst)) {
 		local_unlock_nested_bh(&nat_keepalive_sk_ipv6.bh_lock);
 		kfree_skb(skb);

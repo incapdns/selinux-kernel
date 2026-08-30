@@ -165,7 +165,7 @@ static struct vfsmount *afs_mntpt_do_automount(const struct path *path)
 
 	BUG_ON(!d_inode(mntpt));
 
-	fc = fs_context_for_submount(&afs_fs_type, path);
+	fc = fs_context_for_submount_cred(&afs_fs_type, path, current_cred());
 	if (IS_ERR(fc))
 		return ERR_CAST(fc);
 

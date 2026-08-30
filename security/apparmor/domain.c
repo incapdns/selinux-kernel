@@ -327,8 +327,10 @@ static int aa_xattrs_match(const struct linux_binprm *bprm,
 	d = bprm->file->f_path.dentry;
 
 	for (i = 0; i < attach->xattr_count; i++) {
-		size = vfs_getxattr_alloc(&nop_mnt_idmap, d, attach->xattrs[i],
-					  &value, value_size, GFP_KERNEL);
+		size = vfs_getxattr_alloc_mnt(&nop_mnt_idmap,
+					       bprm->file->f_path.mnt, d,
+					       attach->xattrs[i], &value,
+					       value_size, GFP_KERNEL);
 		if (size >= 0) {
 			struct aa_perms *perms;
 

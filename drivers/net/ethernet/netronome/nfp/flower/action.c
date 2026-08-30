@@ -470,7 +470,12 @@ nfp_fl_set_tun(struct nfp_app *app, struct nfp_fl_set_tun *set_tun,
 
 		flow.daddr = ip_tun->key.u.ipv6.dst;
 		flow.flowi4_proto = IPPROTO_UDP;
-		dst = ip6_dst_lookup_flow(net, NULL, &flow, NULL);
+		{
+			struct xfrm_flow_origin origin = xfrm_flow_origin_none();
+
+			dst = ip6_dst_lookup_flow_origin(net, NULL, &flow, NULL,
+							  &origin);
+		}
 		if (!IS_ERR(dst)) {
 			set_tun->ttl = ip6_dst_hoplimit(dst);
 			dst_release(dst);

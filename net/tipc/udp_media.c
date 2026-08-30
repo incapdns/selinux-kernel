@@ -211,8 +211,11 @@ static int tipc_udp_xmit(struct net *net, struct sk_buff *skb,
 				.saddr = src->ipv6,
 				.flowi6_proto = IPPROTO_UDP
 			};
-			ndst = ip6_dst_lookup_flow(net, ub->sk,
-						   &fl6, NULL);
+			struct xfrm_flow_origin origin =
+				xfrm_flow_origin_skb(skb);
+
+			ndst = ip6_dst_lookup_flow_origin(net, ub->sk, &fl6,
+							  NULL, &origin);
 			if (IS_ERR(ndst)) {
 				err = PTR_ERR(ndst);
 				goto tx_error;

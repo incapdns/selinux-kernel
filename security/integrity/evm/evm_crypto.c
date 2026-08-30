@@ -224,7 +224,8 @@ static void dump_security_xattr(const char *name, const char *value,
  * the hmac using the requested xattr value. Don't alloc/free memory for
  * each xattr, but attempt to re-use the previously allocated memory.
  */
-static int evm_calc_hmac_or_hash(struct dentry *dentry,
+static int evm_calc_hmac_or_hash(const struct vfsmount *mnt,
+				 struct dentry *dentry,
 				 const char *req_xattr_name,
 				 const char *req_xattr_value,
 				 size_t req_xattr_value_len,
@@ -278,8 +279,9 @@ static int evm_calc_hmac_or_hash(struct dentry *dentry,
 					    req_xattr_value_len);
 			continue;
 		}
-		size = vfs_getxattr_alloc(&nop_mnt_idmap, dentry, xattr->name,
-					  &xattr_value, xattr_size, GFP_NOFS);
+		size = vfs_getxattr_alloc_mnt(&nop_mnt_idmap, mnt, dentry,
+					      xattr->name, &xattr_value,
+					      xattr_size, GFP_NOFS);
 		if (size == -ENOMEM) {
 			error = -ENOMEM;
 			goto out;
@@ -287,8 +289,8 @@ static int evm_calc_hmac_or_hash(struct dentry *dentry,
 		if (size < 0)
 			continue;
 
-		user_space_size = vfs_getxattr(&nop_mnt_idmap, dentry,
-					       xattr->name, NULL, 0);
+		user_space_size = vfs_getxattr_mnt(&nop_mnt_idmap, mnt, dentry,
+						   xattr->name, NULL, 0);
 		if (user_space_size != size)
 			pr_debug("file %s: xattr %s size mismatch (kernel: %d, user: %d)\n",
 				 dentry->d_name.name, xattr->name, size,
@@ -319,24 +321,27 @@ out:
 	return error;
 }
 
-int evm_calc_hmac(struct dentry *dentry, const char *req_xattr_name,
+int evm_calc_hmac(const struct vfsmount *mnt, struct dentry *dentry,
+		  const char *req_xattr_name,
 		  const char *req_xattr_value, size_t req_xattr_value_len,
 		  struct evm_digest *data, struct evm_iint_cache *iint)
 {
-	return evm_calc_hmac_or_hash(dentry, req_xattr_name, req_xattr_value,
+	return evm_calc_hmac_or_hash(mnt, dentry, req_xattr_name, req_xattr_value,
 				    req_xattr_value_len, EVM_XATTR_HMAC, data,
 				    iint);
 }
 
-int evm_calc_hash(struct dentry *dentry, const char *req_xattr_name,
+int evm_calc_hash(const struct vfsmount *mnt, struct dentry *dentry,
+		  const char *req_xattr_name,
 		  const char *req_xattr_value, size_t req_xattr_value_len,
 		  char type, struct evm_digest *data, struct evm_iint_cache *iint)
 {
-	return evm_calc_hmac_or_hash(dentry, req_xattr_name, req_xattr_value,
+	return evm_calc_hmac_or_hash(mnt, dentry, req_xattr_name, req_xattr_value,
 				     req_xattr_value_len, type, data, iint);
 }
 
-static int evm_is_immutable(struct dentry *dentry, struct inode *inode)
+static int evm_is_immutable(const struct vfsmount *mnt, struct dentry *dentry,
+			    struct inode *inode)
 {
 	const struct evm_ima_xattr_data *xattr_data = NULL;
 	struct evm_iint_cache *iint;
@@ -347,8 +352,9 @@ static int evm_is_immutable(struct dentry *dentry, struct inode *inode)
 		return 1;
 
 	/* Do this the hard way */
-	rc = vfs_getxattr_alloc(&nop_mnt_idmap, dentry, XATTR_NAME_EVM,
-				(char **)&xattr_data, 0, GFP_NOFS);
+	rc = vfs_getxattr_alloc_mnt(&nop_mnt_idmap, mnt, dentry,
+				    XATTR_NAME_EVM, (char **)&xattr_data, 0,
+				    GFP_NOFS);
 	if (rc <= 0) {
 		if (rc == -ENODATA)
 			rc = 0;
@@ -370,7 +376,8 @@ out:
  *
  * Expects to be called with i_mutex locked.
  */
-int evm_update_evmxattr(struct dentry *dentry, const char *xattr_name,
+int evm_update_evmxattr(const struct vfsmount *mnt, struct dentry *dentry,
+			const char *xattr_name,
 			const char *xattr_value, size_t xattr_value_len)
 {
 	struct inode *inode = d_backing_inode(dentry);
@@ -382,21 +389,20 @@ int evm_update_evmxattr(struct dentry *dentry, const char *xattr_name,
 	 * Don't permit any transformation of the EVM xattr if the signature
 	 * is of an immutable type
 	 */
-	rc = evm_is_immutable(dentry, inode);
+	rc = evm_is_immutable(mnt, dentry, inode);
 	if (rc < 0)
 		return rc;
 	if (rc)
 		return -EPERM;
 
 	data.hdr.algo = HASH_ALGO_SHA1;
-	rc = evm_calc_hmac(dentry, xattr_name, xattr_value,
+	rc = evm_calc_hmac(mnt, dentry, xattr_name, xattr_value,
 			   xattr_value_len, &data, iint);
 	if (rc == 0) {
 		data.hdr.xattr.sha1.type = EVM_XATTR_HMAC;
-		rc = __vfs_setxattr_noperm(&nop_mnt_idmap, dentry,
-					   XATTR_NAME_EVM,
-					   &data.hdr.xattr.data[1],
-					   SHA1_DIGEST_SIZE + 1, 0);
+		rc = __vfs_setxattr_noperm_mnt(
+			&nop_mnt_idmap, mnt, dentry, XATTR_NAME_EVM,
+			&data.hdr.xattr.data[1], SHA1_DIGEST_SIZE + 1, 0);
 	} else if (rc == -ENODATA && (inode->i_opflags & IOP_XATTR)) {
 		rc = __vfs_removexattr(&nop_mnt_idmap, dentry, XATTR_NAME_EVM);
 	}

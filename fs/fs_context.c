@@ -368,8 +368,8 @@ static struct fs_context *__fs_context_for_submount(
  *
  * Return: A new filesystem context or an error pointer.
  */
-struct fs_context *fs_context_for_submount(struct file_system_type *type,
-					   const struct path *reference)
+struct fs_context *fs_context_for_submount(
+	struct file_system_type *type, const struct path *reference)
 {
 	return __fs_context_for_submount(type, reference, NULL);
 }

@@ -2187,7 +2187,8 @@ int security_inode_mkdir_mnt(const struct vfsmount *mnt, struct inode *dir,
 }
 EXPORT_SYMBOL_GPL(security_inode_mkdir_mnt);
 
-int security_inode_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)
+int security_inode_mkdir(struct inode *dir, struct dentry *dentry,
+				  umode_t mode)
 {
 	return security_inode_mkdir_mnt(NULL, dir, dentry, mode);
 }
@@ -2281,7 +2282,8 @@ int security_inode_rename_mnt(const struct vfsmount *old_mnt,
 			     new_mnt, new_dir, new_dentry);
 }
 
-int security_inode_rename(struct inode *old_dir, struct dentry *old_dentry,
+int security_inode_rename(struct inode *old_dir,
+				   struct dentry *old_dentry,
 			  struct inode *new_dir, struct dentry *new_dentry,
 			  unsigned int flags)
 {
@@ -2332,7 +2334,8 @@ int security_inode_follow_link_mnt(const struct vfsmount *mnt,
 	return call_int_hook(inode_follow_link, mnt, dentry, inode, rcu);
 }
 
-int security_inode_follow_link(struct dentry *dentry, struct inode *inode,
+int security_inode_follow_link(struct dentry *dentry,
+					struct inode *inode,
 			       bool rcu)
 {
 	return security_inode_follow_link_mnt(NULL, dentry, inode, rcu);
@@ -2395,17 +2398,19 @@ EXPORT_SYMBOL_GPL(security_inode_setattr);
 /**
  * security_inode_post_setattr() - Update the inode after a setattr operation
  * @idmap: idmap of the mount
+ * @mnt: mount selecting the LSM label view
  * @dentry: file
  * @ia_valid: file attributes set
  *
  * Update inode security field after successful setting file attributes.
  */
-void security_inode_post_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
-				 int ia_valid)
+void security_inode_post_setattr(struct mnt_idmap *idmap,
+				 const struct vfsmount *mnt,
+				 struct dentry *dentry, int ia_valid)
 {
 	if (unlikely(IS_PRIVATE(d_backing_inode(dentry))))
 		return;
-	call_void_hook(inode_post_setattr, idmap, dentry, ia_valid);
+	call_void_hook(inode_post_setattr, idmap, mnt, dentry, ia_valid);
 }
 
 /**
@@ -2511,6 +2516,7 @@ int security_inode_set_acl(struct mnt_idmap *idmap,
 
 /**
  * security_inode_post_set_acl() - Update inode security from posix acls set
+ * @mnt: mount selecting the LSM label view
  * @dentry: file
  * @acl_name: acl name
  * @kacl: acl struct
@@ -2518,12 +2524,13 @@ int security_inode_set_acl(struct mnt_idmap *idmap,
  * Update inode security data after successfully setting posix acls on @dentry.
  * The posix acls in @kacl are identified by @acl_name.
  */
-void security_inode_post_set_acl(struct dentry *dentry, const char *acl_name,
+void security_inode_post_set_acl(const struct vfsmount *mnt,
+				 struct dentry *dentry, const char *acl_name,
 				 struct posix_acl *kacl)
 {
 	if (unlikely(IS_PRIVATE(d_backing_inode(dentry))))
 		return;
-	call_void_hook(inode_post_set_acl, dentry, acl_name, kacl);
+	call_void_hook(inode_post_set_acl, mnt, dentry, acl_name, kacl);
 }
 
 /**
@@ -2584,6 +2591,7 @@ int security_inode_remove_acl(struct mnt_idmap *idmap,
 /**
  * security_inode_post_remove_acl() - Update inode security after rm posix acls
  * @idmap: idmap of the mount
+ * @mnt: mount selecting the LSM label view
  * @dentry: file
  * @acl_name: acl name
  *
@@ -2591,15 +2599,17 @@ int security_inode_remove_acl(struct mnt_idmap *idmap,
  * @dentry in @idmap. The posix acls are identified by @acl_name.
  */
 void security_inode_post_remove_acl(struct mnt_idmap *idmap,
+				    const struct vfsmount *mnt,
 				    struct dentry *dentry, const char *acl_name)
 {
 	if (unlikely(IS_PRIVATE(d_backing_inode(dentry))))
 		return;
-	call_void_hook(inode_post_remove_acl, idmap, dentry, acl_name);
+	call_void_hook(inode_post_remove_acl, idmap, mnt, dentry, acl_name);
 }
 
 /**
  * security_inode_post_setxattr() - Update the inode after a setxattr operation
+ * @mnt: mount selecting the LSM label view
  * @dentry: file
  * @name: xattr name
  * @value: xattr value
@@ -2608,12 +2618,14 @@ void security_inode_post_remove_acl(struct mnt_idmap *idmap,
  *
  * Update inode security field after successful setxattr operation.
  */
-void security_inode_post_setxattr(struct dentry *dentry, const char *name,
+void security_inode_post_setxattr(const struct vfsmount *mnt,
+				  struct dentry *dentry, const char *name,
 				  const void *value, size_t size, int flags)
 {
 	if (unlikely(IS_PRIVATE(d_backing_inode(dentry))))
 		return;
-	call_void_hook(inode_post_setxattr, dentry, name, value, size, flags);
+	call_void_hook(inode_post_setxattr, mnt, dentry, name, value, size,
+		       flags);
 }
 
 /**
@@ -2714,16 +2726,18 @@ int security_inode_removexattr(struct mnt_idmap *idmap,
 
 /**
  * security_inode_post_removexattr() - Update the inode after a removexattr op
+ * @mnt: mount selecting the LSM label view
  * @dentry: file
  * @name: xattr name
  *
  * Update the inode after a successful removexattr operation.
  */
-void security_inode_post_removexattr(struct dentry *dentry, const char *name)
+void security_inode_post_removexattr(const struct vfsmount *mnt,
+				     struct dentry *dentry, const char *name)
 {
 	if (unlikely(IS_PRIVATE(d_backing_inode(dentry))))
 		return;
-	call_void_hook(inode_post_removexattr, dentry, name);
+	call_void_hook(inode_post_removexattr, mnt, dentry, name);
 }
 
 /**
@@ -2744,7 +2758,8 @@ int security_inode_file_setattr_mnt(const struct vfsmount *mnt,
 	return call_int_hook(inode_file_setattr, mnt, dentry, fa);
 }
 
-int security_inode_file_setattr(struct dentry *dentry, struct file_kattr *fa)
+int security_inode_file_setattr(struct dentry *dentry,
+					 struct file_kattr *fa)
 {
 	return security_inode_file_setattr_mnt(NULL, dentry, fa);
 }
@@ -2767,7 +2782,8 @@ int security_inode_file_getattr_mnt(const struct vfsmount *mnt,
 	return call_int_hook(inode_file_getattr, mnt, dentry, fa);
 }
 
-int security_inode_file_getattr(struct dentry *dentry, struct file_kattr *fa)
+int security_inode_file_getattr(struct dentry *dentry,
+					 struct file_kattr *fa)
 {
 	return security_inode_file_getattr_mnt(NULL, dentry, fa);
 }
@@ -2888,7 +2904,8 @@ EXPORT_SYMBOL(security_inode_listsecurity);
  *
  * Get the lsm specific information associated with the node.
  */
-void security_inode_getlsmprop(struct inode *inode, struct lsm_prop *prop)
+void security_inode_getlsmprop(struct inode *inode,
+					struct lsm_prop *prop)
 {
 	call_void_hook(inode_getlsmprop, inode, prop);
 }
@@ -2933,6 +2950,7 @@ EXPORT_SYMBOL(security_inode_copy_up_post);
 
 /**
  * security_inode_copy_up_xattr() - Filter xattrs in an overlayfs copy-up op
+ * @src_mnt: lower-layer mount selecting the LSM label view
  * @src: union dentry of copy-up file
  * @name: xattr name
  *
@@ -2944,11 +2962,12 @@ EXPORT_SYMBOL(security_inode_copy_up_post);
  *         -EOPNOTSUPP if the security module does not know about attribute,
  *         or a negative error code to abort the copy up.
  */
-int security_inode_copy_up_xattr(struct dentry *src, const char *name)
+int security_inode_copy_up_xattr(const struct vfsmount *src_mnt,
+				 struct dentry *src, const char *name)
 {
 	int rc;
 
-	rc = call_int_hook(inode_copy_up_xattr, src, name);
+	rc = call_int_hook(inode_copy_up_xattr, src_mnt, src, name);
 	if (rc != LSM_RET_DEFAULT(inode_copy_up_xattr))
 		return rc;
 
@@ -3637,14 +3656,15 @@ void security_cred_getsecid(const struct cred *c, u32 *secid)
 EXPORT_SYMBOL(security_cred_getsecid);
 
 /**
- * security_cred_getlsmprop() - Get the LSM data from a set of credentials
+ * security_cred_getlsmprop() - Get LSM data from credentials
  * @c: credentials
  * @prop: destination for the LSM data
  *
  * Retrieve the security data of the cred structure @c.  In case of
  * failure, @prop will be cleared.
  */
-void security_cred_getlsmprop(const struct cred *c, struct lsm_prop *prop)
+void security_cred_getlsmprop(const struct cred *c,
+				       struct lsm_prop *prop)
 {
 	lsmprop_init(prop);
 	call_void_hook(cred_getlsmprop, c, prop);
@@ -3945,7 +3965,7 @@ int security_kernel_act_as_ref(struct cred *new,
 EXPORT_SYMBOL(security_kernel_act_as_ref);
 
 /**
- * security_kernel_act_as() - Set the kernel credentials to act as secid
+ * security_kernel_act_as() - Set kernel credentials to act as secid
  * @new: credentials
  * @secid: secid
  *
@@ -4528,14 +4548,15 @@ int security_ipc_permission(struct kern_ipc_perm *ipcp, short flag)
 }
 
 /**
- * security_ipc_getlsmprop() - Get the sysv ipc object LSM data
+ * security_ipc_getlsmprop() - Get sysv ipc object LSM data
  * @ipcp: ipc permission structure
  * @prop: pointer to lsm information
  *
  * Get the lsm information associated with the ipc object.
  */
 
-void security_ipc_getlsmprop(struct kern_ipc_perm *ipcp, struct lsm_prop *prop)
+void security_ipc_getlsmprop(struct kern_ipc_perm *ipcp,
+				      struct lsm_prop *prop)
 {
 	lsmprop_init(prop);
 	call_void_hook(ipc_getlsmprop, ipcp, prop);
@@ -6697,7 +6718,7 @@ void security_audit_rule_free(void *lsmrule)
 }
 
 /**
- * security_audit_rule_match() - Check if a label matches an audit rule
+ * security_audit_rule_match() - Check label against an audit rule
  * @prop: security label
  * @field: LSM audit field
  * @op: matching operator
@@ -6709,8 +6730,8 @@ void security_audit_rule_free(void *lsmrule)
  * Return: Returns 1 if secid matches the rule, 0 if it does not, -ERRNO on
  *         failure.
  */
-int security_audit_rule_match(const struct lsm_prop *prop, u32 field, u32 op,
-			      void *lsmrule)
+int security_audit_rule_match(const struct lsm_prop *prop, u32 field,
+				       u32 op, void *lsmrule)
 {
 	return call_int_hook(audit_rule_match, NULL, prop, field, op, lsmrule);
 }

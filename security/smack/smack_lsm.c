@@ -1439,7 +1439,8 @@ static int smack_inode_setxattr(struct mnt_idmap *idmap,
  * Set the pointer in the inode blob to the entry found
  * in the master label list.
  */
-static void smack_inode_post_setxattr(struct dentry *dentry, const char *name,
+static void smack_inode_post_setxattr(const struct vfsmount *mnt,
+				      struct dentry *dentry, const char *name,
 				      const void *value, size_t size, int flags)
 {
 	struct smack_known *skp;
@@ -2226,13 +2227,14 @@ static void smack_cred_getlsmprop(const struct cred *cred,
 }
 
 /**
- * smack_kernel_act_as - Set the subjective context in a set of credentials
+ * smack_kernel_act_as - Set subjective context in credentials
  * @new: points to the set of credentials to be modified.
  * @secid: specifies the security ID to be set
  *
  * Set the security data for a kernel service.
  */
-static int smack_kernel_act_as(struct cred *new, u32 secid)
+static int __maybe_unused smack_kernel_act_as(struct cred *new,
+						       u32 secid)
 {
 	struct task_smack *new_tsp = smack_cred(new);
 
@@ -5090,8 +5092,10 @@ static int smack_inode_notifysecctx(struct inode *inode, void *ctx, u32 ctxlen)
 
 static int smack_inode_setsecctx(struct dentry *dentry, void *ctx, u32 ctxlen)
 {
-	return __vfs_setxattr_locked(&nop_mnt_idmap, dentry, XATTR_NAME_SMACK,
-				     ctx, ctxlen, 0, NULL);
+	/* This intrinsic inode hook has no path from which to obtain a mount. */
+	return __vfs_setxattr_locked_mnt(&nop_mnt_idmap, NULL, dentry,
+					 XATTR_NAME_SMACK, ctx, ctxlen, 0,
+					 NULL);
 }
 
 static int smack_inode_getsecctx(struct inode *inode, struct lsm_context *cp)
@@ -5132,7 +5136,8 @@ static int smack_inode_copy_up(const struct path *src,
 	return 0;
 }
 
-static int smack_inode_copy_up_xattr(struct dentry *src, const char *name)
+static int smack_inode_copy_up_xattr(const struct vfsmount *src_mnt,
+				     struct dentry *src, const char *name)
 {
 	/*
 	 * Return -ECANCELED if this is the smack access Smack attribute.
@@ -5324,7 +5329,6 @@ static struct security_hook_list smack_hooks[] __ro_after_init = {
 	LSM_HOOK_INIT(cred_transfer, smack_cred_transfer),
 	LSM_HOOK_INIT(cred_getsecid, smack_cred_getsecid),
 	LSM_HOOK_INIT(cred_getlsmprop, smack_cred_getlsmprop),
-	LSM_HOOK_INIT(kernel_act_as, smack_kernel_act_as),
 	LSM_HOOK_INIT(kernel_create_files_as, smack_kernel_create_files_as),
 	LSM_HOOK_INIT(task_setpgid, smack_task_setpgid),
 	LSM_HOOK_INIT(task_getpgid, smack_task_getpgid),

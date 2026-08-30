@@ -2043,8 +2043,8 @@ err_label:
 }
 
 #ifdef CONFIG_SECURITY_SELINUX_KUNIT_TEST
-static int security_netlbl_cache_add(struct netlbl_lsm_secattr *secattr,
-				     u32 sid)
+static int __maybe_unused
+security_netlbl_cache_add(struct netlbl_lsm_secattr *secattr, u32 sid)
 {
 	struct selinux_global_sid_handle *handle;
 	int rc;
@@ -2088,7 +2088,16 @@ security_netlbl_ss_sid_to_global_handle(struct selinux_state *state,
 int selinux_kunit_netlbl_cache_add(struct netlbl_lsm_secattr *secattr,
 				   u32 sid)
 {
-	return security_netlbl_cache_add(secattr, sid);
+	struct selinux_global_sid_handle *handle;
+	int rc;
+
+	handle = global_sid_handle_get(sid);
+	if (IS_ERR(handle))
+		return PTR_ERR(handle);
+	rc = security_netlbl_cache_add_handle(secattr, handle, sid);
+	if (rc)
+		global_sid_handle_put(handle);
+	return rc;
 }
 
 int selinux_kunit_netlbl_cache_corrupt(struct netlbl_lsm_secattr *secattr,
@@ -2242,8 +2251,14 @@ int security_netlbl_secattr_to_sid(struct selinux_state *state,
 				   struct netlbl_lsm_secattr *secattr,
 				   u32 *out_sid)
 {
-	return security_netlbl_secattr_to_sid_view(state, NULL, secattr,
-						   out_sid);
+	struct selinux_global_sid_handle *handle;
+
+	handle = security_netlbl_secattr_to_sid_view_handle(
+		state, NULL, secattr, out_sid);
+	if (IS_ERR(handle))
+		return PTR_ERR(handle);
+	global_sid_handle_put(handle);
+	return 0;
 }
 
 int security_netlbl_sid_to_secattr(struct selinux_state *state, u32 sid,

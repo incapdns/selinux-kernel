@@ -129,8 +129,8 @@ extern struct fs_context *fs_context_for_mount(struct file_system_type *fs_type,
 extern struct fs_context *fs_context_for_reconfigure(struct dentry *dentry,
 						unsigned int sb_flags,
 						unsigned int sb_flags_mask);
-extern struct fs_context *fs_context_for_submount(struct file_system_type *fs_type,
-						  const struct path *reference);
+extern struct fs_context *fs_context_for_submount(
+	struct file_system_type *fs_type, const struct path *reference);
 extern struct fs_context *fs_context_for_submount_cred(
 	struct file_system_type *fs_type, const struct path *reference,
 	const struct cred *cred);

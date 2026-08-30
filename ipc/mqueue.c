@@ -973,8 +973,8 @@ SYSCALL_DEFINE1(mq_unlink, const char __user *, u_name)
 
 	inode = d_inode(dentry);
 	ihold(inode);
-	err = vfs_unlink(&nop_mnt_idmap, d_inode(mnt->mnt_root),
-			 dentry, NULL);
+	err = vfs_unlink_mnt(&nop_mnt_idmap, mnt, d_inode(mnt->mnt_root),
+			     dentry, NULL);
 	end_removing(dentry);
 	iput(inode);
 

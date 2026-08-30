@@ -683,10 +683,19 @@ retry:
 		case LSM_SUBJ_USER:
 		case LSM_SUBJ_ROLE:
 		case LSM_SUBJ_TYPE:
-			rc = ima_filter_rule_match(prop, lsm_rule->lsm[i].type,
-						   Audit_equal,
-						   lsm_rule->lsm[i].rule);
+		{
+			struct lsm_prop_ref *subject_ref = NULL;
+			int subject_status;
+
+			subject_status = security_cred_getlsmprop_ref(
+				cred, GFP_ATOMIC, &subject_ref);
+			rc = ima_filter_rule_match_ref(subject_ref, subject_status,
+					       lsm_rule->lsm[i].type,
+					       Audit_equal,
+					       lsm_rule->lsm[i].rule);
+			security_lsm_prop_ref_put(subject_ref);
 			break;
+		}
 		default:
 			break;
 		}
@@ -1985,7 +1994,7 @@ static int ima_parse_rule(char *rule, struct ima_rule_entry *entry)
 	}
 
 	audit_log_format(ab, "res=%d", !result);
-	audit_log_end(ab);
+	(void)audit_log_end_status(ab);
 	return result;
 }
 

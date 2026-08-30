@@ -407,7 +407,8 @@ int sel_netif_sid(struct selinux_state *state, struct net *ns, int ifindex,
 			continue;
 		if (rc)
 			return rc;
-		rc = sel_netif_sid_snapshot(state, &snapshot, ns, ifindex, sid);
+		rc = sel_netif_sid_snapshot(state, &snapshot, ns, ifindex,
+					     sid);
 		if (rc != -ESTALE)
 			return rc;
 	}

@@ -200,7 +200,8 @@ int do_ftruncate(struct file *file, loff_t length, unsigned int flags)
 		return error;
 
 	scoped_guard(super_write, inode->i_sb)
-		return do_truncate(file_mnt_idmap(file), dentry, length,
+		return do_truncate_mnt(file_mnt_idmap(file), file->f_path.mnt,
+				       dentry, length,
 				   ATTR_MTIME | ATTR_CTIME, file);
 }
 

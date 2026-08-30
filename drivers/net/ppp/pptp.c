@@ -130,9 +130,12 @@ static void del_chan(struct pppox_sock *sock)
 }
 
 static struct rtable *pptp_route_output(const struct pppox_sock *po,
-					struct flowi4 *fl4)
+					struct flowi4 *fl4,
+					const struct sk_buff *skb)
 {
 	const struct sock *sk = &po->sk;
+	struct xfrm_flow_origin origin = skb ? xfrm_flow_origin_skb(skb) :
+						     xfrm_flow_origin_sock(sk);
 	struct net *net;
 
 	net = sock_net(sk);
@@ -143,7 +146,7 @@ static struct rtable *pptp_route_output(const struct pppox_sock *po,
 			   0, 0, sock_net_uid(net, sk));
 	security_sk_classify_flow(sk, flowi4_to_flowi_common(fl4));
 
-	return ip_route_output_flow(net, fl4, sk);
+	return ip_route_output_flow_origin(net, fl4, sk, &origin);
 }
 
 static int pptp_xmit(struct ppp_channel *chan, struct sk_buff *skb)
@@ -167,7 +170,7 @@ static int pptp_xmit(struct ppp_channel *chan, struct sk_buff *skb)
 	if (po->sk.sk_state & PPPOX_DEAD)
 		goto tx_drop;
 
-	rt = pptp_route_output(po, &fl4);
+	rt = pptp_route_output(po, &fl4, skb);
 	if (IS_ERR(rt))
 		goto tx_drop;
 
@@ -456,7 +459,7 @@ static int pptp_connect(struct socket *sock, struct sockaddr_unsized *uservaddr,
 	po->chan.private = sk;
 	po->chan.ops = &pptp_chan_ops;
 
-	rt = pptp_route_output(po, &fl4);
+	rt = pptp_route_output(po, &fl4, NULL);
 	if (IS_ERR(rt)) {
 		error = -EHOSTUNREACH;
 		goto end;

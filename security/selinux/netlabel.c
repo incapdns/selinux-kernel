@@ -72,7 +72,8 @@ static int selinux_netlbl_sidlookup_cached(
 {
 	int rc;
 
-	rc = security_netlbl_secattr_to_sid_view(state, view, secattr, sid);
+	rc = security_netlbl_secattr_to_sid_view(
+		state, view, secattr, sid);
 	if (!rc && (secattr->flags & NETLBL_SECATTR_CACHEABLE) &&
 	    (secattr->flags & NETLBL_SECATTR_CACHE))
 		netlbl_cache_add(skb, family, secattr);
@@ -274,8 +275,8 @@ int selinux_netlbl_source_sid(
 	secattr.flags = NETLBL_SECATTR_CACHE;
 	secattr.type = source->type;
 	secattr.cache = source->cache;
-	return security_netlbl_secattr_to_sid_view(state, source->view,
-						   &secattr, sid);
+	return security_netlbl_secattr_to_sid_view(
+		state, source->view, &secattr, sid);
 #endif
 }
 
@@ -455,7 +456,8 @@ int selinux_netlbl_skbuff_getsid(struct sk_buff *skb, u16 family,
 	struct selinux_netlbl_source source;
 	int rc;
 
-	rc = selinux_netlbl_skbuff_get_source(skb, family, state, &source, sid);
+	rc = selinux_netlbl_skbuff_get_source(
+		skb, family, state, &source, sid);
 	*type = source.type;
 	selinux_netlbl_source_put(&source);
 	return rc;

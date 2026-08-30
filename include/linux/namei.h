@@ -71,7 +71,8 @@ extern struct dentry *lookup_noperm(struct qstr *, struct dentry *);
 extern struct dentry *lookup_noperm_unlocked(struct qstr *, struct dentry *);
 extern struct dentry *lookup_noperm_positive_unlocked(struct qstr *, struct dentry *);
 /* Legacy inode-only entry points; use the _mnt variants for path operations. */
-struct dentry *lookup_one(struct mnt_idmap *, struct qstr *, struct dentry *);
+struct dentry *lookup_one(struct mnt_idmap *, struct qstr *,
+				   struct dentry *);
 struct dentry *lookup_one_mnt(struct mnt_idmap *idmap,
 			      const struct vfsmount *mnt,
 			      struct qstr *name, struct dentry *base);
@@ -96,12 +97,14 @@ struct dentry *lookup_one_positive_killable_mnt(struct mnt_idmap *idmap,
 						struct dentry *base);
 
 /* Legacy inode-only entry points; use the _mnt variants for path operations. */
-struct dentry *start_creating(struct mnt_idmap *idmap, struct dentry *parent,
+struct dentry *start_creating(struct mnt_idmap *idmap,
+			       struct dentry *parent,
 			      struct qstr *name);
 struct dentry *start_creating_mnt(struct mnt_idmap *idmap,
 				  const struct vfsmount *mnt,
 				  struct dentry *parent, struct qstr *name);
-struct dentry *start_removing(struct mnt_idmap *idmap, struct dentry *parent,
+struct dentry *start_removing(struct mnt_idmap *idmap,
+			       struct dentry *parent,
 			      struct qstr *name);
 struct dentry *start_removing_mnt(struct mnt_idmap *idmap,
 				  const struct vfsmount *mnt,

@@ -499,7 +499,12 @@ static int l2tp_ip_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 		 * keep trying until route appears or the connection times
 		 * itself out.
 		 */
-		rt = ip_route_output_flow(sock_net(sk), fl4, sk);
+		{
+			struct xfrm_flow_origin origin = xfrm_flow_origin_skb(skb);
+
+			rt = ip_route_output_flow_origin(sock_net(sk), fl4, sk,
+							 &origin);
+		}
 		if (IS_ERR(rt))
 			goto no_route;
 		if (connected) {

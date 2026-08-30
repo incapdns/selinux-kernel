@@ -56,6 +56,8 @@ int cachefiles_kunit_apply_secctx_ref(struct lsm_prop_ref *ref,
 		.secctx_ref = ref,
 		.secid = diagnostic_secid,
 	};
+	struct lsm_prop_ref *applied_ref = NULL;
+	const struct lsm_prop *prop;
 	int ret;
 
 	if (!ref || !applied_prop)
@@ -64,9 +66,18 @@ int cachefiles_kunit_apply_secctx_ref(struct lsm_prop_ref *ref,
 	ret = cachefiles_get_security_ID(&cache);
 	if (ret)
 		return ret;
-	security_cred_getlsmprop(cache.cache_cred, applied_prop);
+	ret = security_cred_getlsmprop_ref(cache.cache_cred, GFP_KERNEL,
+					    &applied_ref);
+	if (!ret) {
+		prop = security_lsm_prop_ref_prop(applied_ref);
+		if (prop)
+			*applied_prop = *prop;
+		else
+			ret = -EIO;
+	}
+	security_lsm_prop_ref_put(applied_ref);
 	put_cred(cache.cache_cred);
-	return 0;
+	return ret;
 }
 #endif
 

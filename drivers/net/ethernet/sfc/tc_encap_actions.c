@@ -149,7 +149,12 @@ static int efx_bind_neigh(struct efx_nic *efx,
 #if IS_ENABLED(CONFIG_IPV6)
 			struct dst_entry *dst;
 
-			dst = ip6_dst_lookup_flow(net, NULL, &flow6, NULL);
+			{
+				struct xfrm_flow_origin origin = xfrm_flow_origin_none();
+
+				dst = ip6_dst_lookup_flow_origin(net, NULL, &flow6,
+								  NULL, &origin);
+			}
 			rc = PTR_ERR_OR_ZERO(dst);
 			if (rc) {
 				NL_SET_ERR_MSG_MOD(extack, "Failed to lookup route for IPv6 encap");

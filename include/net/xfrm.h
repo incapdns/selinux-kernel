@@ -19,6 +19,7 @@
 
 #include <net/sock.h>
 #include <net/dst.h>
+#include <net/xfrm_origin.h>
 #include <net/inet_dscp.h>
 #include <net/ip.h>
 #include <net/route.h>
@@ -32,62 +33,6 @@
 #ifdef CONFIG_XFRM_STATISTICS
 #include <net/snmp.h>
 #endif
-
-struct request_sock;
-
-/*
- * Object which supplied flowi_secid.  This is a typed borrowed reference: the
- * caller keeps the selected object alive for the complete synchronous XFRM
- * lookup, and each LSM takes its own durable reference before publication.
- * The scalar flowi_secid remains only a compatibility mirror.
- */
-enum xfrm_flow_origin_kind {
-	XFRM_FLOW_ORIGIN_NONE,
-	XFRM_FLOW_ORIGIN_SOCK,
-	XFRM_FLOW_ORIGIN_REQUEST,
-	XFRM_FLOW_ORIGIN_SKB,
-};
-
-struct xfrm_flow_origin {
-	enum xfrm_flow_origin_kind kind;
-	union {
-		const struct sock *sk;
-		const struct request_sock *req;
-		const struct sk_buff *skb;
-	};
-};
-
-static inline struct xfrm_flow_origin xfrm_flow_origin_none(void)
-{
-	return (struct xfrm_flow_origin) { .kind = XFRM_FLOW_ORIGIN_NONE };
-}
-
-static inline struct xfrm_flow_origin
-xfrm_flow_origin_sock(const struct sock *sk)
-{
-	return (struct xfrm_flow_origin) {
-		.kind = sk ? XFRM_FLOW_ORIGIN_SOCK : XFRM_FLOW_ORIGIN_NONE,
-		.sk = sk,
-	};
-}
-
-static inline struct xfrm_flow_origin
-xfrm_flow_origin_request(const struct request_sock *req)
-{
-	return (struct xfrm_flow_origin) {
-		.kind = req ? XFRM_FLOW_ORIGIN_REQUEST : XFRM_FLOW_ORIGIN_NONE,
-		.req = req,
-	};
-}
-
-static inline struct xfrm_flow_origin
-xfrm_flow_origin_skb(const struct sk_buff *skb)
-{
-	return (struct xfrm_flow_origin) {
-		.kind = skb ? XFRM_FLOW_ORIGIN_SKB : XFRM_FLOW_ORIGIN_NONE,
-		.skb = skb,
-	};
-}
 
 #define XFRM_PROTO_ESP		50
 #define XFRM_PROTO_AH		51

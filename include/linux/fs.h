@@ -1846,7 +1846,8 @@ struct vfs_mkobj_ops {
 	u32 security_create_plan_ops;
 };
 
-int vfs_mkobj(struct dentry *, umode_t, const struct vfs_mkobj_ops *, void *);
+int vfs_mkobj(struct dentry *, umode_t,
+		       const struct vfs_mkobj_ops *, void *);
 int vfs_mkobj_mnt(const struct vfsmount *, struct dentry *, umode_t,
 		  const struct vfs_mkobj_ops *, void *);
 
@@ -3294,7 +3295,8 @@ static inline int vfs_lstat(const char __user *name, struct kstat *stat)
 	return vfs_fstatat(AT_FDCWD, name, stat, AT_SYMLINK_NOFOLLOW);
 }
 
-extern const char *vfs_get_link(struct dentry *, struct delayed_call *);
+extern const char *vfs_get_link(struct dentry *,
+					 struct delayed_call *);
 extern const char *vfs_get_link_mnt(const struct vfsmount *, struct dentry *,
 				    struct delayed_call *);
 extern int vfs_readlink(struct dentry *, char __user *, int);

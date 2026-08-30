@@ -617,7 +617,16 @@ EXPORT_SYMBOL(prepare_kernel_cred);
  */
 int set_security_override(struct cred *new, u32 secid)
 {
-	return security_kernel_act_as(new, secid);
+	struct lsm_prop_ref *ref = NULL;
+	int ret;
+
+	ret = security_secid_to_lsmprop_ref(secid, LSM_ID_UNDEF, GFP_KERNEL,
+					    &ref);
+	if (ret)
+		return ret;
+	ret = security_kernel_act_as_ref(new, ref);
+	security_lsm_prop_ref_put(ref);
+	return ret;
 }
 EXPORT_SYMBOL(set_security_override);
 

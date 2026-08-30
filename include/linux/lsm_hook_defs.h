@@ -184,22 +184,23 @@ LSM_HOOK(int, 0, inode_permission, const struct vfsmount *mnt,
 LSM_HOOK(int, 0, inode_setattr, struct mnt_idmap *idmap,
 	 const struct vfsmount *mnt, struct dentry *dentry, struct iattr *attr)
 LSM_HOOK(void, LSM_RET_VOID, inode_post_setattr, struct mnt_idmap *idmap,
-	 struct dentry *dentry, int ia_valid)
+	 const struct vfsmount *mnt, struct dentry *dentry, int ia_valid)
 LSM_HOOK(int, 0, inode_getattr, const struct path *path)
 LSM_HOOK(int, 0, inode_xattr_skipcap, const char *name)
 LSM_HOOK(int, 0, inode_setxattr, struct mnt_idmap *idmap,
 	 const struct vfsmount *mnt, struct dentry *dentry, const char *name,
 	 const void *value, size_t size, int flags)
-LSM_HOOK(void, LSM_RET_VOID, inode_post_setxattr, struct dentry *dentry,
-	 const char *name, const void *value, size_t size, int flags)
+LSM_HOOK(void, LSM_RET_VOID, inode_post_setxattr, const struct vfsmount *mnt,
+	 struct dentry *dentry, const char *name, const void *value, size_t size,
+	 int flags)
 LSM_HOOK(int, 0, inode_getxattr, const struct vfsmount *mnt,
 	 struct dentry *dentry, const char *name)
 LSM_HOOK(int, 0, inode_listxattr, const struct vfsmount *mnt,
 	 struct dentry *dentry)
 LSM_HOOK(int, 0, inode_removexattr, struct mnt_idmap *idmap,
 	 const struct vfsmount *mnt, struct dentry *dentry, const char *name)
-LSM_HOOK(void, LSM_RET_VOID, inode_post_removexattr, struct dentry *dentry,
-	 const char *name)
+LSM_HOOK(void, LSM_RET_VOID, inode_post_removexattr,
+	 const struct vfsmount *mnt, struct dentry *dentry, const char *name)
 LSM_HOOK(int, 0, inode_file_setattr, const struct vfsmount *mnt,
 	 struct dentry *dentry, struct file_kattr *fa)
 LSM_HOOK(int, 0, inode_file_getattr, const struct vfsmount *mnt,
@@ -207,7 +208,8 @@ LSM_HOOK(int, 0, inode_file_getattr, const struct vfsmount *mnt,
 LSM_HOOK(int, 0, inode_set_acl, struct mnt_idmap *idmap,
 	 const struct vfsmount *mnt, struct dentry *dentry,
 	 const char *acl_name, struct posix_acl *kacl)
-LSM_HOOK(void, LSM_RET_VOID, inode_post_set_acl, struct dentry *dentry,
+LSM_HOOK(void, LSM_RET_VOID, inode_post_set_acl,
+	 const struct vfsmount *mnt, struct dentry *dentry,
 	 const char *acl_name, struct posix_acl *kacl)
 LSM_HOOK(int, 0, inode_get_acl, struct mnt_idmap *idmap,
 	 const struct vfsmount *mnt, struct dentry *dentry,
@@ -216,7 +218,8 @@ LSM_HOOK(int, 0, inode_remove_acl, struct mnt_idmap *idmap,
 	 const struct vfsmount *mnt, struct dentry *dentry,
 	 const char *acl_name)
 LSM_HOOK(void, LSM_RET_VOID, inode_post_remove_acl, struct mnt_idmap *idmap,
-	 struct dentry *dentry, const char *acl_name)
+	 const struct vfsmount *mnt, struct dentry *dentry,
+	 const char *acl_name)
 LSM_HOOK(int, 0, inode_need_killpriv, struct dentry *dentry)
 LSM_HOOK(int, 0, inode_killpriv, struct mnt_idmap *idmap,
 	 struct dentry *dentry)
@@ -234,8 +237,8 @@ LSM_HOOK(int, 0, inode_copy_up, const struct path *src,
 LSM_HOOK(int, 0, inode_copy_up_post, const struct path *src,
 	 const struct vfsmount *dst_mnt, struct dentry *dst,
 	 const struct cred *copy_up_cred)
-LSM_HOOK(int, -EOPNOTSUPP, inode_copy_up_xattr, struct dentry *src,
-	 const char *name)
+LSM_HOOK(int, -EOPNOTSUPP, inode_copy_up_xattr,
+	 const struct vfsmount *src_mnt, struct dentry *src, const char *name)
 LSM_HOOK(int, 0, inode_setintegrity, const struct inode *inode,
 	 enum lsm_integrity_type type, const void *value, size_t size)
 LSM_HOOK(int, 0, kernfs_root_alloc_security, void *root_security)

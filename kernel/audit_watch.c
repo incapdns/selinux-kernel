@@ -238,7 +238,7 @@ static void audit_watch_log_rule_change(struct audit_krule *r, struct audit_watc
 	audit_log_untrustedstring(ab, w->path);
 	audit_log_key(ab, r->filterkey);
 	audit_log_format(ab, " list=%d res=1", r->listnr);
-	audit_log_end(ab);
+	(void)audit_log_end_status(ab);
 }
 
 /* Update inode info in audit rules based on filesystem event. */
