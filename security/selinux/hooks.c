@@ -5863,6 +5863,16 @@ static int selinux_file_operation_has_perm(
 
 	if (!cred || !file || !opener || !inode)
 		return -EIO;
+	/*
+	 * Before the initial policy load, file and inode security blobs do not
+	 * carry a resolvable label tuple yet.  Preserve the root policy-less
+	 * bootstrap semantics for every operation routed through this common
+	 * helper.  A policy-less child with an initialized ancestor must still
+	 * enter the transaction below so that the ancestor policy is enforced.
+	 */
+	if (!selinux_initialized(selinux_cred(cred)->state) &&
+	    selinux_cred_chain_uninitialized(cred))
+		return 0;
 	same_cred = cred_sid_chain_equal(cred, opener);
 	transaction = kzalloc_obj(*transaction, GFP_KERNEL);
 	if (!transaction)
