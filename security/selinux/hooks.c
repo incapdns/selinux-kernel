@@ -26507,6 +26507,7 @@ static struct selinux_state *selinux_state_alloc(const struct cred *cred,
 
 	mutex_init(&newstate->status_lock);
 	mutex_init(&newstate->policy_mutex);
+	atomic64_set(&newstate->policy_snapshot_bytes, 0);
 	if (parent) {
 		/* A dormant state can outlive the creating credential. */
 		newstate->parent = get_selinux_state(parent);
@@ -26667,6 +26668,7 @@ static void selinux_state_free(struct work_struct *work)
 		atomic_dec(&selinux_nsnum);
 		mutex_unlock(&selinux_state_tree_mutex);
 		global_sidtab_invalidate_state(state);
+		WARN_ON(atomic64_read(&state->policy_snapshot_bytes));
 		if (state->status_page)
 			__free_page(state->status_page);
 		selinux_state_policy_free(state);

@@ -100,7 +100,6 @@ struct selinux_fs_info {
 	unsigned long last_ino;
 	struct selinux_state *state;
 	struct super_block *sb;
-	atomic64_t policy_snapshot_bytes;
 };
 
 static struct selinux_fs_info *selinux_fs_info_create(void)
@@ -113,7 +112,6 @@ static struct selinux_fs_info *selinux_fs_info_create(void)
 
 	fsi->last_ino = SEL_INO_NEXT - 1;
 	fsi->state = get_selinux_state(current_selinux_state);
-	atomic64_set(&fsi->policy_snapshot_bytes, 0);
 	return fsi;
 }
 
@@ -122,7 +120,6 @@ static void selinux_fs_info_free(struct selinux_fs_info *fsi)
 	unsigned int i;
 
 	if (fsi) {
-		WARN_ON(atomic64_read(&fsi->policy_snapshot_bytes));
 		put_selinux_state(fsi->state);
 		for (i = 0; i < fsi->bool_num; i++)
 			kfree(fsi->bool_pending_names[i]);
@@ -159,31 +156,33 @@ static int selinuxfs_state_access(const struct file *file)
 }
 
 /*
- * Account retained policy snapshots.  The selinuxfs superblock is unique per
- * SELinux state, and open files/VMAs pin that superblock, so this counter has
- * the same lifetime as every charge.  Load buffers are separately serialized
- * under policy_mutex and freed before that mutex is released.
+ * Account retained policy snapshots across every selinuxfs superblock for one
+ * SELinux state.  A state can have one superblock per owning user namespace;
+ * charging the state prevents another mount from bypassing the bound.  Open
+ * files/VMAs pin their superblock, which pins the state for every charge. Load
+ * buffers are separately serialized under policy_mutex and freed before that
+ * mutex is released.
  */
-static int selinuxfs_snapshot_bytes_reserve(struct selinux_fs_info *fsi,
+static int selinuxfs_snapshot_bytes_reserve(struct selinux_state *state,
 					    size_t bytes)
 {
-	s64 used = atomic64_read(&fsi->policy_snapshot_bytes);
+	s64 used = atomic64_read(&state->policy_snapshot_bytes);
 
 	if (bytes > CONFIG_SECURITY_SELINUX_POLICY_MAX_BYTES)
 		return -EFBIG;
 	for (;;) {
 		if (bytes > CONFIG_SECURITY_SELINUX_POLICY_MAX_BYTES - used)
 			return -EDQUOT;
-		if (atomic64_try_cmpxchg(&fsi->policy_snapshot_bytes, &used,
+		if (atomic64_try_cmpxchg(&state->policy_snapshot_bytes, &used,
 					 used + bytes))
 			return 0;
 	}
 }
 
-static void selinuxfs_snapshot_bytes_release(struct selinux_fs_info *fsi,
+static void selinuxfs_snapshot_bytes_release(struct selinux_state *state,
 					     size_t bytes)
 {
-	atomic64_sub(bytes, &fsi->policy_snapshot_bytes);
+	atomic64_sub(bytes, &state->policy_snapshot_bytes);
 }
 
 #ifdef CONFIG_SECURITY_SELINUX_NS
@@ -1430,7 +1429,7 @@ static int sel_open_policy(struct inode *inode, struct file *filp)
 		rc = -EFBIG;
 		goto err;
 	}
-	rc = selinuxfs_snapshot_bytes_reserve(fsi, plm->len);
+	rc = selinuxfs_snapshot_bytes_reserve(state, plm->len);
 	if (rc)
 		goto err;
 	plm->charge = plm->len;
@@ -1442,7 +1441,7 @@ static int sel_open_policy(struct inode *inode, struct file *filp)
 		rc = -EOVERFLOW;
 		goto err;
 	}
-	selinuxfs_snapshot_bytes_release(fsi, plm->charge - plm->len);
+	selinuxfs_snapshot_bytes_release(state, plm->charge - plm->len);
 	plm->charge = plm->len;
 	mutex_unlock(&state->policy_mutex);
 
@@ -1450,7 +1449,7 @@ static int sel_open_policy(struct inode *inode, struct file *filp)
 	return 0;
 err:
 	mutex_unlock(&state->policy_mutex);
-	selinuxfs_snapshot_bytes_release(fsi, plm->charge);
+	selinuxfs_snapshot_bytes_release(state, plm->charge);
 	vfree(plm->data);
 	kfree(plm);
 	return rc;
@@ -1460,7 +1459,7 @@ static int sel_release_policy(struct inode *inode, struct file *filp)
 {
 	struct policy_load_memory *plm = filp->private_data;
 
-	selinuxfs_snapshot_bytes_release(plm->fsi, plm->charge);
+	selinuxfs_snapshot_bytes_release(plm->fsi->state, plm->charge);
 	vfree(plm->data);
 	kfree(plm);
 
@@ -3354,7 +3353,14 @@ static int selinuxfs_compare(struct super_block *sb, struct fs_context *fc)
 {
 	struct selinux_fs_info *fsi = sb->s_fs_info;
 
-	return (current_selinux_state == fsi->state);
+	/*
+	 * The state selects the policy authority; the user namespace selects
+	 * inode ownership and the VFS capability domain.  Matching only the state
+	 * makes sget_fc() find a superblock owned by another user namespace and
+	 * reject an otherwise authorized rootless mount with -EBUSY.
+	 */
+	return current_selinux_state == fsi->state &&
+	       sb->s_user_ns == fc->user_ns;
 }
 
 static int sel_get_tree(struct fs_context *fc)

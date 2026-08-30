@@ -161,6 +161,8 @@ struct selinux_state {
 	struct selinux_avc *avc;
 	struct selinux_policy __rcu *policy;
 	struct mutex policy_mutex;
+	/* Retained selinuxfs policy snapshots across every mount of this state. */
+	atomic64_t policy_snapshot_bytes;
 	struct selinux_state *parent;
 	struct list_head children;
 	struct list_head sibling;
