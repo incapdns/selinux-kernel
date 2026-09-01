@@ -48,6 +48,16 @@ struct selinux_global_sid_handle *
 security_context_to_global_handle(struct selinux_state *state,
 				  const char *scontext, u32 scontext_len,
 				  u32 *out_sid, gfp_t gfp);
+/*
+ * Resolve a map source exactly.  A source may be an uninterpreted label read
+ * from a filesystem whose policy is not understood by @state; map targets
+ * remain strictly validated by security_context_to_global_handle().
+ */
+struct selinux_global_sid_handle *
+security_context_to_global_map_source_handle(struct selinux_state *state,
+					     const char *scontext,
+					     u32 scontext_len,
+					     u32 *out_sid);
 struct selinux_global_sid_handle *
 security_context_to_sid_default_handle(struct selinux_state *state,
 				       const char *scontext, u32 scontext_len,

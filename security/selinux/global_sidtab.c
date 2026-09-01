@@ -967,6 +967,30 @@ err_unlock:
 	return ERR_PTR(rc);
 }
 
+struct selinux_global_sid_handle *
+security_context_to_global_map_source_handle(struct selinux_state *state,
+					     const char *scontext,
+					     u32 scontext_len,
+					     u32 *out_sid)
+{
+	struct selinux_global_sid_handle *handle;
+
+	handle = security_context_to_global_handle(state, scontext,
+						   scontext_len, out_sid,
+						   GFP_KERNEL);
+	if (!IS_ERR(handle) || PTR_ERR(handle) != -EINVAL)
+		return handle;
+
+	/*
+	 * Filesystems can carry labels from a policy which @state does not know.
+	 * The security server retains those labels as uninterpreted contexts.
+	 * A parent-sealed map must be able to name that exact source identity;
+	 * forcing only the source keeps the observer-side target policy-validated.
+	 */
+	return security_context_to_sid_force_handle(state, scontext,
+						     scontext_len, out_sid);
+}
+
 int security_context_to_sid(struct selinux_state *state, const char *scontext,
 			    u32 scontext_len, u32 *out_sid, gfp_t gfp)
 {
@@ -1015,8 +1039,14 @@ security_context_to_sid_default_handle(struct selinux_state *state,
 			return ERR_PTR(rc);
 
 		rcu_read_lock();
-		rc = selinux_ss_sid_to_context(state, ss_sid, &ctx,
-					       &scontext_len);
+		/*
+		 * _context_to_sid_default() deliberately retains labels which this
+		 * policy cannot interpret.  Use the matching force lookup here so the
+		 * global handle keeps the original filesystem label instead of
+		 * collapsing every such label to the policy's unlabeled context.
+		 */
+		rc = selinux_ss_sid_to_context_force(state, ss_sid, &ctx,
+						     &scontext_len);
 		if (rc)
 			goto err_unlock;
 		scontext = kmemdup(ctx, scontext_len, GFP_ATOMIC);

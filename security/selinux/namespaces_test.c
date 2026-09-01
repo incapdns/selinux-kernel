@@ -3837,6 +3837,88 @@ static void selinux_global_sid_initial_alias_test(struct kunit *test)
 	selinux_label_domain_put(domain);
 }
 
+static void selinux_uninterpreted_xattr_provenance_test(struct kunit *test)
+{
+	static const char unlabeled[] =
+		"system_u:object_r:unlabeled_t:s0";
+	static const char rootfs[] = "u:object_r:rootfs:s0";
+	static const char vendor[] = "u:object_r:vendor_file:s0";
+	struct selinux_global_sid_handle *root = NULL, *repeat = NULL;
+	struct selinux_global_sid_handle *mapped = NULL, *other = NULL;
+	struct selinux_label_domain *domain;
+	struct selinux_policy *policy;
+	struct sidtab *sidtab;
+	struct selinux_state state;
+	struct context fallback;
+	u32 root_sid = 0, repeat_sid = 0, mapped_sid = 0, other_sid = 0;
+	int rc;
+
+	domain = selinux_label_domain_alloc(&init_user_ns, NULL, 0);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, domain);
+	policy = kunit_kzalloc(test, sizeof(*policy), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, policy);
+	sidtab = kunit_kzalloc(test, sizeof(*sidtab), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, sidtab);
+	KUNIT_ASSERT_EQ(test, sidtab_init(sidtab), 0);
+
+	/* Seed the fallback which exposed the original provenance collapse. */
+	context_init(&fallback);
+	fallback.user = 1;
+	fallback.role = 1;
+	fallback.type = 1;
+	fallback.str = kstrdup(unlabeled, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, fallback.str);
+	fallback.len = sizeof(unlabeled);
+	rc = sidtab_set_initial_domain(sidtab, SECINITSID_UNLABELED,
+				       &fallback, domain);
+	context_destroy(&fallback);
+	KUNIT_ASSERT_EQ(test, rc, 0);
+
+	policy->sidtab = sidtab;
+	selinux_test_state_init(&state, 1);
+	state.label_domain = domain;
+	rcu_assign_pointer(state.policy, policy);
+	selinux_mark_initialized(&state);
+
+	root = security_context_to_sid_default_handle(
+		&state, rootfs, sizeof(rootfs), &root_sid, SECINITSID_FILE,
+		GFP_KERNEL);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, root);
+	repeat = security_context_to_sid_default_handle(
+		&state, rootfs, sizeof(rootfs), &repeat_sid, SECINITSID_FILE,
+		GFP_KERNEL);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, repeat);
+	other = security_context_to_sid_default_handle(
+		&state, vendor, sizeof(vendor), &other_sid, SECINITSID_FILE,
+		GFP_KERNEL);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, other);
+	mapped = security_context_to_global_map_source_handle(
+		&state, rootfs, sizeof(rootfs), &mapped_sid);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, mapped);
+
+	KUNIT_EXPECT_PTR_EQ(test, repeat, root);
+	KUNIT_EXPECT_PTR_EQ(test, mapped, root);
+	KUNIT_EXPECT_EQ(test, repeat_sid, root_sid);
+	KUNIT_EXPECT_EQ(test, mapped_sid, root_sid);
+	KUNIT_EXPECT_NE(test, other_sid, root_sid);
+	KUNIT_EXPECT_PTR_NE(test, other, root);
+
+	KUNIT_ASSERT_EQ(test,
+			selinux_kunit_global_sid_drop_baseline(root_sid), 0);
+	KUNIT_ASSERT_EQ(test,
+			selinux_kunit_global_sid_drop_baseline(other_sid), 0);
+	global_sid_handle_put(mapped);
+	global_sid_handle_put(other);
+	global_sid_handle_put(repeat);
+	global_sid_handle_put(root);
+	rcu_barrier();
+	KUNIT_EXPECT_FALSE(test, selinux_kunit_global_sid_live(root_sid));
+	KUNIT_EXPECT_FALSE(test, selinux_kunit_global_sid_live(other_sid));
+
+	sidtab_destroy(sidtab);
+	selinux_label_domain_put(domain);
+}
+
 static void selinux_net_peersid_null_sentinel_test(struct kunit *test)
 {
 	struct selinux_global_sid_handle *handle;
@@ -4608,6 +4690,7 @@ static struct kunit_case selinux_namespaces_test_cases[] = {
 	KUNIT_CASE(selinux_global_sid_atomic_handle_test),
 	KUNIT_CASE(selinux_global_sid_initial_immortal_test),
 	KUNIT_CASE(selinux_global_sid_initial_alias_test),
+	KUNIT_CASE(selinux_uninterpreted_xattr_provenance_test),
 	KUNIT_CASE(selinux_net_peersid_null_sentinel_test),
 	KUNIT_CASE(selinux_prop_ref_scalar_metadata_lifetime_test),
 	KUNIT_CASE(selinux_prop_ref_secctx_render_test),

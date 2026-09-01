@@ -326,9 +326,9 @@ int selinux_ns_control_add_map(struct selinux_ns_control *control,
 			     selinux_chain_epoch_read(control->state)))
 			rc = -ESTALE;
 		else {
-			source_handle = security_context_to_global_handle(
+			source_handle = security_context_to_global_map_source_handle(
 				source_state, source_context, source_len,
-				&source_sid, GFP_KERNEL);
+				&source_sid);
 			if (IS_ERR(source_handle)) {
 				rc = PTR_ERR(source_handle);
 				source_handle = NULL;
