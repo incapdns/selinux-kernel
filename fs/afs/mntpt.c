@@ -156,16 +156,15 @@ static int afs_mntpt_set_params(struct fs_context *fc, struct dentry *mntpt)
 /*
  * create a vfsmount to be automounted
  */
-static struct vfsmount *afs_mntpt_do_automount(const struct path *path)
+static struct vfsmount *afs_mntpt_do_automount(struct dentry *mntpt)
 {
-	struct dentry *mntpt = path->dentry;
 	struct fs_context *fc;
 	struct vfsmount *mnt;
 	int ret;
 
 	BUG_ON(!d_inode(mntpt));
 
-	fc = fs_context_for_submount_cred(&afs_fs_type, path, current_cred());
+	fc = fs_context_for_submount(&afs_fs_type, mntpt);
 	if (IS_ERR(fc))
 		return ERR_CAST(fc);
 
@@ -188,7 +187,7 @@ struct vfsmount *afs_d_automount(struct path *path)
 
 	_enter("{%pd}", path->dentry);
 
-	newmnt = afs_mntpt_do_automount(path);
+	newmnt = afs_mntpt_do_automount(path->dentry);
 	if (IS_ERR(newmnt))
 		return newmnt;
 

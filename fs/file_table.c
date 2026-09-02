@@ -358,11 +358,9 @@ EXPORT_SYMBOL_GPL(alloc_empty_backing_file);
  * @path: the (dentry, vfsmount) pair for the new file
  * @fop: the 'struct file_operations' for the new file
  */
-static int file_init_path(struct file *file, const struct path *path,
-			  const struct file_operations *fop)
+static void file_init_path(struct file *file, const struct path *path,
+			   const struct file_operations *fop)
 {
-	int error;
-
 	file->__f_path = *path;
 	file->f_inode = path->dentry->d_inode;
 	file->f_mapping = path->dentry->d_inode->i_mapping;
@@ -377,14 +375,10 @@ static int file_init_path(struct file *file, const struct path *path,
 	     likely(fop->write || fop->write_iter))
 		file->f_mode |= FMODE_CAN_WRITE;
 	file->f_iocb_flags = iocb_flags(file);
-	error = security_file_set_path(file);
-	if (unlikely(error))
-		return error;
 	file->f_mode |= FMODE_OPENED;
 	file->f_op = fop;
 	if ((file->f_mode & (FMODE_READ | FMODE_WRITE)) == FMODE_READ)
 		i_readcount_inc(path->dentry->d_inode);
-	return 0;
 }
 
 /**
@@ -398,17 +392,10 @@ static struct file *alloc_file(const struct path *path, int flags,
 		const struct file_operations *fop)
 {
 	struct file *file;
-	int error;
 
 	file = alloc_empty_file(flags, current_cred());
-	if (IS_ERR(file))
-		return file;
-
-	error = file_init_path(file, path, fop);
-	if (unlikely(error)) {
-		fput(file);
-		return ERR_PTR(error);
-	}
+	if (!IS_ERR(file))
+		file_init_path(file, path, fop);
 	return file;
 }
 
@@ -471,13 +458,7 @@ struct file *alloc_file_pseudo_noaccount(struct inode *inode,
 		path_put(&path);
 		return file;
 	}
-	ret = file_init_path(file, &path, fops);
-	if (unlikely(ret)) {
-		fput(file);
-		ihold(inode);
-		path_put(&path);
-		return ERR_PTR(ret);
-	}
+	file_init_path(file, &path, fops);
 	/*
 	 * Disable all fsnotify events for pseudo files by default.
 	 * They may be enabled by caller with file_set_fsnotify_mode().

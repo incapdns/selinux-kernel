@@ -76,8 +76,9 @@ struct page *selinux_kernel_status_page(struct selinux_state *state)
  *
  * It updates status of the current enforcing/permissive mode.
  */
-void selinux_status_update_setenforce(struct selinux_state *state,
-				      bool enforcing)
+void selinux_status_update_setenforce(
+	struct selinux_state *state,
+	bool enforcing)
 {
 	struct selinux_kernel_status   *status;
 
@@ -102,8 +103,9 @@ void selinux_status_update_setenforce(struct selinux_state *state,
  * It updates status of the times of policy reloaded, and current
  * setting of deny_unknown.
  */
-void selinux_status_update_policyload(struct selinux_state *state,
-				      u32 seqno)
+void selinux_status_update_policyload(
+	struct selinux_state *state,
+	u32 seqno)
 {
 	struct selinux_kernel_status   *status;
 

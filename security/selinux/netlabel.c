@@ -24,18 +24,17 @@
 #include <net/ipv6.h>
 
 #include "objsec.h"
-#include "global_sidtab.h"
-#include "label_view.h"
+#include "chain.h"
+#include "namespace.h"
+#include "object_label.h"
 #include "security.h"
 #include "netlabel.h"
 
 /**
- * selinux_netlbl_sidlookup_cached_handle - Cache a SID lookup
+ * selinux_netlbl_sidlookup_cached - Cache a SID lookup
  * @skb: the packet
  * @family: the packet's address family
  * @secattr: the NetLabel security attributes
- * @state: the SELinux state
- * @view: optional immutable view for a canonical local SECID
  * @sid: the SID
  *
  * Description:
@@ -44,42 +43,48 @@
  * up future lookups.  Returns zero on success, negative values on failure.
  *
  */
-#ifdef CONFIG_SECURITY_SELINUX_NS
-static struct selinux_global_sid_handle *
-selinux_netlbl_sidlookup_cached_handle(
-	struct sk_buff *skb, u16 family, struct netlbl_lsm_secattr *secattr,
-	struct selinux_state *state, const struct selinux_label_view *view,
+static int selinux_netlbl_sidlookup_cached(
+	struct selinux_state *state,
+	struct sk_buff *skb,
+	u16 family,
+	struct netlbl_lsm_secattr *secattr,
 	u32 *sid)
 {
-	struct selinux_global_sid_handle *handle;
+	char *context = NULL;
+	u32 context_len;
+	u32 origin_sid;
+	int rc;
 
-	handle = security_netlbl_secattr_to_sid_view_handle(
-		state, view, secattr, sid);
-	if (!IS_ERR(handle) &&
+	if (state != init_selinux_state &&
+	    (secattr->flags & (NETLBL_SECATTR_CACHE | NETLBL_SECATTR_SECID))) {
+		origin_sid = secattr->flags & NETLBL_SECATTR_CACHE ?
+			*(u32 *)secattr->cache->data : secattr->attr.secid;
+		rc = security_sid_to_context(
+			init_selinux_state,
+			origin_sid,
+			&context,
+			&context_len);
+		if (rc)
+			return rc;
+		rc = security_context_to_sid(
+			state,
+			context,
+			context_len,
+			sid,
+			GFP_ATOMIC);
+		kfree(context);
+		return rc;
+	}
+
+	rc = security_netlbl_secattr_to_sid(state, secattr, sid);
+	if (rc == 0 &&
+	    state == init_selinux_state &&
 	    (secattr->flags & NETLBL_SECATTR_CACHEABLE) &&
 	    (secattr->flags & NETLBL_SECATTR_CACHE))
 		netlbl_cache_add(skb, family, secattr);
 
-	return handle;
-}
-#endif
-
-#ifndef CONFIG_SECURITY_SELINUX_NS
-static int selinux_netlbl_sidlookup_cached(
-	struct sk_buff *skb, u16 family, struct netlbl_lsm_secattr *secattr,
-	struct selinux_state *state, const struct selinux_label_view *view,
-	u32 *sid)
-{
-	int rc;
-
-	rc = security_netlbl_secattr_to_sid_view(
-		state, view, secattr, sid);
-	if (!rc && (secattr->flags & NETLBL_SECATTR_CACHEABLE) &&
-	    (secattr->flags & NETLBL_SECATTR_CACHE))
-		netlbl_cache_add(skb, family, secattr);
 	return rc;
 }
-#endif
 
 /**
  * selinux_netlbl_sock_genattr - Generate the NetLabel socket secattr
@@ -95,6 +100,7 @@ static struct netlbl_lsm_secattr *selinux_netlbl_sock_genattr(struct sock *sk)
 {
 	int rc;
 	struct sk_security_struct *sksec = selinux_sock(sk);
+	struct selinux_object_label_value label;
 	struct netlbl_lsm_secattr *secattr;
 
 	if (sksec->nlbl_secattr != NULL)
@@ -104,7 +110,13 @@ static struct netlbl_lsm_secattr *selinux_netlbl_sock_genattr(struct sock *sk)
 	if (secattr == NULL)
 		return ERR_PTR(-ENOMEM);
 
-	rc = security_netlbl_sid_to_secattr(sksec->state, sksec->sid, secattr);
+	selinux_object_label_get_or_unlabeled(
+		init_selinux_state,
+		sksec->object,
+		SECCLASS_SOCKET,
+		&label);
+	rc = security_netlbl_sid_to_secattr(
+		init_selinux_state, label.sid, secattr);
 	if (rc != 0) {
 		netlbl_secattr_free(secattr);
 		return ERR_PTR(rc);
@@ -160,7 +172,7 @@ void selinux_netlbl_cache_invalidate(void)
  * @gateway: true if host is acting as a gateway, false otherwise
  *
  * Description:
- * When a packet is dropped due to a permission denial, pass the error
+ * When a packet is dropped due to a call to avc_has_perm() pass the error
  * code to the NetLabel subsystem so any protocol specific processing can be
  * done.  This is safe to call even if you are unsure if NetLabel labeling is
  * present on the packet, NetLabel is smart enough to only act when it should.
@@ -204,216 +216,9 @@ void selinux_netlbl_sk_security_reset(struct sk_security_struct *sksec)
 }
 
 /**
- * selinux_netlbl_source_get - Acquire a NetLabel source reference
- * @source: the immutable NetLabel source
- */
-void selinux_netlbl_source_get(struct selinux_netlbl_source *source)
-{
-	if (!source)
-		return;
-	if (source->cache)
-		refcount_inc(&source->cache->refcount);
-	if (source->view)
-		selinux_label_view_get(source->view);
-}
-
-void selinux_netlbl_source_put(struct selinux_netlbl_source *source)
-{
-	if (!source)
-		return;
-	if (source->cache)
-		netlbl_secattr_cache_free(source->cache);
-	selinux_label_view_put(source->view);
-	selinux_netlbl_source_init(source);
-}
-
-#ifdef CONFIG_SECURITY_SELINUX_NS
-struct selinux_global_sid_handle *
-selinux_netlbl_source_sid_handle(
-	struct selinux_state *state,
-	const struct selinux_netlbl_source *source, u32 *sid)
-{
-	struct netlbl_lsm_secattr secattr;
-
-	if (!state || !source || !sid)
-		return ERR_PTR(-EINVAL);
-	if (!source->cache) {
-		*sid = SECSID_NULL;
-		return NULL;
-	}
-	netlbl_secattr_init(&secattr);
-	secattr.flags = NETLBL_SECATTR_CACHE;
-	secattr.type = source->type;
-	secattr.cache = source->cache;
-	return security_netlbl_secattr_to_sid_view_handle(
-		state, source->view, &secattr, sid);
-}
-#endif
-
-int selinux_netlbl_source_sid(
-	struct selinux_state *state,
-	const struct selinux_netlbl_source *source, u32 *sid)
-{
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	struct selinux_global_sid_handle *handle;
-
-	handle = selinux_netlbl_source_sid_handle(state, source, sid);
-	if (IS_ERR(handle))
-		return PTR_ERR(handle);
-	global_sid_handle_put(handle);
-	return 0;
-#else
-	struct netlbl_lsm_secattr secattr;
-
-	if (!state || !source || !sid)
-		return -EINVAL;
-	if (!source->cache) {
-		*sid = SECSID_NULL;
-		return 0;
-	}
-	netlbl_secattr_init(&secattr);
-	secattr.flags = NETLBL_SECATTR_CACHE;
-	secattr.type = source->type;
-	secattr.cache = source->cache;
-	return security_netlbl_secattr_to_sid_view(
-		state, source->view, &secattr, sid);
-#endif
-}
-
-#ifdef CONFIG_SECURITY_SELINUX_NS
-struct selinux_global_sid_handle *
-selinux_netlbl_skbuff_get_source_view_handle(
-	struct sk_buff *skb, u16 family, struct selinux_state *state,
-	const struct selinux_label_view *view,
-	struct selinux_netlbl_source *source, u32 *sid)
-{
-	struct selinux_global_sid_handle *handle = NULL;
-	int rc;
-	struct netlbl_lsm_secattr secattr;
-
-	if (!source || !sid)
-		return ERR_PTR(-EINVAL);
-	selinux_netlbl_source_init(source);
-	if (!netlbl_enabled()) {
-		*sid = SECSID_NULL;
-		return NULL;
-	}
-
-	netlbl_secattr_init(&secattr);
-	rc = netlbl_skbuff_getattr(skb, family, &secattr);
-	if (rc == 0 && secattr.flags != NETLBL_SECATTR_NONE) {
-		handle = selinux_netlbl_sidlookup_cached_handle(
-			skb, family, &secattr, state, view, sid);
-		if (IS_ERR(handle))
-			rc = PTR_ERR(handle);
-		else {
-			if (!secattr.cache ||
-			    !refcount_inc_not_zero(&secattr.cache->refcount)) {
-				rc = -ENOMEM;
-				global_sid_handle_put(handle);
-				handle = ERR_PTR(rc);
-			} else {
-				source->cache = secattr.cache;
-				if (view)
-					source->view = selinux_label_view_get(view);
-				source->type = secattr.type;
-			}
-		}
-	} else {
-		*sid = SECSID_NULL;
-		handle = rc ? ERR_PTR(rc) : NULL;
-	}
-	netlbl_secattr_destroy(&secattr);
-
-	return handle;
-}
-#endif
-
-int selinux_netlbl_skbuff_get_source_view(
-	struct sk_buff *skb, u16 family, struct selinux_state *state,
-	const struct selinux_label_view *view,
-	struct selinux_netlbl_source *source, u32 *sid)
-{
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	struct selinux_global_sid_handle *handle;
-
-	handle = selinux_netlbl_skbuff_get_source_view_handle(
-		skb, family, state, view, source, sid);
-	if (IS_ERR(handle))
-		return PTR_ERR(handle);
-	global_sid_handle_put(handle);
-	return 0;
-#else
-	int rc;
-	struct netlbl_lsm_secattr secattr;
-
-	if (!source || !sid)
-		return -EINVAL;
-	selinux_netlbl_source_init(source);
-	if (!netlbl_enabled()) {
-		*sid = SECSID_NULL;
-		return 0;
-	}
-
-	netlbl_secattr_init(&secattr);
-	rc = netlbl_skbuff_getattr(skb, family, &secattr);
-	if (rc == 0 && secattr.flags != NETLBL_SECATTR_NONE) {
-		rc = selinux_netlbl_sidlookup_cached(skb, family, &secattr,
-						     state, view, sid);
-		if (!rc) {
-			if (!secattr.cache ||
-			    !refcount_inc_not_zero(&secattr.cache->refcount))
-				rc = -ENOMEM;
-			else {
-				source->cache = secattr.cache;
-				if (view)
-					source->view = selinux_label_view_get(view);
-				source->type = secattr.type;
-			}
-		}
-	} else {
-		*sid = SECSID_NULL;
-	}
-	netlbl_secattr_destroy(&secattr);
-	return rc;
-#endif
-}
-
-#ifdef CONFIG_SECURITY_SELINUX_NS
-struct selinux_global_sid_handle *
-selinux_netlbl_skbuff_get_source_handle(
-	struct sk_buff *skb, u16 family, struct selinux_state *state,
-	struct selinux_netlbl_source *source, u32 *sid)
-{
-	return selinux_netlbl_skbuff_get_source_view_handle(
-		skb, family, state, NULL, source, sid);
-}
-#endif
-
-int selinux_netlbl_skbuff_get_source(
-	struct sk_buff *skb, u16 family, struct selinux_state *state,
-	struct selinux_netlbl_source *source, u32 *sid)
-{
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	struct selinux_global_sid_handle *handle;
-
-	handle = selinux_netlbl_skbuff_get_source_handle(
-		skb, family, state, source, sid);
-	if (IS_ERR(handle))
-		return PTR_ERR(handle);
-	global_sid_handle_put(handle);
-	return 0;
-#else
-	return selinux_netlbl_skbuff_get_source_view(
-		skb, family, state, NULL, source, sid);
-#endif
-}
-
-/**
- * selinux_netlbl_skbuff_getsid_handle - Get the sid of a packet using NetLabel
+ * selinux_netlbl_skbuff_getsid - Get the sid of a packet using NetLabel
  * @skb: the packet
  * @family: protocol family
- * @state: the SELinux state
  * @type: NetLabel labeling protocol type
  * @sid: the SID
  *
@@ -421,54 +226,40 @@ int selinux_netlbl_skbuff_get_source(
  * Call the NetLabel mechanism to get the security attributes of the given
  * packet and use those attributes to determine the correct context/SID to
  * assign to the packet.  Returns zero on success, negative values on failure.
+ *
  */
-#ifdef CONFIG_SECURITY_SELINUX_NS
-struct selinux_global_sid_handle *
-selinux_netlbl_skbuff_getsid_handle(struct sk_buff *skb, u16 family,
-				   struct selinux_state *state, u32 *type,
-				   u32 *sid)
-{
-	struct selinux_global_sid_handle *handle;
-	struct selinux_netlbl_source source;
-
-	handle = selinux_netlbl_skbuff_get_source_handle(
-		skb, family, state, &source, sid);
-	*type = source.type;
-	selinux_netlbl_source_put(&source);
-	return handle;
-}
-#endif
-
-int selinux_netlbl_skbuff_getsid(struct sk_buff *skb, u16 family,
-				 struct selinux_state *state, u32 *type,
+int selinux_netlbl_skbuff_getsid(struct selinux_state *state,
+				 struct sk_buff *skb,
+				 u16 family,
+				 u32 *type,
 				 u32 *sid)
 {
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	struct selinux_global_sid_handle *handle;
-
-	handle = selinux_netlbl_skbuff_getsid_handle(skb, family, state, type,
-						     sid);
-	if (IS_ERR(handle))
-		return PTR_ERR(handle);
-	global_sid_handle_put(handle);
-	return 0;
-#else
-	struct selinux_netlbl_source source;
 	int rc;
+	struct netlbl_lsm_secattr secattr;
 
-	rc = selinux_netlbl_skbuff_get_source(
-		skb, family, state, &source, sid);
-	*type = source.type;
-	selinux_netlbl_source_put(&source);
+	if (!netlbl_enabled()) {
+		*type = NETLBL_NLTYPE_NONE;
+		*sid = SECSID_NULL;
+		return 0;
+	}
+
+	netlbl_secattr_init(&secattr);
+	rc = netlbl_skbuff_getattr(skb, family, &secattr);
+	if (rc == 0 && secattr.flags != NETLBL_SECATTR_NONE)
+		rc = selinux_netlbl_sidlookup_cached(
+			state, skb, family, &secattr, sid);
+	else
+		*sid = SECSID_NULL;
+	*type = secattr.type;
+	netlbl_secattr_destroy(&secattr);
+
 	return rc;
-#endif
 }
 
 /**
  * selinux_netlbl_skbuff_setsid - Set the NetLabel on a packet given a sid
  * @skb: the packet
  * @family: protocol family
- * @state: the SELinux state
  * @sid: the SID
  *
  * Description
@@ -476,9 +267,9 @@ int selinux_netlbl_skbuff_getsid(struct sk_buff *skb, u16 family,
  * Returns zero on success, negative values on failure.
  *
  */
-int selinux_netlbl_skbuff_setsid(struct sk_buff *skb,
+int selinux_netlbl_skbuff_setsid(struct selinux_state *state,
+				 struct sk_buff *skb,
 				 u16 family,
-				 struct selinux_state *state,
 				 u32 sid)
 {
 	int rc;
@@ -516,7 +307,6 @@ skbuff_setsid_return:
  * selinux_netlbl_sctp_assoc_request - Label an incoming sctp association.
  * @asoc: incoming association.
  * @skb: the packet.
- * @secid: proposed association SID, not yet published in @asoc
  *
  * Description:
  * A new incoming connection is represented by @asoc, ......
@@ -524,11 +314,13 @@ skbuff_setsid_return:
  *
  */
 int selinux_netlbl_sctp_assoc_request(struct sctp_association *asoc,
-				     struct sk_buff *skb, u32 secid)
+				     struct sk_buff *skb)
 {
 	int rc;
 	struct netlbl_lsm_secattr secattr;
 	struct sk_security_struct *sksec = selinux_sock(asoc->base.sk);
+	struct sctp_security_struct *asocsec = selinux_sctp(asoc);
+	struct selinux_object_label_value root_label;
 	struct sockaddr_in addr4;
 	struct sockaddr_in6 addr6;
 
@@ -537,7 +329,13 @@ int selinux_netlbl_sctp_assoc_request(struct sctp_association *asoc,
 		return 0;
 
 	netlbl_secattr_init(&secattr);
-	rc = security_netlbl_sid_to_secattr(sksec->state, secid, &secattr);
+	selinux_object_label_get_or_unlabeled(
+		init_selinux_state,
+		asocsec->object,
+		SECCLASS_SCTP_SOCKET,
+		&root_label);
+	rc = security_netlbl_sid_to_secattr(
+		init_selinux_state, root_label.sid, &secattr);
 	if (rc != 0)
 		goto assoc_request_return;
 
@@ -568,7 +366,6 @@ assoc_request_return:
  * selinux_netlbl_inet_conn_request - Label an incoming stream connection
  * @req: incoming connection request socket
  * @family: the request socket's address family
- * @state: the SELinux state
  *
  * Description:
  * A new incoming connection request is represented by @req, we need to label
@@ -577,17 +374,25 @@ assoc_request_return:
  * is complete.  Returns zero on success, negative values on failure.
  *
  */
-int selinux_netlbl_inet_conn_request(struct request_sock *req, u16 family,
-				     struct selinux_state *state)
+int selinux_netlbl_inet_conn_request(struct request_sock *req, u16 family)
 {
 	int rc;
 	struct netlbl_lsm_secattr secattr;
+	struct request_sock_security_struct *reqsec =
+		selinux_request_sock(req);
+	struct selinux_object_label_value root_label;
 
 	if (family != PF_INET && family != PF_INET6)
 		return 0;
 
 	netlbl_secattr_init(&secattr);
-	rc = security_netlbl_sid_to_secattr(state, req->secid, &secattr);
+	selinux_object_label_get_or_unlabeled(
+		init_selinux_state,
+		reqsec->object,
+		SECCLASS_TCP_SOCKET,
+		&root_label);
+	rc = security_netlbl_sid_to_secattr(
+		init_selinux_state, root_label.sid, &secattr);
 	if (rc != 0)
 		goto inet_conn_request_return;
 	rc = netlbl_req_setattr(req, &secattr);
@@ -685,64 +490,98 @@ int selinux_netlbl_socket_post_create(struct sock *sk, u16 family)
  * error.
  *
  */
+struct selinux_netlbl_receive_request {
+	struct sk_security_struct *security;
+	struct netlbl_lsm_secattr *secattr;
+	struct sk_buff *skb;
+	u16 family;
+};
+
+static int selinux_resolve_netlbl_receive(
+	struct selinux_state *state,
+	const struct cred *level_cred,
+	void *data,
+	struct selinux_chain_permission *permission)
+{
+	const struct selinux_netlbl_receive_request *request = data;
+	struct selinux_object_label_value socket_label;
+	u32 nlbl_sid;
+	int rc;
+
+	selinux_object_label_get_or_unlabeled(
+		state,
+		request->security->object,
+		SECCLASS_SOCKET,
+		&socket_label);
+	rc = selinux_netlbl_sidlookup_cached(
+		state,
+		request->skb,
+		request->family,
+		request->secattr,
+		&nlbl_sid);
+	if (rc)
+		return rc;
+
+	permission->ssid = socket_label.sid;
+	permission->tsid = nlbl_sid ? nlbl_sid : SECINITSID_UNLABELED;
+	permission->tclass = socket_label.sclass ?
+		socket_label.sclass : SECCLASS_SOCKET;
+	permission->decided =
+		!selinux_policycap_netpeer(state) &&
+		socket_label.source != SELINUX_LABEL_SOURCE_POLICY_BYPASS;
+	switch (permission->tclass) {
+	case SECCLASS_UDP_SOCKET:
+		permission->requested = UDP_SOCKET__RECVFROM;
+		break;
+	case SECCLASS_TCP_SOCKET:
+		permission->requested = TCP_SOCKET__RECVFROM;
+		break;
+	default:
+		permission->requested = RAWIP_SOCKET__RECVFROM;
+		break;
+	}
+	return 0;
+}
+
 int selinux_netlbl_sock_rcv_skb(struct sk_security_struct *sksec,
 				struct sk_buff *skb,
 				u16 family,
 				struct common_audit_data *ad)
 {
-	int rc;
-	u32 nlbl_sid;
-	u32 perm;
 	struct netlbl_lsm_secattr secattr;
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	struct selinux_global_sid_handle *nlbl_handle;
-#endif
+	struct selinux_netlbl_receive_request request = {
+		.security = sksec,
+		.secattr = &secattr,
+		.skb = skb,
+		.family = family,
+	};
+	const struct cred *creator = sksec->creator_cred;
+	int rc;
 
 	if (!netlbl_enabled())
 		return 0;
+	if (!creator)
+		return -ESTALE;
 
 	netlbl_secattr_init(&secattr);
 	rc = netlbl_skbuff_getattr(skb, family, &secattr);
-	if (rc == 0 && secattr.flags != NETLBL_SECATTR_NONE) {
-#ifdef CONFIG_SECURITY_SELINUX_NS
-		nlbl_handle = selinux_netlbl_sidlookup_cached_handle(
-			skb, family, &secattr, sksec->state, NULL, &nlbl_sid);
-		rc = IS_ERR(nlbl_handle) ? PTR_ERR(nlbl_handle) : 0;
-#else
-		rc = selinux_netlbl_sidlookup_cached(skb, family, &secattr,
-						     sksec->state, NULL,
-						     &nlbl_sid);
-#endif
-	} else {
-		nlbl_sid = SECINITSID_UNLABELED;
-#ifdef CONFIG_SECURITY_SELINUX_NS
-		nlbl_handle = rc ? ERR_PTR(rc) : global_sid_handle_get(nlbl_sid);
-		if (!rc && IS_ERR(nlbl_handle))
-			rc = PTR_ERR(nlbl_handle);
-#endif
+	if (rc)
+		goto out;
+	if (secattr.flags == NETLBL_SECATTR_NONE) {
+		secattr.flags = NETLBL_SECATTR_SECID;
+		secattr.attr.secid = SECINITSID_UNLABELED;
 	}
-	netlbl_secattr_destroy(&secattr);
-	if (rc != 0)
-		return rc;
-
-	switch (sksec->sclass) {
-	case SECCLASS_UDP_SOCKET:
-		perm = UDP_SOCKET__RECVFROM;
-		break;
-	case SECCLASS_TCP_SOCKET:
-		perm = TCP_SOCKET__RECVFROM;
-		break;
-	default:
-		perm = RAWIP_SOCKET__RECVFROM;
-	}
-
-	rc = selinux_state_has_perm(sksec->state, sksec->sid, nlbl_sid,
-				    sksec->sclass, perm, ad);
-	if (rc && nlbl_sid != SECINITSID_UNLABELED)
+	rc = selinux_chain_has_custom_perm(
+		creator,
+		sksec->object,
+		NULL,
+		selinux_resolve_netlbl_receive,
+		&request,
+		ad);
+	if (rc && secattr.attr.secid != SECINITSID_UNLABELED)
 		netlbl_skbuff_err(skb, family, rc, 0);
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	global_sid_handle_put(nlbl_handle);
-#endif
+out:
+	netlbl_secattr_destroy(&secattr);
 	return rc;
 }
 

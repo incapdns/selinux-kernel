@@ -28,6 +28,15 @@ struct flowi_tunnel {
 	__be64			tun_id;
 };
 
+enum flowi_lsm_origin_type {
+	FLOWI_LSM_ORIGIN_NONE,
+	FLOWI_LSM_ORIGIN_SOCKET,
+	FLOWI_LSM_ORIGIN_REQUEST_SOCK,
+	FLOWI_LSM_ORIGIN_SKB,
+};
+
+#define FLOWI_LSM_ORIGIN_COOKIE 0x4c534d46U
+
 struct flowi_common {
 	int	flowic_oif;
 	int	flowic_iif;
@@ -43,6 +52,9 @@ struct flowi_common {
 #define FLOWI_FLAG_ANY_SPORT		0x08
 	__u32	flowic_secid;
 	kuid_t  flowic_uid;
+	const void *flowic_lsm_origin;
+	__u32 flowic_lsm_origin_cookie;
+	__u8 flowic_lsm_origin_type;
 	__u32		flowic_multipath_hash;
 	struct flowi_tunnel flowic_tun_key;
 };

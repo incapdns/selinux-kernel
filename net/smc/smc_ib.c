@@ -205,11 +205,7 @@ int smc_ib_find_route(struct net *net, __be32 saddr, __be32 daddr,
 
 	if (daddr == cpu_to_be32(INADDR_NONE))
 		goto out;
-	{
-		struct xfrm_flow_origin origin = xfrm_flow_origin_none();
-
-		rt = ip_route_output_flow_origin(net, &fl4, NULL, &origin);
-	}
+	rt = ip_route_output_flow(net, &fl4, NULL);
 	if (IS_ERR(rt))
 		goto out;
 	if (rt->rt_uses_gateway && rt->rt_gw_family != AF_INET)

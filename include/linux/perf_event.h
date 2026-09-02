@@ -279,20 +279,6 @@ struct hw_perf_event {
 };
 
 struct perf_event;
-
-/*
- * Keep redirected-output delegation bounded for NMI/IRQ producers.  A chain
- * longer than this is rejected at SET_OUTPUT rather than turning the hot
- * output path into an attacker-controlled walk.
- */
-#define PERF_OUTPUT_RELATION_MAX 8
-
-struct perf_event_output_relation {
-	struct rcu_head			rcu;
-	struct perf_buffer		*rb;
-	u8				nr_relations;
-	struct perf_event_relation	*relations[PERF_OUTPUT_RELATION_MAX];
-};
 struct perf_event_pmu_context;
 
 /*
@@ -919,9 +905,6 @@ struct perf_event {
 	void				*overflow_handler_context;
 	struct bpf_prog			*prog;
 	u64				bpf_cookie;
-	struct perf_event_relation __rcu *bpf_relation;
-	struct perf_event_relation	*group_relation;
-	struct perf_event_output_relation __rcu *output_relation;
 
 #ifdef CONFIG_EVENT_TRACING
 	struct trace_event_call		*tp_event;
@@ -1175,7 +1158,6 @@ struct perf_output_handle {
 		u64			aux_flags;	/* perf_aux_output*() */
 		struct {
 			u64		skip_read : 1;
-			u64		group_relation_guard : 1;
 		};
 	};
 	union {
@@ -1183,26 +1165,7 @@ struct perf_output_handle {
 		unsigned long		head;
 	};
 	int				page;
-	/* Start cursor for fail-closed group-read commit revalidation. */
-	struct perf_event		*guard_event;
-	void				*guard_addr;
-	unsigned long			guard_size;
-	u16				guard_record_size;
-	int				guard_page;
 };
-
-static __always_inline void
-perf_output_arm_group_relation_guard(struct perf_output_handle *handle,
-				     struct perf_event *event,
-				     unsigned int record_size)
-{
-	handle->group_relation_guard = 1;
-	handle->guard_event = event;
-	handle->guard_addr = handle->addr;
-	handle->guard_size = handle->size;
-	handle->guard_page = handle->page;
-	handle->guard_record_size = record_size;
-}
 
 struct bpf_perf_event_data_kern {
 	bpf_user_pt_regs_t *regs;
@@ -1270,28 +1233,6 @@ extern void perf_event_delayed_put(struct task_struct *task);
 extern struct file *perf_event_get(unsigned int fd);
 extern const struct perf_event *perf_get_event(struct file *file);
 extern const struct perf_event_attr *perf_event_attrs(struct perf_event *event);
-extern int perf_event_group_relations_valid(struct perf_event *event);
-
-static __always_inline int perf_event_output_relation_valid(
-	const struct perf_event_output_relation *output)
-{
-	u8 i;
-	int ret = 0;
-
-	if (!output || output->nr_relations > PERF_OUTPUT_RELATION_MAX)
-		return -EACCES;
-	/* Inspect every carrier so one reload schedules all stale revalidations. */
-	for (i = 0; i < output->nr_relations; i++) {
-		int rc;
-
-		if (!output->relations[i])
-			return -EACCES;
-		rc = security_perf_event_relation_valid(output->relations[i]);
-		if (rc && !ret)
-			ret = rc;
-	}
-	return ret;
-}
 extern void perf_event_print_debug(void);
 extern void perf_pmu_disable(struct pmu *pmu);
 extern void perf_pmu_enable(struct pmu *pmu);

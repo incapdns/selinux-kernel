@@ -1279,19 +1279,10 @@ static ssize_t smk_write_net4addr(struct file *file, const char __user *buf,
 	 * this host so that incoming packets get labeled.
 	 * but only if we didn't get the special CIPSO option
 	 */
-	if (rc == 0 && skp != NULL) {
-		struct lsm_prop_ref *prop_ref;
-
-		rc = security_secid_to_lsmprop_ref(snp->smk_label->smk_secid,
-						 LSM_ID_SMACK, GFP_KERNEL,
-						 &prop_ref);
-		if (rc == 0) {
-			rc = netlbl_cfg_unlbl_static_add_ref(
-				&init_net, NULL, &snp->smk_host, &snp->smk_mask,
-				PF_INET, prop_ref, &audit_info);
-			security_lsm_prop_ref_put(prop_ref);
-		}
-	}
+	if (rc == 0 && skp != NULL)
+		rc = netlbl_cfg_unlbl_static_add(&init_net, NULL,
+			&snp->smk_host, &snp->smk_mask, PF_INET,
+			snp->smk_label->smk_secid, &audit_info);
 
 	if (rc == 0)
 		rc = count;

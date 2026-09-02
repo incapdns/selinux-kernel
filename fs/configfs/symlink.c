@@ -190,13 +190,8 @@ int configfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	if (dentry->d_inode || d_unhashed(dentry))
 		ret = -EEXIST;
 	else
-		/*
-		 * The pathname layer already performed security_path_symlink()
-		 * before vfs_symlink() called ->symlink().  This second check
-		 * exists only because configfs dropped the inode lock above;
-		 * revalidate DAC without issuing an ambiguous inode-only LSM check.
-		 */
-		ret = generic_permission(idmap, dir, MAY_WRITE | MAY_EXEC);
+		ret = inode_permission(&nop_mnt_idmap, dir,
+				       MAY_WRITE | MAY_EXEC);
 	if (!ret)
 		ret = type->ct_item_ops->allow_link(parent_item, target_item);
 	if (!ret) {

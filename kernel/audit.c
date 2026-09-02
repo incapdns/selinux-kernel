@@ -134,10 +134,9 @@ static u32	audit_backlog_limit = 64;
 static u32	audit_backlog_wait_time = AUDIT_BACKLOG_WAIT_TIME;
 
 /* The identity of the user shutting down the audit system. */
-/* Protected as one tuple by auditd_conn_lock. */
 static kuid_t		audit_sig_uid = INVALID_UID;
 static pid_t		audit_sig_pid = -1;
-static struct lsm_prop_ref *audit_sig_lsm;
+static struct lsm_prop	audit_sig_lsm;
 
 /* Records can be lost in several ways:
    0) [suppressed in audit_alloc]
@@ -214,64 +213,7 @@ struct audit_buffer {
 	struct audit_context *ctx;	/* NULL or associated context */
 	struct audit_stamp   stamp;	/* audit stamp for these records */
 	gfp_t		     gfp_mask;
-	int		     error;	/* sticky formatting/allocation error */
 };
-
-static void audit_buffer_set_error(struct audit_buffer *ab, int error)
-{
-	if (!ab->error)
-		ab->error = error;
-}
-
-#ifdef CONFIG_KUNIT
-static DEFINE_MUTEX(audit_kunit_format_fault_lock);
-static struct {
-	struct task_struct *owner;
-	u16 expansion_failures;
-	u16 enqueues;
-	bool fail_expand;
-	bool intercept_enqueue;
-	bool active;
-} audit_kunit_format_fault;
-
-static bool audit_kunit_format_fault_active(void)
-{
-	/* Pairs with arming after the complete owner/fault tuple is stored. */
-	return smp_load_acquire(&audit_kunit_format_fault.active) &&
-	       READ_ONCE(audit_kunit_format_fault.owner) == current;
-}
-
-static bool audit_kunit_format_fail_expand(void)
-{
-	if (!audit_kunit_format_fault_active() ||
-	    !READ_ONCE(audit_kunit_format_fault.fail_expand))
-		return false;
-	WRITE_ONCE(audit_kunit_format_fault.fail_expand, false);
-	audit_kunit_format_fault.expansion_failures++;
-	return true;
-}
-
-static bool audit_kunit_format_intercept_enqueue(struct sk_buff *skb)
-{
-	if (!audit_kunit_format_fault_active() ||
-	    !READ_ONCE(audit_kunit_format_fault.intercept_enqueue))
-		return false;
-	audit_kunit_format_fault.enqueues++;
-	kfree_skb(skb);
-	return true;
-}
-#else
-static inline bool audit_kunit_format_fail_expand(void)
-{
-	return false;
-}
-
-static inline bool audit_kunit_format_intercept_enqueue(struct sk_buff *skb)
-{
-	(void)skb;
-	return false;
-}
-#endif
 
 struct audit_reply {
 	__u32 portid;
@@ -495,7 +437,7 @@ static int audit_log_config_change(char *function_name, u32 new, u32 old,
 	if (rc)
 		allow_changes = 0; /* Something weird, deny request */
 	audit_log_format(ab, " res=%d", allow_changes);
-	(void)audit_log_end_status(ab);
+	audit_log_end(ab);
 	return rc;
 }
 
@@ -1239,7 +1181,7 @@ static void audit_log_feature_change(int which, u32 old_feature, u32 new_feature
 	audit_log_format(ab, " feature=%s old=%u new=%u old_lock=%u new_lock=%u res=%d",
 			 audit_feature_names[which], !!old_feature, !!new_feature,
 			 !!old_lock, !!new_lock, res);
-	(void)audit_log_end_status(ab);
+	audit_log_end(ab);
 }
 
 static int audit_set_feature(struct audit_features *uaf)
@@ -1319,6 +1261,7 @@ static int audit_receive_msg(struct sk_buff *skb, struct nlmsghdr *nlh,
 	int			err;
 	struct audit_buffer	*ab;
 	u16			msg_type = nlh->nlmsg_type;
+	struct audit_sig_info   *sig_data;
 	struct lsm_context	lsmctx = { NULL, 0, 0 };
 
 	err = audit_netlink_ok(skb, msg_type);
@@ -1503,7 +1446,7 @@ static int audit_receive_msg(struct sk_buff *skb, struct nlmsghdr *nlh,
 					data_len--;
 				audit_log_n_untrustedstring(ab, str, data_len);
 			}
-			(void)audit_log_end_status(ab);
+			audit_log_end(ab);
 		}
 		break;
 	case AUDIT_ADD_RULE:
@@ -1517,7 +1460,7 @@ static int audit_receive_msg(struct sk_buff *skb, struct nlmsghdr *nlh,
 					 msg_type == AUDIT_ADD_RULE ?
 						"add_rule" : "remove_rule",
 					 audit_enabled);
-			(void)audit_log_end_status(ab);
+			audit_log_end(ab);
 			return -EPERM;
 		}
 		err = audit_rule_change(msg_type, seq, data, data_len);
@@ -1532,7 +1475,7 @@ static int audit_receive_msg(struct sk_buff *skb, struct nlmsghdr *nlh,
 		audit_log_common_recv_msg(audit_context(), &ab,
 					  AUDIT_CONFIG_CHANGE);
 		audit_log_format(ab, " op=trim res=1");
-		(void)audit_log_end_status(ab);
+		audit_log_end(ab);
 		break;
 	case AUDIT_MAKE_EQUIV: {
 		void *bufp = data;
@@ -1569,41 +1512,27 @@ static int audit_receive_msg(struct sk_buff *skb, struct nlmsghdr *nlh,
 		audit_log_format(ab, " new=");
 		audit_log_untrustedstring(ab, new);
 		audit_log_format(ab, " res=%d", !err);
-		(void)audit_log_end_status(ab);
+		audit_log_end(ab);
 		kfree(old);
 		kfree(new);
 		break;
 	}
-	case AUDIT_SIGNAL_INFO: {
-		struct lsm_prop_ref *sig_lsm;
-		struct audit_sig_info *sig_data;
-		unsigned long flags;
-		kuid_t sig_uid;
-		pid_t sig_pid;
-
-		spin_lock_irqsave(&auditd_conn_lock, flags);
-		sig_lsm = security_lsm_prop_ref_get(audit_sig_lsm);
-		sig_uid = audit_sig_uid;
-		sig_pid = audit_sig_pid;
-		spin_unlock_irqrestore(&auditd_conn_lock, flags);
-
-		if (sig_lsm) {
-			err = security_lsm_prop_ref_to_secctx(sig_lsm,
-							 current_cred(),
-							 LSM_ID_UNDEF, &lsmctx);
-			security_lsm_prop_ref_put(sig_lsm);
+	case AUDIT_SIGNAL_INFO:
+		if (lsmprop_is_set(&audit_sig_lsm)) {
+			err = security_lsmprop_to_secctx(&audit_sig_lsm,
+							 &lsmctx, LSM_ID_UNDEF);
 			if (err < 0)
 				return err;
 		}
 		sig_data = kmalloc_flex(*sig_data, ctx, lsmctx.len);
 		if (!sig_data) {
-			if (lsmctx.context)
+			if (lsmprop_is_set(&audit_sig_lsm))
 				security_release_secctx(&lsmctx);
 			return -ENOMEM;
 		}
-		sig_data->uid = from_kuid(&init_user_ns, sig_uid);
-		sig_data->pid = sig_pid;
-		if (lsmctx.context) {
+		sig_data->uid = from_kuid(&init_user_ns, audit_sig_uid);
+		sig_data->pid = audit_sig_pid;
+		if (lsmprop_is_set(&audit_sig_lsm)) {
 			memcpy(sig_data->ctx, lsmctx.context, lsmctx.len);
 			security_release_secctx(&lsmctx);
 		}
@@ -1612,7 +1541,6 @@ static int audit_receive_msg(struct sk_buff *skb, struct nlmsghdr *nlh,
 						       lsmctx.len));
 		kfree(sig_data);
 		break;
-	}
 	case AUDIT_TTY_GET: {
 		struct audit_tty_status s;
 		unsigned int t;
@@ -1652,7 +1580,7 @@ static int audit_receive_msg(struct sk_buff *skb, struct nlmsghdr *nlh,
 				 " old-log_passwd=%d new-log_passwd=%d res=%d",
 				 old.enabled, s.enabled, old.log_passwd,
 				 s.log_passwd, !err);
-		(void)audit_log_end_status(ab);
+		audit_log_end(ab);
 		break;
 	}
 	default:
@@ -1742,7 +1670,7 @@ static void audit_log_multicast(int group, const char *op, int err)
 	audit_log_untrustedstring(ab, get_task_comm(comm, current));
 	audit_log_d_path_exe(ab, current->mm); /* exe= */
 	audit_log_format(ab, " nl-mcgrp=%d op=%s res=%d", group, op, !err);
-	(void)audit_log_end_status(ab);
+	audit_log_end(ab);
 }
 
 /* Run custom bind function on netlink socket group connect or bind requests. */
@@ -1914,7 +1842,6 @@ static struct audit_buffer *audit_buffer_alloc(struct audit_context *ctx,
 		return NULL;
 
 	skb_queue_head_init(&ab->skb_list);
-	ab->error = 0;
 
 	ab->skb = nlmsg_new(AUDIT_BUFSIZ, gfp_mask);
 	if (!ab->skb)
@@ -2065,17 +1992,10 @@ static inline int audit_expand(struct audit_buffer *ab, int extra)
 {
 	struct sk_buff *skb = ab->skb;
 	int oldtail = skb_tailroom(skb);
-	int newtail, ret;
-
-	if (unlikely(audit_kunit_format_fail_expand())) {
-		audit_buffer_set_error(ab, -ENOMEM);
-		return 0;
-	}
-	ret = pskb_expand_head(skb, 0, extra, ab->gfp_mask);
-	newtail = skb_tailroom(skb);
+	int ret = pskb_expand_head(skb, 0, extra, ab->gfp_mask);
+	int newtail = skb_tailroom(skb);
 
 	if (ret < 0) {
-		audit_buffer_set_error(ab, ret);
 		audit_log_lost("out of memory in audit_expand");
 		return 0;
 	}
@@ -2361,7 +2281,6 @@ static int audit_buffer_aux_new(struct audit_buffer *ab, int type)
 err:
 	kfree_skb(ab->skb);
 	ab->skb = skb_peek(&ab->skb_list);
-	audit_buffer_set_error(ab, -ENOMEM);
 	return -ENOMEM;
 }
 
@@ -2449,7 +2368,7 @@ int audit_log_task_context(struct audit_buffer *ab)
 }
 EXPORT_SYMBOL(audit_log_task_context);
 
-int audit_log_obj_ctx(struct audit_buffer *ab, const struct lsm_prop *prop)
+int audit_log_obj_ctx(struct audit_buffer *ab, struct lsm_prop *prop)
 {
 	int i;
 	int rc;
@@ -2589,7 +2508,7 @@ void audit_log_path_denied(int type, const char *operation)
 	audit_log_format(ab, "op=%s", operation);
 	audit_log_task_info(ab);
 	audit_log_format(ab, " res=0");
-	(void)audit_log_end_status(ab);
+	audit_log_end(ab);
 }
 
 int audit_log_nf_skb(struct audit_buffer *ab,
@@ -2795,7 +2714,7 @@ static void audit_log_set_loginuid(kuid_t koldloginuid, kuid_t kloginuid,
 			 oldloginuid, loginuid, tty ? tty_name(tty) : "(none)",
 			 oldsessionid, sessionid, !rc);
 	audit_put_tty(tty);
-	(void)audit_log_end_status(ab);
+	audit_log_end(ab);
 }
 
 /**
@@ -2843,36 +2762,18 @@ out:
  */
 int audit_signal_info(int sig, struct task_struct *t)
 {
-	struct lsm_prop_ref *new_lsm = NULL, *old_lsm;
-	pid_t pid;
 	kuid_t uid = current_uid(), auid;
-	unsigned long flags;
-	int rc;
 
 	if (auditd_test_task(t) &&
 	    (sig == SIGTERM || sig == SIGHUP ||
 	     sig == SIGUSR1 || sig == SIGUSR2)) {
-		rc = security_current_getlsmprop_ref_subj(GFP_ATOMIC, &new_lsm);
-		if (rc && rc != -EOPNOTSUPP)
-			return rc;
-		if (new_lsm &&
-		    security_lsm_prop_ref_provider_count(new_lsm) != 1) {
-			security_lsm_prop_ref_put(new_lsm);
-			return -ENOTUNIQ;
-		}
-
-		pid = task_tgid_nr(current);
+		audit_sig_pid = task_tgid_nr(current);
 		auid = audit_get_loginuid(current);
 		if (uid_valid(auid))
-			uid = auid;
-
-		spin_lock_irqsave(&auditd_conn_lock, flags);
-		old_lsm = audit_sig_lsm;
-		audit_sig_lsm = new_lsm;
-		audit_sig_uid = uid;
-		audit_sig_pid = pid;
-		spin_unlock_irqrestore(&auditd_conn_lock, flags);
-		security_lsm_prop_ref_put(old_lsm);
+			audit_sig_uid = auid;
+		else
+			audit_sig_uid = uid;
+		security_current_getlsmprop_subj(&audit_sig_lsm);
 	}
 
 	return audit_signal_info_syscall(t);
@@ -2882,25 +2783,26 @@ int audit_signal_info(int sig, struct task_struct *t)
  * __audit_log_end - enqueue one audit record
  * @skb: the buffer to send
  */
-static int __audit_log_end(struct sk_buff *skb)
+static void __audit_log_end(struct sk_buff *skb)
 {
 	struct nlmsghdr *nlh;
 
-	if (unlikely(audit_kunit_format_intercept_enqueue(skb)))
-		return 0;
+	if (audit_rate_check()) {
+		/* setup the netlink header, see the comments in
+		 * kauditd_send_multicast_skb() for length quirks */
+		nlh = nlmsg_hdr(skb);
+		nlh->nlmsg_len = skb->len - NLMSG_HDRLEN;
 
-	/* setup the netlink header, see the comments in
-	 * kauditd_send_multicast_skb() for length quirks */
-	nlh = nlmsg_hdr(skb);
-	nlh->nlmsg_len = skb->len - NLMSG_HDRLEN;
-
-	/* Queueing to the in-kernel skb queue cannot fail. */
-	skb_queue_tail(&audit_queue, skb);
-	return 0;
+		/* queue the netlink packet */
+		skb_queue_tail(&audit_queue, skb);
+	} else {
+		audit_log_lost("rate limit exceeded");
+		kfree_skb(skb);
+	}
 }
 
 /**
- * audit_log_end_status - end one audit record and report queueing failure
+ * audit_log_end - end one audit record
  * @ab: the audit_buffer
  *
  * We can not do a netlink send inside an irq context because it blocks (last
@@ -2908,29 +2810,12 @@ static int __audit_log_end(struct sk_buff *skb)
  * queue and a kthread is scheduled to remove them from the queue outside the
  * irq context.  May be called in any context.
  */
-int audit_log_end_status(struct audit_buffer *ab)
+void audit_log_end(struct audit_buffer *ab)
 {
 	struct sk_buff *skb;
-	int rc;
 
 	if (!ab)
-		return -EINVAL;
-	rc = ab->error;
-	if (rc) {
-		audit_buffer_free(ab);
-		return rc;
-	}
-	/*
-	 * Rate-limit an audit event as one transaction.  The main record and
-	 * every auxiliary record share one serial and must be observable
-	 * together; checking each skb while dequeueing could publish a prefix
-	 * and then reject the remainder.
-	 */
-	if (!audit_rate_check()) {
-		audit_log_lost("rate limit exceeded");
-		audit_buffer_free(ab);
-		return -ENOBUFS;
-	}
+		return;
 
 	while ((skb = skb_dequeue(&ab->skb_list)))
 		__audit_log_end(skb);
@@ -2939,82 +2824,6 @@ int audit_log_end_status(struct audit_buffer *ab)
 	wake_up_interruptible(&kauditd_wait);
 
 	audit_buffer_free(ab);
-	return rc;
-}
-
-#ifdef CONFIG_KUNIT
-int
-audit_kunit_format_expand_failure(struct audit_kunit_format_fault_result *result)
-{
-	struct audit_buffer *ab;
-	u16 before;
-	int rc = 0;
-
-	if (!result)
-		return -EINVAL;
-	memset(result, 0, sizeof(*result));
-	mutex_lock(&audit_kunit_format_fault_lock);
-	WRITE_ONCE(audit_kunit_format_fault.owner, current);
-	WRITE_ONCE(audit_kunit_format_fault.fail_expand, true);
-	WRITE_ONCE(audit_kunit_format_fault.intercept_enqueue, true);
-	audit_kunit_format_fault.expansion_failures = 0;
-	audit_kunit_format_fault.enqueues = 0;
-	/* Publish only after the complete task-targeted fault is initialized. */
-	smp_store_release(&audit_kunit_format_fault.active, true);
-
-	ab = audit_buffer_alloc(NULL, GFP_KERNEL, AUDIT_AVC);
-	if (!ab) {
-		rc = -ENOMEM;
-		goto out_disarm;
-	}
-	rc = audit_buffer_aux_new(ab, AUDIT_MAC_TASK_CONTEXTS);
-	if (rc) {
-		audit_buffer_free(ab);
-		goto out_disarm;
-	}
-	/* Force expansion regardless of allocator-specific skb headroom. */
-	audit_log_format(ab, "%*s", skb_tailroom(ab->skb) + 1, "");
-	audit_buffer_aux_end(ab);
-	result->failure_rc = audit_log_end_status(ab);
-	result->failure_enqueues = audit_kunit_format_fault.enqueues;
-
-	before = audit_kunit_format_fault.enqueues;
-	ab = audit_buffer_alloc(NULL, GFP_KERNEL, AUDIT_AVC);
-	if (!ab) {
-		rc = -ENOMEM;
-		goto out_result;
-	}
-	rc = audit_buffer_aux_new(ab, AUDIT_MAC_TASK_CONTEXTS);
-	if (rc) {
-		audit_buffer_free(ab);
-		goto out_result;
-	}
-	audit_log_format(ab, "%*s", skb_tailroom(ab->skb) + 1, "");
-	audit_buffer_aux_end(ab);
-	result->retry_rc = audit_log_end_status(ab);
-	result->retry_enqueues = audit_kunit_format_fault.enqueues - before;
-
-out_result:
-	result->expansion_failures =
-		audit_kunit_format_fault.expansion_failures;
-out_disarm:
-	/* Make disarming visible before the target pointer can be replaced. */
-	smp_store_release(&audit_kunit_format_fault.active, false);
-	WRITE_ONCE(audit_kunit_format_fault.intercept_enqueue, false);
-	WRITE_ONCE(audit_kunit_format_fault.fail_expand, false);
-	WRITE_ONCE(audit_kunit_format_fault.owner, NULL);
-	mutex_unlock(&audit_kunit_format_fault_lock);
-	return rc;
-}
-#endif
-
-/**
- * audit_log_end - end one audit record, ignoring queueing status
- * @ab: the audit_buffer
- */
-void audit_log_end(struct audit_buffer *ab)
-{
-	audit_log_end_status(ab);
 }
 
 /**
@@ -3040,12 +2849,11 @@ void audit_log(struct audit_context *ctx, gfp_t gfp_mask, int type,
 		va_start(args, fmt);
 		audit_log_vformat(ab, fmt, args);
 		va_end(args);
-		(void)audit_log_end_status(ab);
+		audit_log_end(ab);
 	}
 }
 
 EXPORT_SYMBOL(audit_log_start);
 EXPORT_SYMBOL(audit_log_end);
-EXPORT_SYMBOL(audit_log_end_status);
 EXPORT_SYMBOL(audit_log_format);
 EXPORT_SYMBOL(audit_log);

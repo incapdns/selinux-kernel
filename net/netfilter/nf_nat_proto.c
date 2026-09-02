@@ -600,7 +600,6 @@ nf_nat_ipv4_pre_routing(void *priv, struct sk_buff *skb,
 #ifdef CONFIG_XFRM
 static int nf_xfrm_me_harder(struct net *net, struct sk_buff *skb, unsigned int family)
 {
-	struct xfrm_flow_origin origin = xfrm_flow_origin_skb(skb);
 	struct sock *sk = skb->sk;
 	struct dst_entry *dst;
 	unsigned int hh_len;
@@ -620,7 +619,7 @@ static int nf_xfrm_me_harder(struct net *net, struct sk_buff *skb, unsigned int 
 	if (sk && !net_eq(net, sock_net(sk)))
 		sk = NULL;
 
-	dst = xfrm_lookup_origin(net, dst, &fl, sk, &origin, 0);
+	dst = xfrm_lookup(net, dst, &fl, sk, 0);
 	if (IS_ERR(dst))
 		return PTR_ERR(dst);
 

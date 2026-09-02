@@ -67,7 +67,6 @@ struct netlbl_unlhsh_tbl {
 	container_of(iter, struct netlbl_unlhsh_addr4, list)
 struct netlbl_unlhsh_addr4 {
 	u32 secid;
-	struct lsm_prop_ref *prop_ref;
 
 	struct netlbl_af4list list;
 	struct rcu_head rcu;
@@ -76,7 +75,6 @@ struct netlbl_unlhsh_addr4 {
 	container_of(iter, struct netlbl_unlhsh_addr6, list)
 struct netlbl_unlhsh_addr6 {
 	u32 secid;
-	struct lsm_prop_ref *prop_ref;
 
 	struct netlbl_af6list list;
 	struct rcu_head rcu;
@@ -106,8 +104,6 @@ static DEFINE_SPINLOCK(netlbl_unlhsh_lock);
 	rcu_dereference_check(p, lockdep_is_held(&netlbl_unlhsh_lock))
 static struct netlbl_unlhsh_tbl __rcu *netlbl_unlhsh;
 static struct netlbl_unlhsh_iface __rcu *netlbl_unlhsh_def;
-
-static void netlbl_unlhsh_condremove_iface(struct netlbl_unlhsh_iface *iface);
 
 /* Accept unlabeled packets flag */
 static u8 netlabel_unlabel_acceptflg;
@@ -164,45 +160,17 @@ static void netlbl_unlhsh_free_iface(struct rcu_head *entry)
 	 * structure */
 
 	netlbl_af4list_foreach_safe(iter4, tmp4, &iface->addr4_list) {
-		struct netlbl_unlhsh_addr4 *addr4 =
-			netlbl_unlhsh_addr4_entry(iter4);
-
 		netlbl_af4list_remove_entry(iter4);
-		security_lsm_prop_ref_put(addr4->prop_ref);
-		kfree(addr4);
+		kfree(netlbl_unlhsh_addr4_entry(iter4));
 	}
 #if IS_ENABLED(CONFIG_IPV6)
 	netlbl_af6list_foreach_safe(iter6, tmp6, &iface->addr6_list) {
-		struct netlbl_unlhsh_addr6 *addr6 =
-			netlbl_unlhsh_addr6_entry(iter6);
-
 		netlbl_af6list_remove_entry(iter6);
-		security_lsm_prop_ref_put(addr6->prop_ref);
-		kfree(addr6);
+		kfree(netlbl_unlhsh_addr6_entry(iter6));
 	}
 #endif /* IPv6 */
 	kfree(iface);
 }
-
-static void netlbl_unlhsh_free_addr4(struct rcu_head *rcu)
-{
-	struct netlbl_unlhsh_addr4 *entry =
-		container_of(rcu, struct netlbl_unlhsh_addr4, rcu);
-
-	security_lsm_prop_ref_put(entry->prop_ref);
-	kfree(entry);
-}
-
-#if IS_ENABLED(CONFIG_IPV6)
-static void netlbl_unlhsh_free_addr6(struct rcu_head *rcu)
-{
-	struct netlbl_unlhsh_addr6 *entry =
-		container_of(rcu, struct netlbl_unlhsh_addr6, rcu);
-
-	security_lsm_prop_ref_put(entry->prop_ref);
-	kfree(entry);
-}
-#endif
 
 /**
  * netlbl_unlhsh_hash - Hashing function for the hash table
@@ -253,7 +221,6 @@ static struct netlbl_unlhsh_iface *netlbl_unlhsh_search_iface(int ifindex)
  * @addr: IPv4 address in network byte order
  * @mask: IPv4 address mask in network byte order
  * @secid: LSM secid value for entry
- * @prop_ref: strong LSM property reference paired with @secid
  *
  * Description:
  * Add a new address entry into the unlabeled connection hash table using the
@@ -264,8 +231,7 @@ static struct netlbl_unlhsh_iface *netlbl_unlhsh_search_iface(int ifindex)
 static int netlbl_unlhsh_add_addr4(struct netlbl_unlhsh_iface *iface,
 				   const struct in_addr *addr,
 				   const struct in_addr *mask,
-				   u32 secid,
-				   struct lsm_prop_ref *prop_ref)
+				   u32 secid)
 {
 	int ret_val;
 	struct netlbl_unlhsh_addr4 *entry;
@@ -278,16 +244,13 @@ static int netlbl_unlhsh_add_addr4(struct netlbl_unlhsh_iface *iface,
 	entry->list.mask = mask->s_addr;
 	entry->list.valid = 1;
 	entry->secid = secid;
-	entry->prop_ref = security_lsm_prop_ref_get(prop_ref);
 
 	spin_lock(&netlbl_unlhsh_lock);
 	ret_val = netlbl_af4list_add(&entry->list, &iface->addr4_list);
 	spin_unlock(&netlbl_unlhsh_lock);
 
-	if (ret_val != 0) {
-		security_lsm_prop_ref_put(entry->prop_ref);
+	if (ret_val != 0)
 		kfree(entry);
-	}
 	return ret_val;
 }
 
@@ -298,7 +261,6 @@ static int netlbl_unlhsh_add_addr4(struct netlbl_unlhsh_iface *iface,
  * @addr: IPv6 address in network byte order
  * @mask: IPv6 address mask in network byte order
  * @secid: LSM secid value for entry
- * @prop_ref: strong LSM property reference paired with @secid
  *
  * Description:
  * Add a new address entry into the unlabeled connection hash table using the
@@ -309,8 +271,7 @@ static int netlbl_unlhsh_add_addr4(struct netlbl_unlhsh_iface *iface,
 static int netlbl_unlhsh_add_addr6(struct netlbl_unlhsh_iface *iface,
 				   const struct in6_addr *addr,
 				   const struct in6_addr *mask,
-				   u32 secid,
-				   struct lsm_prop_ref *prop_ref)
+				   u32 secid)
 {
 	int ret_val;
 	struct netlbl_unlhsh_addr6 *entry;
@@ -327,16 +288,13 @@ static int netlbl_unlhsh_add_addr6(struct netlbl_unlhsh_iface *iface,
 	entry->list.mask = *mask;
 	entry->list.valid = 1;
 	entry->secid = secid;
-	entry->prop_ref = security_lsm_prop_ref_get(prop_ref);
 
 	spin_lock(&netlbl_unlhsh_lock);
 	ret_val = netlbl_af6list_add(&entry->list, &iface->addr6_list);
 	spin_unlock(&netlbl_unlhsh_lock);
 
-	if (ret_val != 0) {
-		security_lsm_prop_ref_put(entry->prop_ref);
+	if (ret_val != 0)
 		kfree(entry);
-	}
 	return ret_val;
 }
 #endif /* IPv6 */
@@ -389,33 +347,30 @@ add_iface_failure:
 }
 
 /**
- * netlbl_unlhsh_add_ref - Adds a strong entry to the unlabeled hash table
+ * netlbl_unlhsh_add - Adds a new entry to the unlabeled connection hash table
  * @net: network namespace
  * @dev_name: interface name
  * @addr: IP address in network byte order
  * @mask: address mask in network byte order
  * @addr_len: length of address/mask (4 for IPv4, 16 for IPv6)
- * @prop_ref: strong LSM property reference for the entry
+ * @secid: LSM secid value for the entry
  * @audit_info: NetLabel audit information
  *
  * Description:
  * Adds a new entry to the unlabeled connection hash table.  Returns zero on
- * success, negative values on failure.  The table takes its own reference;
- * ownership of the caller's reference is unchanged.
+ * success, negative values on failure.
  *
  */
-int netlbl_unlhsh_add_ref(struct net *net,
-			  const char *dev_name,
-			  const void *addr,
-			  const void *mask,
-			  u32 addr_len,
-			  struct lsm_prop_ref *prop_ref,
-			  struct netlbl_audit *audit_info)
+int netlbl_unlhsh_add(struct net *net,
+		      const char *dev_name,
+		      const void *addr,
+		      const void *mask,
+		      u32 addr_len,
+		      u32 secid,
+		      struct netlbl_audit *audit_info)
 {
 	int ret_val;
 	int ifindex;
-	bool iface_created = false;
-	u32 secid;
 	struct net_device *dev;
 	struct netlbl_unlhsh_iface *iface;
 	struct audit_buffer *audit_buf = NULL;
@@ -424,12 +379,6 @@ int netlbl_unlhsh_add_ref(struct net *net,
 	if (addr_len != sizeof(struct in_addr) &&
 	    addr_len != sizeof(struct in6_addr))
 		return -EINVAL;
-	if (!prop_ref)
-		return -EINVAL;
-	if (security_lsm_prop_ref_provider_count(prop_ref) != 1)
-		return -ENOTUNIQ;
-	if (!security_lsm_prop_ref_source_secid(prop_ref, &secid))
-		return -ESTALE;
 
 	rcu_read_lock();
 	if (dev_name != NULL) {
@@ -450,7 +399,6 @@ int netlbl_unlhsh_add_ref(struct net *net,
 			ret_val = -ENOMEM;
 			goto unlhsh_add_return;
 		}
-		iface_created = true;
 	}
 	audit_buf = netlbl_audit_start_common(AUDIT_MAC_UNLBL_STCADD,
 					      audit_info);
@@ -459,8 +407,7 @@ int netlbl_unlhsh_add_ref(struct net *net,
 		const struct in_addr *addr4 = addr;
 		const struct in_addr *mask4 = mask;
 
-		ret_val = netlbl_unlhsh_add_addr4(
-			iface, addr4, mask4, secid, prop_ref);
+		ret_val = netlbl_unlhsh_add_addr4(iface, addr4, mask4, secid);
 		if (audit_buf != NULL)
 			netlbl_af4list_audit_addr(audit_buf, 1,
 						  dev_name,
@@ -473,8 +420,7 @@ int netlbl_unlhsh_add_ref(struct net *net,
 		const struct in6_addr *addr6 = addr;
 		const struct in6_addr *mask6 = mask;
 
-		ret_val = netlbl_unlhsh_add_addr6(
-			iface, addr6, mask6, secid, prop_ref);
+		ret_val = netlbl_unlhsh_add_addr6(iface, addr6, mask6, secid);
 		if (audit_buf != NULL)
 			netlbl_af6list_audit_addr(audit_buf, 1,
 						  dev_name,
@@ -487,63 +433,18 @@ int netlbl_unlhsh_add_ref(struct net *net,
 	}
 	if (ret_val == 0)
 		atomic_inc(&netlabel_mgmt_protocount);
-	else if (iface_created)
-		netlbl_unlhsh_condremove_iface(iface);
 
 unlhsh_add_return:
 	rcu_read_unlock();
 	if (audit_buf != NULL) {
-		if (security_lsm_prop_ref_to_secctx(
-			    prop_ref, current_cred(), LSM_ID_UNDEF, &ctx) >= 0) {
+		if (security_secid_to_secctx(secid, &ctx) >= 0) {
 			audit_log_format(audit_buf, " sec_obj=%s", ctx.context);
 			security_release_secctx(&ctx);
 		}
 		audit_log_format(audit_buf, " res=%u", ret_val == 0 ? 1 : 0);
-		(void)audit_log_end_status(audit_buf);
+		audit_log_end(audit_buf);
 	}
 	return ret_val;
-}
-
-/**
- * netlbl_unlhsh_add - Adds a legacy secid entry to the unlabeled hash table
- * @net: network namespace
- * @dev_name: interface name
- * @addr: IP address in network byte order
- * @mask: address mask in network byte order
- * @addr_len: length of address/mask (4 for IPv4, 16 for IPv6)
- * @secid: legacy LSM secid value for the entry
- * @audit_info: NetLabel audit information
- *
- * Capture an unambiguous strong property reference for @secid and delegate to
- * netlbl_unlhsh_add_ref().  Returns zero on success, negative values on
- * failure.
- */
-int netlbl_unlhsh_add(struct net *net,
-		      const char *dev_name,
-		      const void *addr,
-		      const void *mask,
-		      u32 addr_len,
-		      u32 secid,
-		      struct netlbl_audit *audit_info)
-{
-	struct lsm_prop_ref *prop_ref;
-	u32 source_secid;
-	int rc;
-
-	rc = security_secid_to_lsmprop_ref(
-		secid, LSM_ID_UNDEF, GFP_KERNEL, &prop_ref);
-	if (rc)
-		return rc;
-	if (security_lsm_prop_ref_provider_count(prop_ref) != 1)
-		rc = -ENOTUNIQ;
-	else if (!security_lsm_prop_ref_source_secid(prop_ref, &source_secid) ||
-		 source_secid != secid)
-		rc = -ESTALE;
-	else
-		rc = netlbl_unlhsh_add_ref(
-			net, dev_name, addr, mask, addr_len, prop_ref, audit_info);
-	security_lsm_prop_ref_put(prop_ref);
-	return rc;
 }
 
 /**
@@ -589,20 +490,18 @@ static int netlbl_unlhsh_remove_addr4(struct net *net,
 					  addr->s_addr, mask->s_addr);
 		dev_put(dev);
 		if (entry != NULL &&
-		    security_lsm_prop_ref_to_secctx(
-			    entry->prop_ref, current_cred(), LSM_ID_UNDEF,
-			    &ctx) >= 0) {
+		    security_secid_to_secctx(entry->secid, &ctx) >= 0) {
 			audit_log_format(audit_buf, " sec_obj=%s", ctx.context);
 			security_release_secctx(&ctx);
 		}
 		audit_log_format(audit_buf, " res=%u", entry != NULL ? 1 : 0);
-		(void)audit_log_end_status(audit_buf);
+		audit_log_end(audit_buf);
 	}
 
 	if (entry == NULL)
 		return -ENOENT;
 
-	call_rcu(&entry->rcu, netlbl_unlhsh_free_addr4);
+	kfree_rcu(entry, rcu);
 	return 0;
 }
 
@@ -649,20 +548,18 @@ static int netlbl_unlhsh_remove_addr6(struct net *net,
 					  addr, mask);
 		dev_put(dev);
 		if (entry != NULL &&
-		    security_lsm_prop_ref_to_secctx(
-			    entry->prop_ref, current_cred(), LSM_ID_UNDEF,
-			    &ctx) >= 0) {
+		    security_secid_to_secctx(entry->secid, &ctx) >= 0) {
 			audit_log_format(audit_buf, " sec_obj=%s", ctx.context);
 			security_release_secctx(&ctx);
 		}
 		audit_log_format(audit_buf, " res=%u", entry != NULL ? 1 : 0);
-		(void)audit_log_end_status(audit_buf);
+		audit_log_end(audit_buf);
 	}
 
 	if (entry == NULL)
 		return -ENOENT;
 
-	call_rcu(&entry->rcu, netlbl_unlhsh_free_addr6);
+	kfree_rcu(entry, rcu);
 	return 0;
 }
 #endif /* IPv6 */
@@ -839,7 +736,7 @@ static void netlbl_unlabel_acceptflg_set(u8 value,
 	if (audit_buf != NULL) {
 		audit_log_format(audit_buf,
 				 " unlbl_accept=%u old=%u", value, old_val);
-		(void)audit_log_end_status(audit_buf);
+		audit_log_end(audit_buf);
 	}
 }
 
@@ -967,7 +864,6 @@ static int netlbl_unlabel_staticadd(struct sk_buff *skb,
 	void *mask;
 	u32 addr_len;
 	u32 secid;
-	struct lsm_prop_ref *prop_ref;
 	struct netlbl_audit audit_info;
 
 	/* Don't allow users to add both IPv4 and IPv6 addresses for a
@@ -988,22 +884,16 @@ static int netlbl_unlabel_staticadd(struct sk_buff *skb,
 	if (ret_val != 0)
 		return ret_val;
 	dev_name = nla_data(info->attrs[NLBL_UNLABEL_A_IFACE]);
-	ret_val = security_secctx_to_lsmprop_ref(
-		nla_data(info->attrs[NLBL_UNLABEL_A_SECCTX]),
-		nla_len(info->attrs[NLBL_UNLABEL_A_SECCTX]), LSM_ID_UNDEF,
-		GFP_KERNEL, &prop_ref);
+	ret_val = security_secctx_to_secid(
+		                  nla_data(info->attrs[NLBL_UNLABEL_A_SECCTX]),
+				  nla_len(info->attrs[NLBL_UNLABEL_A_SECCTX]),
+				  &secid);
 	if (ret_val != 0)
 		return ret_val;
-	if (security_lsm_prop_ref_provider_count(prop_ref) != 1)
-		ret_val = -ENOTUNIQ;
-	else if (!security_lsm_prop_ref_source_secid(prop_ref, &secid))
-		ret_val = -ESTALE;
-	else
-		ret_val = netlbl_unlhsh_add_ref(
-			&init_net, dev_name, addr, mask, addr_len, prop_ref,
-			&audit_info);
-	security_lsm_prop_ref_put(prop_ref);
-	return ret_val;
+
+	return netlbl_unlhsh_add(&init_net,
+				 dev_name, addr, mask, addr_len, secid,
+				 &audit_info);
 }
 
 /**
@@ -1025,7 +915,6 @@ static int netlbl_unlabel_staticadddef(struct sk_buff *skb,
 	void *mask;
 	u32 addr_len;
 	u32 secid;
-	struct lsm_prop_ref *prop_ref;
 	struct netlbl_audit audit_info;
 
 	/* Don't allow users to add both IPv4 and IPv6 addresses for a
@@ -1044,22 +933,16 @@ static int netlbl_unlabel_staticadddef(struct sk_buff *skb,
 	ret_val = netlbl_unlabel_addrinfo_get(info, &addr, &mask, &addr_len);
 	if (ret_val != 0)
 		return ret_val;
-	ret_val = security_secctx_to_lsmprop_ref(
-		nla_data(info->attrs[NLBL_UNLABEL_A_SECCTX]),
-		nla_len(info->attrs[NLBL_UNLABEL_A_SECCTX]), LSM_ID_UNDEF,
-		GFP_KERNEL, &prop_ref);
+	ret_val = security_secctx_to_secid(
+		                  nla_data(info->attrs[NLBL_UNLABEL_A_SECCTX]),
+				  nla_len(info->attrs[NLBL_UNLABEL_A_SECCTX]),
+				  &secid);
 	if (ret_val != 0)
 		return ret_val;
-	if (security_lsm_prop_ref_provider_count(prop_ref) != 1)
-		ret_val = -ENOTUNIQ;
-	else if (!security_lsm_prop_ref_source_secid(prop_ref, &secid))
-		ret_val = -ESTALE;
-	else
-		ret_val = netlbl_unlhsh_add_ref(
-			&init_net, NULL, addr, mask, addr_len, prop_ref,
-			&audit_info);
-	security_lsm_prop_ref_put(prop_ref);
-	return ret_val;
+
+	return netlbl_unlhsh_add(&init_net,
+				 NULL, addr, mask, addr_len, secid,
+				 &audit_info);
 }
 
 /**
@@ -1170,8 +1053,8 @@ static int netlbl_unlabel_staticlist_gen(u32 cmd,
 	struct netlbl_unlhsh_walk_arg *cb_arg = arg;
 	struct net_device *dev;
 	struct lsm_context ctx;
-	struct lsm_prop_ref *prop_ref;
 	void *data;
+	u32 secid;
 
 	data = genlmsg_put(cb_arg->skb, NETLINK_CB(cb_arg->nl_cb->skb).portid,
 			   cb_arg->seq, &netlbl_unlabel_gnl_family,
@@ -1209,7 +1092,7 @@ static int netlbl_unlabel_staticlist_gen(u32 cmd,
 		if (ret_val != 0)
 			goto list_cb_failure;
 
-		prop_ref = addr4->prop_ref;
+		secid = addr4->secid;
 	} else {
 		ret_val = nla_put_in6_addr(cb_arg->skb,
 					   NLBL_UNLABEL_A_IPV6ADDR,
@@ -1223,11 +1106,10 @@ static int netlbl_unlabel_staticlist_gen(u32 cmd,
 		if (ret_val != 0)
 			goto list_cb_failure;
 
-		prop_ref = addr6->prop_ref;
+		secid = addr6->secid;
 	}
 
-	ret_val = security_lsm_prop_ref_to_secctx(
-		prop_ref, current_cred(), LSM_ID_UNDEF, &ctx);
+	ret_val = security_secid_to_secctx(secid, &ctx);
 	if (ret_val < 0)
 		goto list_cb_failure;
 	ret_val = nla_put(cb_arg->skb,
@@ -1558,9 +1440,6 @@ int netlbl_unlabel_getattr(const struct sk_buff *skb,
 			   struct netlbl_lsm_secattr *secattr)
 {
 	struct netlbl_unlhsh_iface *iface;
-	struct lsm_prop_ref *prop_ref = NULL;
-	u32 secid = 0;
-	u32 source_secid;
 
 	rcu_read_lock();
 	iface = netlbl_unlhsh_search_iface(skb->skb_iif);
@@ -1588,9 +1467,7 @@ int netlbl_unlabel_getattr(const struct sk_buff *skb,
 					      &iface->addr4_list);
 		if (addr4 == NULL)
 			goto unlabel_getattr_nolabel;
-		secid = netlbl_unlhsh_addr4_entry(addr4)->secid;
-		prop_ref = security_lsm_prop_ref_get(
-			netlbl_unlhsh_addr4_entry(addr4)->prop_ref);
+		secattr->attr.secid = netlbl_unlhsh_addr4_entry(addr4)->secid;
 		break;
 	}
 #if IS_ENABLED(CONFIG_IPV6)
@@ -1603,9 +1480,7 @@ int netlbl_unlabel_getattr(const struct sk_buff *skb,
 					      &iface->addr6_list);
 		if (addr6 == NULL)
 			goto unlabel_getattr_nolabel;
-		secid = netlbl_unlhsh_addr6_entry(addr6)->secid;
-		prop_ref = security_lsm_prop_ref_get(
-			netlbl_unlhsh_addr6_entry(addr6)->prop_ref);
+		secattr->attr.secid = netlbl_unlhsh_addr6_entry(addr6)->secid;
 		break;
 	}
 #endif /* IPv6 */
@@ -1614,15 +1489,7 @@ int netlbl_unlabel_getattr(const struct sk_buff *skb,
 	}
 	rcu_read_unlock();
 
-	if (!prop_ref || security_lsm_prop_ref_provider_count(prop_ref) != 1 ||
-	    !security_lsm_prop_ref_source_secid(prop_ref, &source_secid) ||
-	    source_secid != secid) {
-		security_lsm_prop_ref_put(prop_ref);
-		return -ESTALE;
-	}
-	secattr->attr.secid = secid;
-	secattr->prop_ref = prop_ref;
-	secattr->flags |= NETLBL_SECATTR_SECID | NETLBL_SECATTR_PROP_REF;
+	secattr->flags |= NETLBL_SECATTR_SECID;
 	secattr->type = NETLBL_NLTYPE_UNLABELED;
 	return 0;
 

@@ -1307,7 +1307,6 @@ static void xfrm_hash_grow_check(struct net *net, int have_hash_collision)
 
 static void xfrm_state_look_at(struct xfrm_policy *pol, struct xfrm_state *x,
 			       const struct flowi *fl, unsigned short family,
-			       const struct xfrm_flow_origin *origin,
 			       struct xfrm_state **best, int *acq_in_progress,
 			       int *error, unsigned int pcpu_id)
 {
@@ -1327,8 +1326,7 @@ static void xfrm_state_look_at(struct xfrm_policy *pol, struct xfrm_state *x,
 		     (x->sel.family != family ||
 		      !xfrm_selector_match(&x->sel, fl, family))) ||
 		    !security_xfrm_state_pol_flow_match(x, pol,
-							&fl->u.__fl_common,
-							origin))
+							&fl->u.__fl_common))
 			return;
 
 		if (x->pcpu_num != UINT_MAX && x->pcpu_num != pcpu_id)
@@ -1349,16 +1347,14 @@ static void xfrm_state_look_at(struct xfrm_policy *pol, struct xfrm_state *x,
 		     (x->sel.family == family &&
 		      xfrm_selector_match(&x->sel, fl, family))) &&
 		    security_xfrm_state_pol_flow_match(x, pol,
-						       &fl->u.__fl_common,
-						       origin))
+						       &fl->u.__fl_common))
 			*error = -ESRCH;
 	}
 }
 
 struct xfrm_state *
 xfrm_state_find(const xfrm_address_t *daddr, const xfrm_address_t *saddr,
-		const struct flowi *fl, const struct xfrm_flow_origin *origin,
-		struct xfrm_tmpl *tmpl,
+		const struct flowi *fl, struct xfrm_tmpl *tmpl,
 		struct xfrm_policy *pol, int *err,
 		unsigned short family, u32 if_id)
 {
@@ -1399,7 +1395,7 @@ xfrm_state_find(const xfrm_address_t *daddr, const xfrm_address_t *saddr,
 		    tmpl->mode == x->props.mode &&
 		    tmpl->id.proto == x->id.proto &&
 		    (tmpl->id.spi == x->id.spi || !tmpl->id.spi))
-			xfrm_state_look_at(pol, x, fl, encap_family, origin,
+			xfrm_state_look_at(pol, x, fl, encap_family,
 					   &best, &acquire_in_progress, &error, pcpu_id);
 	}
 
@@ -1416,7 +1412,7 @@ xfrm_state_find(const xfrm_address_t *daddr, const xfrm_address_t *saddr,
 		    tmpl->mode == x->props.mode &&
 		    tmpl->id.proto == x->id.proto &&
 		    (tmpl->id.spi == x->id.spi || !tmpl->id.spi))
-			xfrm_state_look_at(pol, x, fl, family, origin,
+			xfrm_state_look_at(pol, x, fl, family,
 					   &best, &acquire_in_progress, &error, pcpu_id);
 	}
 
@@ -1457,7 +1453,7 @@ cached:
 		    tmpl->mode == x->props.mode &&
 		    tmpl->id.proto == x->id.proto &&
 		    (tmpl->id.spi == x->id.spi || !tmpl->id.spi))
-			xfrm_state_look_at(pol, x, fl, family, origin,
+			xfrm_state_look_at(pol, x, fl, family,
 					   &best, &acquire_in_progress, &error, pcpu_id);
 	}
 	if (best || acquire_in_progress)
@@ -1492,7 +1488,7 @@ cached:
 		    tmpl->mode == x->props.mode &&
 		    tmpl->id.proto == x->id.proto &&
 		    (tmpl->id.spi == x->id.spi || !tmpl->id.spi))
-			xfrm_state_look_at(pol, x, fl, family, origin,
+			xfrm_state_look_at(pol, x, fl, family,
 					   &best, &acquire_in_progress, &error, pcpu_id);
 	}
 
@@ -1536,7 +1532,9 @@ found:
 			x->pcpu_num = pcpu_id;
 
 		error = security_xfrm_state_alloc_acquire(
-			x, pol->security, fl->flowi_secid, origin);
+			x,
+			pol->security,
+			&fl->u.__fl_common);
 		if (error) {
 			x->km.state = XFRM_STATE_DEAD;
 			to_put = x;
@@ -3472,7 +3470,7 @@ void xfrm_audit_state_add(struct xfrm_state *x, int result, bool task_valid)
 	xfrm_audit_helper_usrinfo(task_valid, audit_buf);
 	xfrm_audit_helper_sainfo(x, audit_buf);
 	audit_log_format(audit_buf, " res=%u", result);
-	(void)audit_log_end_status(audit_buf);
+	audit_log_end(audit_buf);
 }
 EXPORT_SYMBOL_GPL(xfrm_audit_state_add);
 
@@ -3486,7 +3484,7 @@ void xfrm_audit_state_delete(struct xfrm_state *x, int result, bool task_valid)
 	xfrm_audit_helper_usrinfo(task_valid, audit_buf);
 	xfrm_audit_helper_sainfo(x, audit_buf);
 	audit_log_format(audit_buf, " res=%u", result);
-	(void)audit_log_end_status(audit_buf);
+	audit_log_end(audit_buf);
 }
 EXPORT_SYMBOL_GPL(xfrm_audit_state_delete);
 
@@ -3504,7 +3502,7 @@ void xfrm_audit_state_replay_overflow(struct xfrm_state *x,
 	 * of audit message */
 	spi = ntohl(x->id.spi);
 	audit_log_format(audit_buf, " spi=%u(0x%x)", spi, spi);
-	(void)audit_log_end_status(audit_buf);
+	audit_log_end(audit_buf);
 }
 EXPORT_SYMBOL_GPL(xfrm_audit_state_replay_overflow);
 
@@ -3521,7 +3519,7 @@ void xfrm_audit_state_replay(struct xfrm_state *x,
 	spi = ntohl(x->id.spi);
 	audit_log_format(audit_buf, " spi=%u(0x%x) seqno=%u",
 			 spi, spi, ntohl(net_seq));
-	(void)audit_log_end_status(audit_buf);
+	audit_log_end(audit_buf);
 }
 EXPORT_SYMBOL_GPL(xfrm_audit_state_replay);
 
@@ -3533,7 +3531,7 @@ void xfrm_audit_state_notfound_simple(struct sk_buff *skb, u16 family)
 	if (audit_buf == NULL)
 		return;
 	xfrm_audit_helper_pktinfo(skb, family, audit_buf);
-	(void)audit_log_end_status(audit_buf);
+	audit_log_end(audit_buf);
 }
 EXPORT_SYMBOL_GPL(xfrm_audit_state_notfound_simple);
 
@@ -3550,7 +3548,7 @@ void xfrm_audit_state_notfound(struct sk_buff *skb, u16 family,
 	spi = ntohl(net_spi);
 	audit_log_format(audit_buf, " spi=%u(0x%x) seqno=%u",
 			 spi, spi, ntohl(net_seq));
-	(void)audit_log_end_status(audit_buf);
+	audit_log_end(audit_buf);
 }
 EXPORT_SYMBOL_GPL(xfrm_audit_state_notfound);
 
@@ -3570,7 +3568,7 @@ void xfrm_audit_state_icvfail(struct xfrm_state *x,
 		audit_log_format(audit_buf, " spi=%u(0x%x) seqno=%u",
 				 spi, spi, ntohl(net_seq));
 	}
-	(void)audit_log_end_status(audit_buf);
+	audit_log_end(audit_buf);
 }
 EXPORT_SYMBOL_GPL(xfrm_audit_state_icvfail);
 #endif /* CONFIG_AUDITSYSCALL */

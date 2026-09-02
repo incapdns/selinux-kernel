@@ -222,8 +222,7 @@ static struct vfsmount *cifs_do_automount(struct path *path)
 	if (rc)
 		return ERR_PTR(rc);
 
-	fc = fs_context_for_submount_cred(path->mnt->mnt_sb->s_type, path,
-					  current_cred());
+	fc = fs_context_for_submount(path->mnt->mnt_sb->s_type, mntpt);
 	if (IS_ERR(fc))
 		return ERR_CAST(fc);
 

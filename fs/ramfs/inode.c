@@ -197,12 +197,6 @@ static const struct inode_operations ramfs_dir_inode_operations = {
 	.mknod		= ramfs_mknod,
 	.rename		= simple_rename,
 	.tmpfile	= ramfs_tmpfile,
-	.security_create_plan_ops =
-		SECURITY_INODE_CREATE_OP(SECURITY_INODE_CREATE) |
-		SECURITY_INODE_CREATE_OP(SECURITY_INODE_MKNOD) |
-		SECURITY_INODE_CREATE_OP(SECURITY_INODE_MKDIR) |
-		SECURITY_INODE_CREATE_OP(SECURITY_INODE_SYMLINK) |
-		SECURITY_INODE_CREATE_OP(SECURITY_INODE_TMPFILE),
 };
 
 /*

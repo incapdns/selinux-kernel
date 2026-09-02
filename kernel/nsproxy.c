@@ -339,9 +339,10 @@ static void put_nsset(struct nsset *nsset)
 {
 	unsigned flags = nsset->flags;
 
-	security_ipc_namespace_reanchor_abort(&nsset->ipc_security_txn);
 	if (flags & CLONE_NEWUSER)
 		put_cred(nsset_cred(nsset));
+	if (nsset->security_cred_for_children)
+		put_cred(nsset->security_cred_for_children);
 	/*
 	 * We only created a temporary copy if we attached to more than just
 	 * the mount namespace.
@@ -350,8 +351,6 @@ static void put_nsset(struct nsset *nsset)
 		free_fs_struct(nsset->fs);
 	if (nsset->nsproxy)
 		nsproxy_free(nsset->nsproxy);
-	if (nsset->security_cred)
-		abort_creds(nsset->security_cred);
 }
 
 static int prepare_nsset(unsigned flags, struct nsset *nsset)
@@ -540,9 +539,6 @@ static void commit_nsset(struct nsset *nsset)
 	unsigned flags = nsset->flags;
 	struct task_struct *me = current;
 
-	/* Infallible after prepare; object constructors are gated by pending. */
-	security_ipc_namespace_reanchor_commit(&nsset->ipc_security_txn);
-
 #ifdef CONFIG_USER_NS
 	if (flags & CLONE_NEWUSER) {
 		/* transfer ownership */
@@ -550,6 +546,12 @@ static void commit_nsset(struct nsset *nsset)
 		nsset->cred = NULL;
 	}
 #endif
+	if (nsset->security_cred_for_children) {
+		security_task_setns_cred_for_children(
+			nsset->security_cred_for_children);
+		put_cred(nsset->security_cred_for_children);
+		nsset->security_cred_for_children = NULL;
+	}
 
 	/* We only need to commit if we have used a temporary fs_struct. */
 	if ((flags & CLONE_NEWNS) && (flags & ~CLONE_NEWNS)) {
@@ -570,10 +572,6 @@ static void commit_nsset(struct nsset *nsset)
 	/* transfer ownership */
 	switch_task_namespaces(me, nsset->nsproxy);
 	nsset->nsproxy = NULL;
-	if (nsset->security_cred) {
-		commit_creds(nsset->security_cred);
-		nsset->security_cred = NULL;
-	}
 }
 
 SYSCALL_DEFINE2(setns, int, fd, int, flags)

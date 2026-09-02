@@ -115,15 +115,6 @@ union bpf_attr;
 struct btf_show;
 struct btf_id_set;
 struct bpf_prog;
-struct bpf_token;
-
-enum bpf_btf_origin {
-	BPF_BTF_ORIGIN_UNINITIALIZED,
-	BPF_BTF_ORIGIN_USER,
-	BPF_BTF_ORIGIN_KERNEL_LOAD,
-	BPF_BTF_ORIGIN_VMLINUX,
-	BPF_BTF_ORIGIN_MODULE,
-};
 
 typedef int (*btf_kfunc_filter_t)(const struct bpf_prog *prog, u32 kfunc_id);
 
@@ -151,15 +142,11 @@ struct btf_struct_metas {
 extern const struct file_operations btf_fops;
 
 const char *btf_get_name(const struct btf *btf);
-void *btf_security(const struct btf *btf);
-void btf_set_security(struct btf *btf, void *security);
-enum bpf_btf_origin btf_get_origin(const struct btf *btf);
 void btf_get(struct btf *btf);
 void btf_put(struct btf *btf);
 const struct btf_header *btf_header(const struct btf *btf);
 struct bpf_log_attr;
-int btf_new_fd(const union bpf_attr *attr, bpfptr_t uattr,
-	       struct bpf_log_attr *attr_log, struct bpf_token *token);
+int btf_new_fd(const union bpf_attr *attr, bpfptr_t uattr, struct bpf_log_attr *attr_log);
 struct btf *btf_get_by_fd(int fd);
 int btf_get_info_by_fd(const struct btf *btf,
 		       const union bpf_attr *attr,

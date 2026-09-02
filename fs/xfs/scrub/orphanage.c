@@ -165,9 +165,8 @@ xrep_orphanage_create(
 	 * directory to control access to a file we put in here.
 	 */
 	if (d_really_is_negative(orphanage_dentry)) {
-		orphanage_dentry = vfs_mkdir_mnt(&nop_mnt_idmap,
-						 sc->file->f_path.mnt, root_inode,
-						 orphanage_dentry, 0750, NULL);
+		orphanage_dentry = vfs_mkdir(&nop_mnt_idmap, root_inode,
+					     orphanage_dentry, 0750, NULL);
 		error = PTR_ERR(orphanage_dentry);
 		if (IS_ERR(orphanage_dentry))
 			goto out_dput_orphanage;

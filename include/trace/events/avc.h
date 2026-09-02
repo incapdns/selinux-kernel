@@ -14,8 +14,8 @@
 TRACE_EVENT(selinux_audited,
 
 	TP_PROTO(struct selinux_audit_data *sad,
-		const char *scontext,
-		const char *tcontext,
+		char *scontext,
+		char *tcontext,
 		const char *tclass
 	),
 

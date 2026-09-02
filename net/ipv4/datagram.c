@@ -115,11 +115,7 @@ void ip4_datagram_release_cb(struct sock *sk)
 	}
 
 	inet_sk_init_flowi4(inet, &fl4);
-	{
-		struct xfrm_flow_origin origin = xfrm_flow_origin_sock(sk);
-
-		rt = ip_route_output_flow_origin(sock_net(sk), &fl4, sk, &origin);
-	}
+	rt = ip_route_output_flow(sock_net(sk), &fl4, sk);
 	dst = !IS_ERR(rt) ? &rt->dst : NULL;
 	sk_dst_set(sk, dst);
 

@@ -446,11 +446,7 @@ static noinline_for_stack int ipvlan_process_v4_outbound(struct sk_buff *skb)
 	fl4.saddr = ip4h->saddr;
 	fl4.flowi4_dscp = ip4h_dscp(ip4h);
 
-	{
-		struct xfrm_flow_origin origin = xfrm_flow_origin_skb(skb);
-
-		rt = ip_route_output_flow_origin(net, &fl4, NULL, &origin);
-	}
+	rt = ip_route_output_flow(net, &fl4, NULL);
 	if (IS_ERR(rt))
 		goto err;
 

@@ -2561,7 +2561,7 @@ EXPORT_SYMBOL(dquot_resume);
 int dquot_quota_on(struct super_block *sb, int type, int format_id,
 		   const struct path *path)
 {
-	int error = security_quota_on_mnt(path->mnt, path->dentry);
+	int error = security_quota_on(path->dentry);
 	if (error)
 		return error;
 	/* Quota file not on the same filesystem? */
@@ -2589,12 +2589,7 @@ int dquot_quota_on_mount(struct super_block *sb, char *qf_name,
 	if (IS_ERR(dentry))
 		return PTR_ERR(dentry);
 
-	/*
-	 * This mount-time helper has no published vfsmount to borrow.  Keep the
-	 * legacy NULL-view call explicit: a namespaced LSM must fail closed rather
-	 * than infer a mount from the dentry or reinterpret a derived view.
-	 */
-	error = security_quota_on_mnt(NULL, dentry);
+	error = security_quota_on(dentry);
 	if (!error)
 		error = dquot_load_quota_inode(d_inode(dentry), type, format_id,
 				DQUOT_USAGE_ENABLED | DQUOT_LIMITS_ENABLED);

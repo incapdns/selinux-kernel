@@ -36,7 +36,6 @@ struct kernfs_root {
 	unsigned int		flags;	/* KERNFS_ROOT_* flags */
 
 	/* private fields, do not use outside kernfs proper */
-	void			*security;
 	struct idr		ino_idr;
 	spinlock_t		kernfs_idr_lock;	/* root->ino_idr */
 	u32			last_id_lowbits;
@@ -55,11 +54,6 @@ struct kernfs_root {
 	rwlock_t		kernfs_rename_lock;
 
 	struct rcu_head		rcu;
-
-#ifdef CONFIG_KERNFS_KUNIT_TEST
-	void			(*security_free_done)(void *data);
-	void			*security_free_done_data;
-#endif
 
 	struct simple_xattr_cache xa_cache;
 };

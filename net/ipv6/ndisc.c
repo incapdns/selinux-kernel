@@ -64,7 +64,6 @@
 #include <net/flow.h>
 #include <net/ip6_checksum.h>
 #include <net/inet_common.h>
-#include <net/xfrm.h>
 #include <linux/proc_fs.h>
 
 #include <linux/netfilter.h>
@@ -486,11 +485,10 @@ void ndisc_send_skb(struct sk_buff *skb, const struct in6_addr *daddr,
 	sk = net->ipv6.ndisc_sk;
 	if (!dst) {
 		struct flowi6 fl6;
-		struct xfrm_flow_origin origin = xfrm_flow_origin_sock(sk);
 		int oif = skb->dev->ifindex;
 
 		icmpv6_flow_init(sk, &fl6, type, saddr, daddr, oif);
-		dst = icmp6_dst_alloc_origin(skb->dev, &fl6, &origin);
+		dst = icmp6_dst_alloc(skb->dev, &fl6);
 		if (IS_ERR(dst)) {
 			rcu_read_unlock();
 			kfree_skb(skb);
@@ -1667,7 +1665,6 @@ void ndisc_send_redirect(struct sk_buff *skb, const struct in6_addr *target)
 	struct rt6_info *rt;
 	struct dst_entry *dst;
 	struct flowi6 fl6;
-	struct xfrm_flow_origin origin = xfrm_flow_origin_sock(sk);
 	int rd_len;
 	u8 ha_buf[MAX_ADDR_LEN], *ha = NULL,
 	   ops_data_buf[NDISC_OPS_REDIRECT_DATA_SPACE], *ops_data = NULL;
@@ -1698,8 +1695,7 @@ void ndisc_send_redirect(struct sk_buff *skb, const struct in6_addr *target)
 		dst_release(dst);
 		return;
 	}
-	dst = xfrm_lookup_origin(net, dst, flowi6_to_flowi(&fl6), NULL,
-				 &origin, 0);
+	dst = xfrm_lookup(net, dst, flowi6_to_flowi(&fl6), NULL, 0);
 	if (IS_ERR(dst))
 		return;
 

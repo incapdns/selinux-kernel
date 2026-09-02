@@ -936,12 +936,7 @@ static netdev_tx_t ipip6_tunnel_xmit(struct sk_buff *skb,
 
 	rt = dst_cache_get_ip4(&tunnel->dst_cache, &fl4.saddr);
 	if (!rt) {
-		{
-			struct xfrm_flow_origin origin = xfrm_flow_origin_skb(skb);
-
-			rt = ip_route_output_flow_origin(tunnel->net, &fl4, NULL,
-							 &origin);
-		}
+		rt = ip_route_output_flow(tunnel->net, &fl4, NULL);
 		if (IS_ERR(rt)) {
 			DEV_STATS_INC(dev, tx_carrier_errors);
 			goto tx_error_icmp;

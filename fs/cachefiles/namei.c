@@ -97,8 +97,7 @@ struct dentry *cachefiles_get_directory(struct cachefiles_cache *cache,
 retry:
 	ret = cachefiles_inject_read_error();
 	if (ret == 0)
-		subdir = start_creating_mnt(&nop_mnt_idmap, cache->mnt, dir,
-					    &QSTR(dirname));
+		subdir = start_creating(&nop_mnt_idmap, dir, &QSTR(dirname));
 	else
 		subdir = ERR_PTR(ret);
 	trace_cachefiles_lookup(NULL, dir, subdir);
@@ -130,8 +129,7 @@ retry:
 			goto mkdir_error;
 		ret = cachefiles_inject_write_error();
 		if (ret == 0) {
-			subdir = vfs_mkdir_mnt(&nop_mnt_idmap, cache->mnt,
-					       d_inode(dir), subdir, 0700, NULL);
+			subdir = vfs_mkdir(&nop_mnt_idmap, d_inode(dir), subdir, 0700, NULL);
 			if (IS_ERR(subdir))
 				ret = PTR_ERR(subdir);
 		} else {
@@ -249,8 +247,7 @@ static int cachefiles_unlink(struct cachefiles_cache *cache,
 
 	ret = cachefiles_inject_remove_error();
 	if (ret == 0) {
-		ret = vfs_unlink_mnt(&nop_mnt_idmap, cache->mnt,
-				     d_backing_inode(dir), dentry, NULL);
+		ret = vfs_unlink(&nop_mnt_idmap, d_backing_inode(dir), dentry, NULL);
 		if (ret == -EIO)
 			cachefiles_io_error(cache, "Unlink failed");
 	}
@@ -308,8 +305,6 @@ try_again:
 		(uint32_t) atomic_inc_return(&cache->gravecounter));
 
 	rd.mnt_idmap = &nop_mnt_idmap;
-	rd.old_mnt = cache->mnt;
-	rd.new_mnt = cache->mnt;
 	rd.old_parent = dir;
 	rd.new_parent = cache->graveyard;
 	rd.flags = 0;
@@ -600,9 +595,8 @@ bool cachefiles_look_up_object(struct cachefiles_object *object)
 	/* Look up path "cache/vol/fanout/file". */
 	ret = cachefiles_inject_read_error();
 	if (ret == 0)
-		dentry = lookup_one_positive_unlocked_mnt(
-			&nop_mnt_idmap, volume->cache->mnt,
-			&QSTR(object->d_name), fan);
+		dentry = lookup_one_positive_unlocked(&nop_mnt_idmap,
+						      &QSTR(object->d_name), fan);
 	else
 		dentry = ERR_PTR(ret);
 	trace_cachefiles_lookup(object, fan, dentry);
@@ -657,8 +651,7 @@ bool cachefiles_commit_tmpfile(struct cachefiles_cache *cache,
 
 	ret = cachefiles_inject_read_error();
 	if (ret == 0)
-		dentry = start_creating_mnt(&nop_mnt_idmap, volume->cache->mnt,
-					    fan, &QSTR(object->d_name));
+		dentry = start_creating(&nop_mnt_idmap, fan, &QSTR(object->d_name));
 	else
 		dentry = ERR_PTR(ret);
 	if (IS_ERR(dentry)) {
@@ -682,9 +675,8 @@ bool cachefiles_commit_tmpfile(struct cachefiles_cache *cache,
 
 		ret = cachefiles_inject_read_error();
 		if (ret == 0)
-			dentry = start_creating_mnt(&nop_mnt_idmap,
-						    volume->cache->mnt, fan,
-						    &QSTR(object->d_name));
+			dentry = start_creating(&nop_mnt_idmap, fan,
+						&QSTR(object->d_name));
 		else
 			dentry = ERR_PTR(ret);
 		if (IS_ERR(dentry)) {
@@ -697,9 +689,8 @@ bool cachefiles_commit_tmpfile(struct cachefiles_cache *cache,
 
 	ret = cachefiles_inject_read_error();
 	if (ret == 0)
-		ret = vfs_link_mnt(object->file->f_path.mnt,
-				   object->file->f_path.dentry, &nop_mnt_idmap,
-				   volume->cache->mnt, d_inode(fan), dentry, NULL);
+		ret = vfs_link(object->file->f_path.dentry, &nop_mnt_idmap,
+			       d_inode(fan), dentry, NULL);
 	if (ret < 0) {
 		trace_cachefiles_vfs_error(object, d_inode(fan), ret,
 					   cachefiles_trace_link_error);
@@ -731,8 +722,7 @@ static struct dentry *cachefiles_lookup_for_cull(struct cachefiles_cache *cache,
 	struct dentry *victim;
 	int ret = -ENOENT;
 
-	victim = start_removing_mnt(&nop_mnt_idmap, cache->mnt, dir,
-				    &QSTR(filename));
+	victim = start_removing(&nop_mnt_idmap, dir, &QSTR(filename));
 
 	if (IS_ERR(victim))
 		goto lookup_error;

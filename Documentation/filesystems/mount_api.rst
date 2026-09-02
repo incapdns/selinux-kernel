@@ -429,27 +429,16 @@ destroying a context:
 
        struct fs_context *fs_context_for_submount(
 		struct file_system_type *fs_type,
-		const struct path *reference);
-
-       struct fs_context *fs_context_for_submount_cred(
-		struct file_system_type *fs_type,
-		const struct path *reference,
-		const struct cred *cred);
+		struct dentry *reference);
 
      Allocate a filesystem context for the purpose of creating a new mount for
-     an automount point or other derived superblock.  ``fs_type`` specifies the
-     filesystem type that will manage the context.  The complete ``reference``
-     path supplies the parameters, propagates namespaces from its superblock,
-     and preserves the particular mount through which the reference was
-     selected for mount-scoped security state.
+     an automount point or other derived superblock.  fs_type specifies the
+     filesystem type that will manage the context and the reference dentry
+     supplies the parameters.  Namespaces are propagated from the reference
+     dentry's superblock also.
 
-     ``fs_context_for_submount()`` binds the new context to the current
-     credentials.  ``fs_context_for_submount_cred()`` instead binds it to the
-     supplied non-NULL ``cred``; this is intended for callers that must retain
-     the authority associated with an earlier operation.
-
-     Note that it's not a requirement that the reference path be of the same
-     filesystem type as ``fs_type``.
+     Note that it's not a requirement that the reference dentry be of the same
+     filesystem type as fs_type.
 
    * ::
 

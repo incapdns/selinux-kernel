@@ -81,7 +81,7 @@ static void tty_audit_log(const char *description, dev_t dev,
 	audit_log_untrustedstring(ab, name);
 	audit_log_format(ab, " data=");
 	audit_log_n_hex(ab, data, size);
-	(void)audit_log_end_status(ab);
+	audit_log_end(ab);
 }
 
 /*

@@ -213,9 +213,8 @@ static struct dentry *ovl_lookup_positive_unlocked(struct ovl_lookup_data *d,
 						   struct dentry *base, int len,
 						   bool drop_negative)
 {
-	struct dentry *ret = lookup_one_unlocked_mnt(
-		mnt_idmap(d->layer->mnt), d->layer->mnt,
-		&QSTR_LEN(name, len), base);
+	struct dentry *ret = lookup_one_unlocked(mnt_idmap(d->layer->mnt),
+						 &QSTR_LEN(name, len), base);
 
 	if (!IS_ERR(ret) && d_flags_negative(smp_load_acquire(&ret->d_flags))) {
 		if (drop_negative && ret->d_lockref.count == 1) {
@@ -824,9 +823,8 @@ struct dentry *ovl_lookup_index(struct ovl_fs *ofs, struct dentry *upper,
 	if (err)
 		return ERR_PTR(err);
 
-	index = lookup_one_positive_unlocked_mnt(
-		ovl_upper_mnt_idmap(ofs), ovl_upper_mnt(ofs), &name,
-		ofs->workdir);
+	index = lookup_one_positive_unlocked(ovl_upper_mnt_idmap(ofs), &name,
+					     ofs->workdir);
 	if (IS_ERR(index)) {
 		err = PTR_ERR(index);
 		if (err == -ENOENT) {
@@ -1452,11 +1450,9 @@ bool ovl_lower_positive(struct dentry *dentry)
 			 * because lookup_one_positive_unlocked() will hash name
 			 * with parentpath base, which is on another (lower fs).
 			 */
-			this = lookup_one_positive_unlocked_mnt(
-				mnt_idmap(parentpath->layer->mnt),
-				parentpath->layer->mnt,
-				&QSTR_LEN(name->name, name->len),
-				parentpath->dentry);
+			this = lookup_one_positive_unlocked(mnt_idmap(parentpath->layer->mnt),
+							    &QSTR_LEN(name->name, name->len),
+							    parentpath->dentry);
 			if (IS_ERR(this)) {
 				switch (PTR_ERR(this)) {
 				case -ENOENT:

@@ -798,7 +798,7 @@ static int smb3_fs_context_parse_monolithic(struct fs_context *fc,
 	if (!options)
 		return 0;
 
-	ret = security_sb_eat_lsm_opts(options, fc);
+	ret = security_sb_eat_lsm_opts(options, &fc->security);
 	if (ret)
 		return ret;
 

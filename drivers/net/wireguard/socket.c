@@ -58,12 +58,7 @@ static int send4(struct wg_device *wg, struct sk_buff *skb,
 			if (cache)
 				dst_cache_reset(cache);
 		}
-		{
-			struct xfrm_flow_origin origin = xfrm_flow_origin_skb(skb);
-
-			rt = ip_route_output_flow_origin(sock_net(sock), &fl, sock,
-							 &origin);
-		}
+		rt = ip_route_output_flow(sock_net(sock), &fl, sock);
 		if (unlikely(endpoint->src_if4 && ((IS_ERR(rt) &&
 			     PTR_ERR(rt) == -EINVAL) || (!IS_ERR(rt) &&
 			     rt->dst.dev->ifindex != endpoint->src_if4)))) {
@@ -74,12 +69,7 @@ static int send4(struct wg_device *wg, struct sk_buff *skb,
 				dst_cache_reset(cache);
 			if (!IS_ERR(rt))
 				ip_rt_put(rt);
-			{
-				struct xfrm_flow_origin origin = xfrm_flow_origin_skb(skb);
-
-				rt = ip_route_output_flow_origin(sock_net(sock), &fl,
-								 sock, &origin);
-			}
+			rt = ip_route_output_flow(sock_net(sock), &fl, sock);
 		}
 		if (IS_ERR(rt)) {
 			ret = PTR_ERR(rt);
@@ -146,12 +136,7 @@ static int send6(struct wg_device *wg, struct sk_buff *skb,
 			if (cache)
 				dst_cache_reset(cache);
 		}
-		{
-			struct xfrm_flow_origin origin = xfrm_flow_origin_sock(sock);
-
-			dst = ip6_dst_lookup_flow_origin(sock_net(sock), sock, &fl,
-							  NULL, &origin);
-		}
+		dst = ip6_dst_lookup_flow(sock_net(sock), sock, &fl, NULL);
 		if (IS_ERR(dst)) {
 			ret = PTR_ERR(dst);
 			net_dbg_ratelimited("%s: No route to %pISpfsc, error %d\n",

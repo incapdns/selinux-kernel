@@ -64,14 +64,11 @@ int ip6_route_me_harder(struct net *net, struct sock *sk_partial, struct sk_buff
 #ifdef CONFIG_XFRM
 	if (!(IP6CB(skb)->flags & IP6SKB_XFRM_TRANSFORMED) &&
 	    xfrm_decode_session(net, skb, flowi6_to_flowi(&fl6), AF_INET6) == 0) {
-		struct xfrm_flow_origin origin = xfrm_flow_origin_skb(skb);
-
 		/* ignore return value from skb_dstref_steal, xfrm_lookup takes
 		 * care of dropping the refcnt if needed.
 		 */
 		skb_dstref_steal(skb);
-		dst = xfrm_lookup_origin(net, dst, flowi6_to_flowi(&fl6), sk,
-					 &origin, 0);
+		dst = xfrm_lookup(net, dst, flowi6_to_flowi(&fl6), sk, 0);
 		if (IS_ERR(dst))
 			return PTR_ERR(dst);
 		skb_dst_set(skb, dst);

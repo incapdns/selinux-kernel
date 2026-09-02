@@ -356,9 +356,9 @@ static int ovl_check_whiteouts(const struct path *path, struct ovl_readdir_data 
 		struct ovl_cache_entry *p =
 			rdd->first_maybe_whiteout;
 		rdd->first_maybe_whiteout = p->next_maybe_whiteout;
-		dentry = lookup_one_positive_killable_mnt(
-			mnt_idmap(path->mnt), path->mnt,
-			&QSTR_LEN(p->name, p->len), dir);
+		dentry = lookup_one_positive_killable(mnt_idmap(path->mnt),
+						      &QSTR_LEN(p->name, p->len),
+						      dir);
 		if (!IS_ERR(dentry)) {
 			p->is_whiteout = ovl_is_whiteout(dentry);
 			dput(dentry);
@@ -574,8 +574,7 @@ static int ovl_cache_update(const struct path *path, struct ovl_cache_entry *p, 
 		}
 	}
 	/* This checks also for xwhiteouts */
-	this = lookup_one_mnt(mnt_idmap(path->mnt), path->mnt,
-			      &QSTR_LEN(p->name, p->len), dir);
+	this = lookup_one(mnt_idmap(path->mnt), &QSTR_LEN(p->name, p->len), dir);
 	if (IS_ERR_OR_NULL(this) || !this->d_inode) {
 		/* Mark a stale entry */
 		p->is_whiteout = true;

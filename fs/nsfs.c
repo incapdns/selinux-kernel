@@ -27,32 +27,6 @@ static struct vfsmount *nsfs_mnt;
 
 static struct path nsfs_root_path = {};
 
-#if IS_ENABLED(CONFIG_KUNIT)
-static DEFINE_SPINLOCK(nsfs_kunit_security_init_lock);
-static struct ns_common *nsfs_kunit_security_init_ns;
-static int nsfs_kunit_security_init_error;
-
-void nsfs_kunit_fail_security_init_once(struct ns_common *ns, int error)
-{
-	guard(spinlock)(&nsfs_kunit_security_init_lock);
-	nsfs_kunit_security_init_ns = ns;
-	nsfs_kunit_security_init_error = error;
-}
-
-static int nsfs_kunit_security_failure(struct ns_common *ns)
-{
-	int error = 0;
-
-	guard(spinlock)(&nsfs_kunit_security_init_lock);
-	if (nsfs_kunit_security_init_ns == ns) {
-		error = nsfs_kunit_security_init_error;
-		nsfs_kunit_security_init_ns = NULL;
-		nsfs_kunit_security_init_error = 0;
-	}
-	return error;
-}
-#endif
-
 void nsfs_get_root(struct path *path)
 {
 	*path = nsfs_root_path;
@@ -250,11 +224,14 @@ static long ns_ioctl(struct file *filp, unsigned int ioctl,
 	int ret;
 
 	ns = get_proc_ns(file_inode(filp));
-	if (!nsfs_ioctl_valid(ioctl))
-		return ns->ops->ioctl ? ns->ops->ioctl(ns, ioctl, arg) :
-					-ENOIOCTLCMD;
+	if (!nsfs_ioctl_valid(ioctl)) {
+		if (ns->ops->ioctl)
+			return ns->ops->ioctl(ns, ioctl, arg);
+		return -ENOIOCTLCMD;
+	}
 	if (!may_use_nsfs_ioctl(ioctl))
 		return -EPERM;
+
 	switch (ioctl) {
 	case NS_GET_USERNS:
 		return open_related_ns(ns, ns_get_owner);
@@ -447,23 +424,11 @@ static const struct super_operations nsfs_ops = {
 static int nsfs_init_inode(struct inode *inode, void *data)
 {
 	struct ns_common *ns = data;
-	int ret;
 
 	inode->i_private = data;
 	inode->i_mode |= S_IRUGO;
 	inode->i_fop = &ns_file_operations;
 	inode->i_ino = ns->inum;
-
-	/* nsfs_evict() unconditionally drops this active reference. */
-	__ns_ref_active_get(ns);
-#if IS_ENABLED(CONFIG_KUNIT)
-	ret = nsfs_kunit_security_failure(ns);
-	if (!ret)
-#endif
-		ret = security_inode_init_security_nsfs(inode, ns);
-	if (ret)
-		/* prepare_anon_dentry() iputs and balances through nsfs_evict(). */
-		return ret;
 
 	/*
 	 * Bring the namespace subtree back to life if we have to. This
@@ -473,6 +438,7 @@ static int nsfs_init_inode(struct inode *inode, void *data)
 	 * ioctl on such a socket will resurrect the relevant namespace
 	 * subtree.
 	 */
+	__ns_ref_active_get(ns);
 	return 0;
 }
 
@@ -547,17 +513,9 @@ bool is_current_namespace(struct ns_common *ns)
 		return current_in_namespace(to_uts_ns(ns));
 #endif
 	default:
-		if (ns->ops->is_current)
-			return ns->ops->is_current(ns);
 		VFS_WARN_ON_ONCE(true);
 		return false;
 	}
-}
-
-static bool nsfs_handle_fields_valid(u64 ns_id, u32 ns_inum, u32 ns_type)
-{
-	/* Type zero is valid for namespaces without a spare CLONE_NEW* bit. */
-	return ns_id && !(!ns_inum && ns_type);
 }
 
 static struct dentry *nsfs_fh_to_dentry(struct super_block *sb, struct fid *fh,
@@ -585,7 +543,10 @@ static struct dentry *nsfs_fh_to_dentry(struct super_block *sb, struct fid *fh,
 		return NULL;
 	}
 
-	if (!nsfs_handle_fields_valid(fid->ns_id, fid->ns_inum, fid->ns_type))
+	if (!fid->ns_id)
+		return NULL;
+	/* Either both are set or both are unset. */
+	if (!fid->ns_inum != !fid->ns_type)
 		return NULL;
 
 	scoped_guard(rcu) {
@@ -666,13 +627,7 @@ static struct dentry *nsfs_fh_to_dentry(struct super_block *sb, struct fid *fh,
 		break;
 #endif
 	default:
-		if (!ns->ops->get || !ns->ops->owner) {
-			ns->ops->put(ns);
-			return ERR_PTR(-EOPNOTSUPP);
-		}
-		if (!is_current_namespace(ns))
-			owning_ns = ns->ops->owner(ns);
-		break;
+		return ERR_PTR(-EOPNOTSUPP);
 	}
 
 	if (owning_ns && !may_see_all_namespaces()) {
@@ -687,13 +642,6 @@ static struct dentry *nsfs_fh_to_dentry(struct super_block *sb, struct fid *fh,
 
 	return no_free_ptr(path.dentry);
 }
-
-#if IS_ENABLED(CONFIG_KUNIT)
-bool nsfs_kunit_handle_fields_valid(u64 ns_id, u32 ns_inum, u32 ns_type)
-{
-	return nsfs_handle_fields_valid(ns_id, ns_inum, ns_type);
-}
-#endif
 
 static int nsfs_export_permission(struct handle_to_path_ctx *ctx,
 				   unsigned int oflags)

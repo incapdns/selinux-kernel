@@ -10702,7 +10702,7 @@ int bpf_xdp_link_attach(const union bpf_attr *attr, struct bpf_prog *prog)
 	link->dev = dev;
 	link->flags = attr->link_create.flags;
 
-	err = bpf_link_prime(&link->link, &link_primer, NULL, NULL);
+	err = bpf_link_prime(&link->link, &link_primer);
 	if (err) {
 		kfree(link);
 		goto unlock;

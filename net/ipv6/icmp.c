@@ -358,7 +358,6 @@ static struct dst_entry *icmpv6_route_lookup(struct net *net,
 {
 	struct dst_entry *dst, *dst2;
 	struct flowi6 fl2;
-	struct xfrm_flow_origin origin = xfrm_flow_origin_skb(skb);
 	int err;
 
 	err = ip6_dst_lookup(net, sk, &dst, fl6);
@@ -379,8 +378,7 @@ static struct dst_entry *icmpv6_route_lookup(struct net *net,
 	/* No need to clone since we're just using its address. */
 	dst2 = dst;
 
-	dst = xfrm_lookup_origin(net, dst, flowi6_to_flowi(fl6), sk,
-				 &origin, 0);
+	dst = xfrm_lookup(net, dst, flowi6_to_flowi(fl6), sk, 0);
 	if (!IS_ERR(dst)) {
 		if (dst != dst2)
 			return dst;
@@ -399,8 +397,7 @@ static struct dst_entry *icmpv6_route_lookup(struct net *net,
 	if (err)
 		goto relookup_failed;
 
-	dst2 = xfrm_lookup_origin(net, dst2, flowi6_to_flowi(&fl2), sk,
-				  &origin, XFRM_LOOKUP_ICMP);
+	dst2 = xfrm_lookup(net, dst2, flowi6_to_flowi(&fl2), sk, XFRM_LOOKUP_ICMP);
 	if (!IS_ERR(dst2)) {
 		dst_release(dst);
 		dst = dst2;
@@ -992,12 +989,7 @@ static enum skb_drop_reason icmpv6_echo_reply(struct sk_buff *skb)
 
 	if (ip6_dst_lookup(net, sk, &dst, &fl6))
 		goto out;
-	{
-		struct xfrm_flow_origin origin = xfrm_flow_origin_skb(skb);
-
-		dst = xfrm_lookup_origin(net, dst, flowi6_to_flowi(&fl6), sk,
-					 &origin, 0);
-	}
+	dst = xfrm_lookup(net, dst, flowi6_to_flowi(&fl6), sk, 0);
 	if (IS_ERR(dst))
 		goto out;
 

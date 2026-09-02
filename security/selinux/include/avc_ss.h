@@ -11,6 +11,7 @@
 #include <linux/types.h>
 
 struct selinux_avc;
+
 int avc_ss_reset(struct selinux_avc *avc, u32 seqno);
 
 /* Class/perm mapping support */

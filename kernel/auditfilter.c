@@ -1122,7 +1122,7 @@ static void audit_log_rule_change(char *action, struct audit_krule *rule, int re
 	audit_log_format(ab, " op=%s", action);
 	audit_log_key(ab, rule->filterkey);
 	audit_log_format(ab, " list=%d res=%d", rule->listnr, res);
-	(void)audit_log_end_status(ab);
+	audit_log_end(ab);
 }
 
 /**
@@ -1336,31 +1336,9 @@ int audit_compare_dname_path(const struct qstr *dname, const char *path, int par
 	return memcmp(p, dname->name, dlen);
 }
 
-static int audit_lsm_filter_result(int match, int action,
-				   unsigned int listtype)
-{
-	if (match <= 0)
-		return 1;
-	if (action == AUDIT_NEVER || listtype == AUDIT_FILTER_EXCLUDE)
-		return 0;
-	return 1;
-}
-
-#ifdef CONFIG_KUNIT
-int audit_kunit_lsm_filter_result(int match, int action,
-				  unsigned int listtype)
-{
-	return audit_lsm_filter_result(match, action, listtype);
-}
-EXPORT_SYMBOL_GPL(audit_kunit_lsm_filter_result);
-#endif
-
 int audit_filter(int msgtype, unsigned int listtype)
 {
 	struct audit_entry *e;
-	struct lsm_prop_ref *subject_ref = NULL;
-	int subject_status = 0;
-	bool subject_captured = false;
 	int ret = 1; /* Audit by default */
 
 	rcu_read_lock();
@@ -1369,6 +1347,7 @@ int audit_filter(int msgtype, unsigned int listtype)
 
 		for (i = 0; i < e->rule.field_count; i++) {
 			struct audit_field *f = &e->rule.fields[i];
+			struct lsm_prop prop = { };
 			pid_t pid;
 
 			switch (f->type) {
@@ -1399,16 +1378,10 @@ int audit_filter(int msgtype, unsigned int listtype)
 			case AUDIT_SUBJ_SEN:
 			case AUDIT_SUBJ_CLR:
 				if (f->lsm_rule) {
-					if (!subject_captured) {
-						subject_status =
-							security_current_getlsmprop_ref_subj(
-								GFP_ATOMIC,
-								&subject_ref);
-						subject_captured = true;
-					}
-					result = security_audit_rule_match_ref(
-						subject_ref, subject_status, f->type,
-						f->op, f->lsm_rule);
+					security_current_getlsmprop_subj(&prop);
+					result = security_audit_rule_match(
+						   &prop, f->type, f->op,
+						   f->lsm_rule);
 				}
 				break;
 			case AUDIT_EXE:
@@ -1419,23 +1392,19 @@ int audit_filter(int msgtype, unsigned int listtype)
 			default:
 				goto unlock_and_return;
 			}
-			if (result < 0) { /* fail open for logging */
-				ret = audit_lsm_filter_result(result, e->rule.action,
-							      listtype);
+			if (result < 0) /* error */
 				goto unlock_and_return;
-			}
 			if (!result)
 				break;
 		}
 		if (result > 0) {
-			ret = audit_lsm_filter_result(result, e->rule.action,
-						      listtype);
+			if (e->rule.action == AUDIT_NEVER || listtype == AUDIT_FILTER_EXCLUDE)
+				ret = 0;
 			break;
 		}
 	}
 unlock_and_return:
 	rcu_read_unlock();
-	security_lsm_prop_ref_put(subject_ref);
 	return ret;
 }
 

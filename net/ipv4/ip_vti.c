@@ -169,7 +169,6 @@ static bool vti_state_check(const struct xfrm_state *x, __be32 dst, __be32 src)
 static netdev_tx_t vti_xmit(struct sk_buff *skb, struct net_device *dev,
 			    struct flowi *fl)
 {
-	struct xfrm_flow_origin origin = xfrm_flow_origin_skb(skb);
 	struct ip_tunnel *tunnel = netdev_priv(dev);
 	struct ip_tunnel_parm_kern *parms = &tunnel->parms;
 	struct dst_entry *dst = skb_dst(skb);
@@ -215,7 +214,7 @@ static netdev_tx_t vti_xmit(struct sk_buff *skb, struct net_device *dev,
 	}
 
 	dst_hold(dst);
-	dst = xfrm_lookup_route_origin(tunnel->net, dst, fl, NULL, &origin, 0);
+	dst = xfrm_lookup_route(tunnel->net, dst, fl, NULL, 0);
 	if (IS_ERR(dst)) {
 		DEV_STATS_INC(dev, tx_carrier_errors);
 		goto tx_error_icmp;

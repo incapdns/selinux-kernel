@@ -577,7 +577,7 @@ retry:
 	 */
 	if (d_is_symlink(path.dentry) ||
 	    d_backing_inode(path.dentry)->i_op->readlink) {
-		error = security_inode_readlink_mnt(path.mnt, path.dentry);
+		error = security_inode_readlink(path.dentry);
 		if (!error) {
 			touch_atime(&path);
 			error = vfs_readlink(path.dentry, buf, bufsiz);

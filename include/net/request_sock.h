@@ -69,11 +69,8 @@ struct request_sock {
 	const struct request_sock_ops	*rsk_ops;
 	struct sock			*sk;
 	struct saved_syn		*saved_syn;
-	u32				secid;
-	u32				peer_secid;
-#ifdef CONFIG_SECURITY
 	void				*security;
-#endif
+	u32				peer_secid;
 	u32				timeout;
 };
 

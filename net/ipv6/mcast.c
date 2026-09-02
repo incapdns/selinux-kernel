@@ -60,7 +60,6 @@
 #include <net/addrconf.h>
 #include <net/ip6_route.h>
 #include <net/inet_common.h>
-#include <net/xfrm.h>
 
 #include <net/ip6_checksum.h>
 
@@ -1837,7 +1836,6 @@ static void mld_sendpack(struct sk_buff *skb)
 	struct net *net = dev_net(skb->dev);
 	int err;
 	struct flowi6 fl6;
-	struct xfrm_flow_origin origin;
 	struct dst_entry *dst;
 
 	rcu_read_lock();
@@ -1857,8 +1855,7 @@ static void mld_sendpack(struct sk_buff *skb)
 	icmpv6_flow_init(net->ipv6.igmp_sk, &fl6, ICMPV6_MLD2_REPORT,
 			 &ipv6_hdr(skb)->saddr, &ipv6_hdr(skb)->daddr,
 			 skb->dev->ifindex);
-	origin = xfrm_flow_origin_sock(net->ipv6.igmp_sk);
-	dst = icmp6_dst_alloc_origin(skb->dev, &fl6, &origin);
+	dst = icmp6_dst_alloc(skb->dev, &fl6);
 
 	err = 0;
 	if (IS_ERR(dst)) {
@@ -2188,7 +2185,6 @@ static void igmp6_send(struct in6_addr *addr, struct net_device *dev, int type)
 		     IPV6_TLV_PADN, 0 };
 	struct dst_entry *dst;
 	struct flowi6 fl6;
-	struct xfrm_flow_origin origin;
 	struct net *net;
 	struct sock *sk;
 
@@ -2243,8 +2239,7 @@ static void igmp6_send(struct in6_addr *addr, struct net_device *dev, int type)
 	icmpv6_flow_init(sk, &fl6, type,
 			 &ipv6_hdr(skb)->saddr, &ipv6_hdr(skb)->daddr,
 			 skb->dev->ifindex);
-	origin = xfrm_flow_origin_sock(sk);
-	dst = icmp6_dst_alloc_origin(skb->dev, &fl6, &origin);
+	dst = icmp6_dst_alloc(skb->dev, &fl6);
 	if (IS_ERR(dst)) {
 		err = PTR_ERR(dst);
 		goto err_out;

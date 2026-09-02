@@ -491,7 +491,7 @@ enum integrity_status ima_get_cache_status(struct ima_iint_cache *iint,
 					   enum ima_hooks func);
 enum hash_algo ima_get_hash_algo(const struct evm_ima_xattr_data *xattr_value,
 				 int xattr_len);
-int ima_read_xattr(const struct vfsmount *mnt, struct dentry *dentry,
+int ima_read_xattr(struct dentry *dentry,
 		   struct evm_ima_xattr_data **xattr_value, int xattr_len);
 void __init init_ima_appraise_lsm(const struct lsm_id *lsmid);
 
@@ -538,8 +538,7 @@ ima_get_hash_algo(struct evm_ima_xattr_data *xattr_value, int xattr_len)
 	return ima_hash_algo;
 }
 
-static inline int ima_read_xattr(const struct vfsmount *mnt,
-				 struct dentry *dentry,
+static inline int ima_read_xattr(struct dentry *dentry,
 				 struct evm_ima_xattr_data **xattr_value,
 				 int xattr_len)
 {
@@ -597,7 +596,6 @@ static inline void ima_free_modsig(struct modsig *modsig)
 #define ima_filter_rule_init security_audit_rule_init
 #define ima_filter_rule_free security_audit_rule_free
 #define ima_filter_rule_match security_audit_rule_match
-#define ima_filter_rule_match_ref security_audit_rule_match_ref
 
 #else
 
@@ -611,17 +609,10 @@ static inline void ima_filter_rule_free(void *lsmrule)
 {
 }
 
-static inline int ima_filter_rule_match(struct lsm_prop *prop,
-					 u32 field, u32 op, void *lsmrule)
+static inline int ima_filter_rule_match(struct lsm_prop *prop, u32 field, u32 op,
+					void *lsmrule)
 {
 	return -EINVAL;
-}
-
-static inline int ima_filter_rule_match_ref(const struct lsm_prop_ref *ref,
-					    int status, u32 field, u32 op,
-					    void *lsmrule)
-{
-	return status < 0 ? status : -EINVAL;
 }
 #endif /* CONFIG_IMA_LSM_RULES */
 

@@ -159,8 +159,7 @@ struct vfsmount *nfs_d_automount(struct path *path)
 	/* Open a new filesystem context, transferring parameters from the
 	 * parent superblock, including the network namespace.
 	 */
-	fc = fs_context_for_submount_cred(path->mnt->mnt_sb->s_type, path,
-					   server->cred);
+	fc = fs_context_for_submount(path->mnt->mnt_sb->s_type, path->dentry);
 	if (IS_ERR(fc))
 		return ERR_CAST(fc);
 
@@ -170,6 +169,11 @@ struct vfsmount *nfs_d_automount(struct path *path)
 	ctx->clone_data.fattr	= nfs_alloc_fattr();
 	if (!ctx->clone_data.fattr)
 		goto out_fc;
+
+	if (fc->cred != server->cred) {
+		put_cred(fc->cred);
+		fc->cred = get_cred(server->cred);
+	}
 
 	if (fc->net_ns != client->cl_net) {
 		put_net(fc->net_ns);

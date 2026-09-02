@@ -5,7 +5,6 @@
 #include <linux/slab.h>
 #include <linux/nospec.h>
 #include <linux/io_uring.h>
-#include <linux/security.h>
 
 #include <uapi/linux/io_uring.h>
 
@@ -201,11 +200,6 @@ static int io_msg_install_complete(struct io_kiocb *req, unsigned int issue_flag
 	struct file *src_file = msg->src_file;
 	int ret;
 
-	/* The fixed-file slot is an FD receive operation in the target task. */
-	ret = security_file_receive(src_file);
-	if (ret)
-		return ret;
-
 	if (unlikely(io_lock_external_ctx(target_ctx, issue_flags)))
 		return -EAGAIN;
 
@@ -273,16 +267,13 @@ static int io_msg_send_fd(struct io_kiocb *req, unsigned int issue_flags)
 	 */
 	if (smp_load_acquire(&target_ctx->flags) & IORING_SETUP_R_DISABLED)
 		return -EBADFD;
-	if (unlikely(!READ_ONCE(target_ctx->submitter_task)))
-		return -EOWNERDEAD;
 	if (!msg->src_file) {
 		int ret = io_msg_grab_file(req, issue_flags);
 		if (unlikely(ret))
 			return ret;
 	}
 
-	/* Run file_receive hooks with the target task and credentials. */
-	if (target_ctx->submitter_task != current)
+	if (io_msg_need_remote(target_ctx))
 		return io_msg_fd_remote(req);
 	return io_msg_install_complete(req, issue_flags);
 }

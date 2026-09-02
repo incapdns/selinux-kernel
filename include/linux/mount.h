@@ -60,8 +60,6 @@ struct vfsmount {
 	struct super_block *mnt_sb;	/* pointer to superblock */
 	int mnt_flags;
 	struct mnt_idmap *mnt_idmap;
-	void *mnt_security;	/* composite LSM mount blob */
-	bool mnt_security_initialized;
 } __randomize_layout;
 
 static inline struct mnt_idmap *mnt_idmap(const struct vfsmount *mnt)

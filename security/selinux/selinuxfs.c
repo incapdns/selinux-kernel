@@ -13,35 +13,29 @@
  */
 
 #include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/compat.h>
+#include <linux/file.h>
 #include <linux/pagemap.h>
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <linux/fs.h>
-#include <linux/file.h>
 #include <linux/fs_context.h>
 #include <linux/hex.h>
 #include <linux/mount.h>
 #include <linux/mutex.h>
 #include <linux/namei.h>
 #include <linux/init.h>
-#include <linux/ipc_namespace.h>
-#include <linux/nsproxy.h>
 #include <linux/string.h>
 #include <linux/security.h>
 #include <linux/major.h>
 #include <linux/seq_file.h>
 #include <linux/percpu.h>
-#include <linux/rhashtable.h>
-#include <linux/sched/mm.h>
-#include <linux/workqueue.h>
 #include <linux/audit.h>
-#include <linux/nsfs.h>
 #include <linux/uaccess.h>
 #include <linux/kobject.h>
 #include <linux/ctype.h>
+#include <linux/nsfs.h>
 #include <linux/selinux_ns.h>
+#include <crypto/sha2.h>
 
 /* selinuxfs pseudo filesystem for exporting the security policy API.
    Based on the proc code and the fs/nfsd/nfsctl.c code. */
@@ -50,15 +44,13 @@
 #include "flask.h"
 #include "avc.h"
 #include "avc_ss.h"
-#include "global_sidtab.h"
 #include "security.h"
-#include "selinux_ss.h"
 #include "objsec.h"
 #include "conditional.h"
 #include "ima.h"
-#ifdef CONFIG_SECURITY_SELINUX_NS
+#include "chain.h"
 #include "namespace.h"
-#endif
+#include "object_label.h"
 
 enum sel_inos {
 	SEL_ROOT_INO = 2,
@@ -81,12 +73,9 @@ enum sel_inos {
 	SEL_STATUS,	/* export current status using mmap() */
 	SEL_POLICY,	/* allow userspace to read the in kernel policy */
 	SEL_VALIDATE_TRANS, /* compute validatetrans decision */
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	SEL_MAXNS,	    /* maximum number of SELinux namespaces */
-	SEL_MAXNSDEPTH,	    /* maximum depth of SELinux namespaces */
-	SEL_NS_CREATE,	    /* create a dormant namespace control FD */
-#endif
-	SEL_POLICY_MAX_BYTES, /* maximum accepted binary policy size */
+	SEL_MAXNS,	/* maximum number of SELinux namespaces */
+	SEL_MAXNSDEPTH,	/* maximum SELinux namespace ancestry depth */
+	SEL_NS_CREATE,	/* create a dormant SELinux namespace control FD */
 	SEL_INO_NEXT,	/* The next inode number to use */
 };
 
@@ -102,7 +91,8 @@ struct selinux_fs_info {
 	struct super_block *sb;
 };
 
-static struct selinux_fs_info *selinux_fs_info_create(void)
+static struct selinux_fs_info *selinux_fs_info_create(
+	struct selinux_state *state)
 {
 	struct selinux_fs_info *fsi;
 
@@ -111,7 +101,7 @@ static struct selinux_fs_info *selinux_fs_info_create(void)
 		return NULL;
 
 	fsi->last_ino = SEL_INO_NEXT - 1;
-	fsi->state = get_selinux_state(current_selinux_state);
+	fsi->state = get_selinux_state(state);
 	return fsi;
 }
 
@@ -120,14 +110,113 @@ static void selinux_fs_info_free(struct selinux_fs_info *fsi)
 	unsigned int i;
 
 	if (fsi) {
-		put_selinux_state(fsi->state);
 		for (i = 0; i < fsi->bool_num; i++)
 			kfree(fsi->bool_pending_names[i]);
 		kfree(fsi->bool_pending_names);
 		kfree(fsi->bool_pending_values);
+		put_selinux_state(fsi->state);
 	}
 	kfree(fsi);
 }
+
+static struct selinux_state *selinux_file_state(const struct file *file)
+{
+	struct selinux_fs_info *fsi = file_inode(file)->i_sb->s_fs_info;
+
+	return fsi->state;
+}
+
+/*
+ * Charge retained policy snapshots to the policy state, rather than to one
+ * selinuxfs superblock. A state can have one superblock per owning user
+ * namespace, and opening another mount must not bypass the memory bound.
+ */
+static int selinuxfs_snapshot_bytes_reserve(
+	struct selinux_state *state,
+	size_t bytes)
+{
+	s64 used = atomic64_read(&state->policy_snapshot_bytes);
+
+	if (bytes > CONFIG_SECURITY_SELINUX_POLICY_MAX_BYTES)
+		return -EFBIG;
+	for (;;) {
+		if (bytes > CONFIG_SECURITY_SELINUX_POLICY_MAX_BYTES - used)
+			return -EDQUOT;
+		if (atomic64_try_cmpxchg(
+				&state->policy_snapshot_bytes,
+				&used,
+				used + bytes))
+			return 0;
+	}
+}
+
+static void selinuxfs_snapshot_bytes_release(
+	struct selinux_state *state,
+	size_t bytes)
+{
+	atomic64_sub(bytes, &state->policy_snapshot_bytes);
+}
+
+static int selinuxfs_has_perm(const struct file *file, u32 permission)
+{
+	if (selinux_file_state(file) != current_selinux_state)
+		return -EXDEV;
+	return selinux_chain_has_initial_perm(
+		current_cred(),
+		SECINITSID_SECURITY,
+		SECCLASS_SECURITY,
+		permission,
+		NULL);
+}
+
+static int selinuxfs_mutation_allowed(const struct file *file, u32 permission)
+{
+	struct selinux_state *state = selinux_file_state(file);
+
+	if (state != current_selinux_state)
+		return -EXDEV;
+	return selinux_state_policy_mutation_allowed(
+		state,
+		current_cred(),
+		permission,
+		false);
+}
+
+static long sel_ns_create_ioctl(
+	struct file *file,
+	unsigned int command,
+	unsigned long argument)
+{
+	struct selinux_ns_control *control;
+	int rc;
+
+	if (command != SELINUX_NS_IOC_CREATE)
+		return -ENOTTY;
+	if (argument)
+		return -EINVAL;
+	if (selinux_file_state(file) != current_selinux_state)
+		return -EXDEV;
+
+	control = selinux_ns_control_alloc(current_cred());
+	if (IS_ERR(control))
+		return PTR_ERR(control);
+	rc = selinux_ns_control_authorize_parent(
+		control,
+		current_cred());
+	if (rc) {
+		selinux_ns_control_put(control);
+		return rc;
+	}
+
+	/* open_namespace() consumes the control reference on every path. */
+	return open_namespace(&control->ns);
+}
+
+static const struct file_operations sel_ns_create_ops = {
+	.unlocked_ioctl = sel_ns_create_ioctl,
+	.compat_ioctl = compat_ptr_ioctl,
+	.llseek = noop_llseek,
+};
 
 #define SEL_INITCON_INO_OFFSET		0x01000000
 #define SEL_BOOL_INO_OFFSET		0x02000000
@@ -139,302 +228,17 @@ static void selinux_fs_info_free(struct selinux_fs_info *fsi)
 #define CLASS_DIR_NAME "class"
 
 #define TMPBUFLEN	12
-
-/*
- * A selinuxfs file is an authority for exactly the SELinux state which owns
- * its superblock.  Recheck on every state-dependent operation: file
- * descriptors and VMAs can outlive the task which opened them and can be
- * transferred to a task in another SELinux state.
- */
-static int selinuxfs_state_access(const struct file *file)
-{
-	const struct selinux_fs_info *fsi = file_inode(file)->i_sb->s_fs_info;
-
-	if (unlikely(fsi->state != current_selinux_state))
-		return -EPERM;
-	return 0;
-}
-
-/*
- * Account retained policy snapshots across every selinuxfs superblock for one
- * SELinux state.  A state can have one superblock per owning user namespace;
- * charging the state prevents another mount from bypassing the bound.  Open
- * files/VMAs pin their superblock, which pins the state for every charge. Load
- * buffers are separately serialized under policy_mutex and freed before that
- * mutex is released.
- */
-static int selinuxfs_snapshot_bytes_reserve(struct selinux_state *state,
-					    size_t bytes)
-{
-	s64 used = atomic64_read(&state->policy_snapshot_bytes);
-
-	if (bytes > CONFIG_SECURITY_SELINUX_POLICY_MAX_BYTES)
-		return -EFBIG;
-	for (;;) {
-		if (bytes > CONFIG_SECURITY_SELINUX_POLICY_MAX_BYTES - used)
-			return -EDQUOT;
-		if (atomic64_try_cmpxchg(&state->policy_snapshot_bytes, &used,
-					 used + bytes))
-			return 0;
-	}
-}
-
-static void selinuxfs_snapshot_bytes_release(struct selinux_state *state,
-					     size_t bytes)
-{
-	atomic64_sub(bytes, &state->policy_snapshot_bytes);
-}
-
-#ifdef CONFIG_SECURITY_SELINUX_NS
-struct selinuxfs_mm_vmas {
-	struct rhash_head node;
-	struct mm_struct *mm;
-	refcount_t refs;
-	struct rcu_work free_rwork;
-};
-
-static struct rhashtable selinuxfs_mm_vmas;
-static DEFINE_MUTEX(selinuxfs_mm_vmas_lock);
-/* Baseline one makes overflow saturate permanently fail-closed. */
-static refcount_t selinuxfs_untracked_vmas = REFCOUNT_INIT(1);
-static bool selinuxfs_mm_vmas_ready;
-
-static const struct rhashtable_params selinuxfs_mm_vmas_params = {
-	.head_offset		= offsetof(struct selinuxfs_mm_vmas, node),
-	.key_offset		= offsetof(struct selinuxfs_mm_vmas, mm),
-	.key_len		= sizeof(struct mm_struct *),
-	.automatic_shrinking	= true,
-};
-
-static int __init selinuxfs_mm_vmas_init(void)
-{
-	int rc;
-
-	rc = rhashtable_init(&selinuxfs_mm_vmas,
-			     &selinuxfs_mm_vmas_params);
-	if (!rc)
-		smp_store_release(&selinuxfs_mm_vmas_ready, true);
-	return rc;
-}
-
-static struct selinuxfs_mm_vmas *selinuxfs_mm_vmas_get(struct mm_struct *mm)
-{
-	struct selinuxfs_mm_vmas *entry;
-	int rc;
-
-	if (unlikely(!smp_load_acquire(&selinuxfs_mm_vmas_ready)))
-		return ERR_PTR(-EIO);
-
-	mutex_lock(&selinuxfs_mm_vmas_lock);
-	entry = rhashtable_lookup_fast(&selinuxfs_mm_vmas, &mm,
-				       selinuxfs_mm_vmas_params);
-	if (entry) {
-		refcount_inc(&entry->refs);
-		mutex_unlock(&selinuxfs_mm_vmas_lock);
-		return entry;
-	}
-
-	entry = kzalloc_obj(*entry);
-	if (!entry) {
-		mutex_unlock(&selinuxfs_mm_vmas_lock);
-		return ERR_PTR(-ENOMEM);
-	}
-	entry->mm = mm;
-	refcount_set(&entry->refs, 1);
-	mmgrab(mm);
-	rc = rhashtable_insert_fast(&selinuxfs_mm_vmas, &entry->node,
-				    selinuxfs_mm_vmas_params);
-	if (rc) {
-		mmdrop(mm);
-		kfree(entry);
-		entry = ERR_PTR(rc);
-	}
-	mutex_unlock(&selinuxfs_mm_vmas_lock);
-	return entry;
-}
-
-static void selinuxfs_mm_vmas_free(struct work_struct *work)
-{
-	struct selinuxfs_mm_vmas *entry =
-		container_of(to_rcu_work(work), struct selinuxfs_mm_vmas,
-			     free_rwork);
-
-	mmdrop(entry->mm);
-	kfree(entry);
-}
-
-static void selinuxfs_mm_vmas_put(struct selinuxfs_mm_vmas *entry)
-{
-	int rc;
-
-	mutex_lock(&selinuxfs_mm_vmas_lock);
-	if (!refcount_dec_and_test(&entry->refs)) {
-		mutex_unlock(&selinuxfs_mm_vmas_lock);
-		return;
-	}
-	rc = rhashtable_remove_fast(&selinuxfs_mm_vmas, &entry->node,
-				    selinuxfs_mm_vmas_params);
-	if (WARN_ON_ONCE(rc)) {
-		/* Keep an unremovable entry permanently fail-closed. */
-		refcount_set(&entry->refs, 1);
-		mutex_unlock(&selinuxfs_mm_vmas_lock);
-		return;
-	}
-	INIT_RCU_WORK(&entry->free_rwork, selinuxfs_mm_vmas_free);
-	mutex_unlock(&selinuxfs_mm_vmas_lock);
-	if (WARN_ON_ONCE(!queue_rcu_work(system_dfl_wq,
-					 &entry->free_rwork)))
-		return;
-}
-
-static int selinuxfs_vma_track_initial(struct vm_area_struct *vma)
-{
-	struct selinuxfs_mm_vmas *entry = selinuxfs_mm_vmas_get(vma->vm_mm);
-
-	if (IS_ERR(entry))
-		return PTR_ERR(entry);
-	vma->vm_private_data = entry;
-	return 0;
-}
-
-static void selinuxfs_vma_open(struct vm_area_struct *vma)
-{
-	struct selinuxfs_mm_vmas *entry = selinuxfs_mm_vmas_get(vma->vm_mm);
-
-	if (IS_ERR(entry)) {
-		/* .open cannot fail; make every state transition fail closed. */
-		refcount_inc(&selinuxfs_untracked_vmas);
-		vma->vm_private_data = entry;
-		pr_warn_ratelimited("SELinux: unable to track selinuxfs VMA\n");
-		return;
-	}
-	vma->vm_private_data = entry;
-}
-
-static void selinuxfs_vma_close(struct vm_area_struct *vma)
-{
-	struct selinuxfs_mm_vmas *entry = vma->vm_private_data;
-
-	if (WARN_ON_ONCE(!entry))
-		return;
-	if (IS_ERR(entry))
-		WARN_ON_ONCE(!refcount_dec_not_one(&selinuxfs_untracked_vmas));
-	else
-		selinuxfs_mm_vmas_put(entry);
-	vma->vm_private_data = NULL;
-}
-
-int selinuxfs_mm_may_change(struct mm_struct *mm)
-{
-	struct selinuxfs_mm_vmas *entry;
-	int rc = 0;
-
-	if (unlikely(!smp_load_acquire(&selinuxfs_mm_vmas_ready)))
-		return -EIO;
-	if (!mm)
-		return 0;
-
-	/* VMA callbacks take mmap_lock before the registry mutex. */
-	mmap_read_lock(mm);
-	mutex_lock(&selinuxfs_mm_vmas_lock);
-	if (unlikely(refcount_read(&selinuxfs_untracked_vmas) != 1)) {
-		rc = -EIO;
-		goto out;
-	}
-	entry = rhashtable_lookup_fast(&selinuxfs_mm_vmas, &mm,
-				       selinuxfs_mm_vmas_params);
-	if (entry)
-		rc = -EBUSY;
-out:
-	mutex_unlock(&selinuxfs_mm_vmas_lock);
-	mmap_read_unlock(mm);
-	return rc;
-}
-
-#ifdef CONFIG_SECURITY_SELINUX_KUNIT_TEST
-bool selinuxfs_kunit_mm_tracking_ready(void)
-{
-	return smp_load_acquire(&selinuxfs_mm_vmas_ready);
-}
-
-void *selinuxfs_kunit_mm_track(struct mm_struct *mm)
-{
-	return selinuxfs_mm_vmas_get(mm);
-}
-
-void selinuxfs_kunit_mm_untrack(void *cookie)
-{
-	selinuxfs_mm_vmas_put(cookie);
-}
-
-void selinuxfs_kunit_tracking_failure(bool active)
-{
-	if (active)
-		refcount_inc(&selinuxfs_untracked_vmas);
-	else
-		WARN_ON_ONCE(!refcount_dec_not_one(&selinuxfs_untracked_vmas));
-}
-#endif
-#endif
-
-static int selinuxfs_dir_open(struct inode *inode, struct file *file)
-{
-	int rc = selinuxfs_state_access(file);
-
-	if (rc)
-		return rc;
-	return dcache_dir_open(inode, file);
-}
-
-static int selinuxfs_dir_iterate(struct file *file, struct dir_context *ctx)
-{
-	int rc = selinuxfs_state_access(file);
-
-	if (rc)
-		return rc;
-	return dcache_readdir(file, ctx);
-}
-
-static loff_t selinuxfs_lseek(struct file *file, loff_t offset, int whence)
-{
-	int rc = selinuxfs_state_access(file);
-
-	if (rc)
-		return rc;
-	return generic_file_llseek(file, offset, whence);
-}
-
-static loff_t selinuxfs_dir_lseek(struct file *file, loff_t offset, int whence)
-{
-	int rc = selinuxfs_state_access(file);
-
-	if (rc)
-		return rc;
-	return dcache_dir_lseek(file, offset, whence);
-}
-
-static const struct file_operations selinuxfs_dir_operations = {
-	.open		= selinuxfs_dir_open,
-	.release	= dcache_dir_close,
-	.llseek		= selinuxfs_dir_lseek,
-	.read		= generic_read_dir,
-	.iterate_shared	= selinuxfs_dir_iterate,
-	.fsync		= noop_fsync,
-};
-
 static ssize_t sel_read_enforce(struct file *filp, char __user *buf,
 				size_t count, loff_t *ppos)
 {
-	struct selinux_fs_info *fsi = file_inode(filp)->i_sb->s_fs_info;
 	char tmpbuf[TMPBUFLEN];
 	ssize_t length;
-	int rc = selinuxfs_state_access(filp);
 
-	if (rc)
-		return rc;
-
-	length = scnprintf(tmpbuf, TMPBUFLEN, "%d",
-			   enforcing_enabled(fsi->state));
+	length = scnprintf(
+		tmpbuf,
+		TMPBUFLEN,
+		"%d",
+		enforcing_enabled(selinux_file_state(filp)));
 	return simple_read_from_buffer(buf, count, ppos, tmpbuf, length);
 }
 
@@ -443,16 +247,10 @@ static ssize_t sel_write_enforce(struct file *file, const char __user *buf,
 				 size_t count, loff_t *ppos)
 
 {
-	struct selinux_fs_info *fsi = file_inode(file)->i_sb->s_fs_info;
-	struct selinux_state *state = fsi->state;
 	char *page = NULL;
 	ssize_t length;
 	int scan_value;
 	bool old_value, new_value;
-
-	length = selinuxfs_state_access(file);
-	if (length)
-		return length;
 
 	if (count >= PAGE_SIZE)
 		return -ENOMEM;
@@ -471,47 +269,30 @@ static ssize_t sel_write_enforce(struct file *file, const char __user *buf,
 
 	new_value = !!scan_value;
 
-	old_value = enforcing_enabled(state);
+	old_value = enforcing_enabled(selinux_file_state(file));
 	if (new_value != old_value) {
-		/*
-		 * Only check against the current namespace because
-		 * this operation only affects it and no others.
-		 */
-		length = avc_has_perm(current_selinux_state,
-				      current_sid(), SECINITSID_SECURITY,
-				      SECCLASS_SECURITY, SECURITY__SETENFORCE,
-				      NULL);
+		length = selinuxfs_mutation_allowed(
+			file,
+			SECURITY__SETENFORCE);
 		if (length)
 			goto out;
-		length = selinux_chain_update_prepare(state);
-		if (length)
-			goto out;
-		length = selinux_chain_update_begin(state);
-		if (WARN_ON_ONCE(length)) {
-			selinux_chain_update_abort(state);
-			goto out;
-		}
-		enforcing_set(state, new_value);
-		selinux_chain_update_end(state);
-
-		/* Audit and cache callbacks may block; publication is stable now. */
 		audit_log(audit_context(), GFP_KERNEL, AUDIT_MAC_STATUS,
 			"enforcing=%d old_enforcing=%d auid=%u ses=%u"
 			" enabled=1 old-enabled=1 lsm=selinux res=1",
 			new_value, old_value,
 			from_kuid(&init_user_ns, audit_get_loginuid(current)),
 			audit_get_sessionid(current));
+		enforcing_set(selinux_file_state(file), new_value);
 		if (new_value)
-			avc_ss_reset(state->avc, 0);
-		selinux_chain_update_complete(state);
+			avc_ss_reset(selinux_file_state(file)->avc, 0);
 		selnl_notify_setenforce(new_value);
-		selinux_status_update_setenforce(state, new_value);
-#ifndef CONFIG_SECURITY_SELINUX_NS
+		selinux_status_update_setenforce(
+			selinux_file_state(file),
+			new_value);
 		if (!new_value)
 			call_blocking_lsm_notifier(LSM_POLICY_CHANGE, NULL);
-#endif
 
-		selinux_ima_measure_state(state);
+		selinux_ima_measure_state();
 	}
 	length = count;
 out:
@@ -525,25 +306,18 @@ out:
 static const struct file_operations sel_enforce_ops = {
 	.read		= sel_read_enforce,
 	.write		= sel_write_enforce,
-	.llseek		= selinuxfs_lseek,
+	.llseek		= generic_file_llseek,
 };
 
 static ssize_t sel_read_handle_unknown(struct file *filp, char __user *buf,
 					size_t count, loff_t *ppos)
 {
-	struct selinux_fs_info *fsi = file_inode(filp)->i_sb->s_fs_info;
-	struct selinux_state *state = fsi->state;
 	char tmpbuf[TMPBUFLEN];
 	ssize_t length;
 	ino_t ino = file_inode(filp)->i_ino;
-	int handle_unknown;
-	int rc = selinuxfs_state_access(filp);
-
-	if (rc)
-		return rc;
-	handle_unknown = (ino == SEL_REJECT_UNKNOWN) ?
-		security_get_reject_unknown(state) :
-		!security_get_allow_unknown(state);
+	int handle_unknown = (ino == SEL_REJECT_UNKNOWN) ?
+		security_get_reject_unknown(selinux_file_state(filp)) :
+		!security_get_allow_unknown(selinux_file_state(filp));
 
 	length = scnprintf(tmpbuf, TMPBUFLEN, "%d", handle_unknown);
 	return simple_read_from_buffer(buf, count, ppos, tmpbuf, length);
@@ -551,18 +325,13 @@ static ssize_t sel_read_handle_unknown(struct file *filp, char __user *buf,
 
 static const struct file_operations sel_handle_unknown_ops = {
 	.read		= sel_read_handle_unknown,
-	.llseek		= selinuxfs_lseek,
+	.llseek		= generic_file_llseek,
 };
 
 static int sel_open_handle_status(struct inode *inode, struct file *filp)
 {
-	struct selinux_fs_info *fsi = file_inode(filp)->i_sb->s_fs_info;
-	struct page *status;
-	int rc = selinuxfs_state_access(filp);
-
-	if (rc)
-		return rc;
-	status = selinux_kernel_status_page(fsi->state);
+	struct page *status = selinux_kernel_status_page(
+		selinux_file_state(filp));
 
 	if (!status)
 		return -ENOMEM;
@@ -575,56 +344,22 @@ static int sel_open_handle_status(struct inode *inode, struct file *filp)
 static ssize_t sel_read_handle_status(struct file *filp, char __user *buf,
 				      size_t count, loff_t *ppos)
 {
-	struct page *status = filp->private_data;
-	int rc = selinuxfs_state_access(filp);
+	struct page    *status = filp->private_data;
 
-	if (rc)
-		return rc;
-
-	if (WARN_ON_ONCE(!status))
-		return -EIO;
+	BUG_ON(!status);
 
 	return simple_read_from_buffer(buf, count, ppos,
 				       page_address(status),
 				       sizeof(struct selinux_kernel_status));
 }
 
-static vm_fault_t sel_status_fault(struct vm_fault *vmf)
-{
-	struct file *file = vmf->vma->vm_file;
-	struct page *status = file->private_data;
-
-	if (WARN_ON_ONCE(!status))
-		return VM_FAULT_SIGBUS;
-	if (selinuxfs_state_access(file))
-		return VM_FAULT_SIGBUS;
-	if (vmf->flags & (FAULT_FLAG_MKWRITE | FAULT_FLAG_WRITE))
-		return VM_FAULT_SIGBUS;
-	if (vmf->pgoff)
-		return VM_FAULT_SIGBUS;
-
-	get_page(status);
-	vmf->page = status;
-	return 0;
-}
-
-static const struct vm_operations_struct sel_status_vm_ops = {
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	.open		= selinuxfs_vma_open,
-	.close		= selinuxfs_vma_close,
-#endif
-	.fault		= sel_status_fault,
-	.page_mkwrite	= sel_status_fault,
-};
-
 static int sel_mmap_handle_status(struct file *filp,
 				  struct vm_area_struct *vma)
 {
-	unsigned long size = vma->vm_end - vma->vm_start;
-	int rc = selinuxfs_state_access(filp);
+	struct page    *status = filp->private_data;
+	unsigned long	size = vma->vm_end - vma->vm_start;
 
-	if (rc)
-		return rc;
+	BUG_ON(!status);
 
 	/* only allows one page from the head */
 	if (vma->vm_pgoff > 0 || size != PAGE_SIZE)
@@ -634,21 +369,17 @@ static int sel_mmap_handle_status(struct file *filp,
 		return -EPERM;
 	/* disallow mprotect() turns it into writable */
 	vm_flags_clear(vma, VM_MAYWRITE);
-	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	rc = selinuxfs_vma_track_initial(vma);
-	if (rc)
-		return rc;
-#endif
-	vma->vm_ops = &sel_status_vm_ops;
-	return 0;
+
+	return remap_pfn_range(vma, vma->vm_start,
+			       page_to_pfn(status),
+			       size, vma->vm_page_prot);
 }
 
 static const struct file_operations sel_handle_status_ops = {
 	.open		= sel_open_handle_status,
 	.read		= sel_read_handle_status,
 	.mmap		= sel_mmap_handle_status,
-	.llseek		= selinuxfs_lseek,
+	.llseek		= generic_file_llseek,
 };
 
 static ssize_t sel_write_disable(struct file *file, const char __user *buf,
@@ -669,65 +400,82 @@ static const struct file_operations sel_disable_ops = {
 	.llseek		= generic_file_llseek,
 };
 
-#ifdef CONFIG_SECURITY_SELINUX_NS
-static ssize_t sel_read_maxns(struct file *filp, char __user *buf,
-			     size_t count, loff_t *ppos)
+static ssize_t sel_read_maxns(
+	struct file *file,
+	char __user *buffer,
+	size_t count,
+	loff_t *position)
 {
-	char tmpbuf[TMPBUFLEN];
+	char value[TMPBUFLEN];
 	ssize_t length;
 
-	length = scnprintf(tmpbuf, TMPBUFLEN, "%u", READ_ONCE(selinux_maxns));
-	return simple_read_from_buffer(buf, count, ppos, tmpbuf, length);
+	length = scnprintf(
+		value,
+		sizeof(value),
+		"%u",
+		READ_ONCE(selinux_maxns));
+	return simple_read_from_buffer(
+		buffer,
+		count,
+		position,
+		value,
+		length);
 }
 
-
-static ssize_t sel_write_maxns(struct file *file, const char __user *buf,
-				 size_t count, loff_t *ppos)
-
+static ssize_t sel_write_namespace_limit(
+	struct file *file,
+	const char __user *buffer,
+	size_t count,
+	loff_t *position,
+	u32 permission,
+	int (*set_limit)(unsigned int value))
 {
-	struct selinux_fs_info *fsi = file_inode(file)->i_sb->s_fs_info;
-	struct selinux_state *state = fsi->state;
-	char *page = NULL;
-	ssize_t length;
-	unsigned int new_value;
+	struct selinux_state *state = selinux_file_state(file);
+	unsigned int value;
+	char *input;
+	int rc;
 
-	/*
-	 * Only permit setting from the init SELinux namespace, and only
-	 * on the init SELinux namespace.
-	 */
-	if (current_selinux_state != init_selinux_state ||
-	    state != init_selinux_state)
+	/* Namespace-count limits are host-global and owned by the root state. */
+	if (state != init_selinux_state ||
+	    current_selinux_state != init_selinux_state)
 		return -EPERM;
-
-	length = avc_has_perm(current_selinux_state,
-			      current_sid(), SECINITSID_SECURITY,
-			      SECCLASS_SECURITY, SECURITY__SETMAXNS,
-			      NULL);
-	if (length)
-		return length;
-
-	if (count >= PAGE_SIZE)
-		return -ENOMEM;
-
-	/* No partial writes. */
-	if (*ppos != 0)
+	if (*position)
 		return -EINVAL;
+	if (count >= PAGE_SIZE)
+		return -E2BIG;
 
-	page = memdup_user_nul(buf, count);
-	if (IS_ERR(page))
-		return PTR_ERR(page);
+	rc = selinux_state_policy_mutation_allowed(
+		init_selinux_state,
+		current_cred(),
+		permission,
+		false);
+	if (rc)
+		return rc;
 
-	length = kstrtouint(page, 0, &new_value);
-	if (length)
-		goto out;
-	length = selinux_state_set_maxns(new_value);
-	if (length)
-		goto out;
+	input = memdup_user_nul(buffer, count);
+	if (IS_ERR(input))
+		return PTR_ERR(input);
+	rc = kstrtouint(input, 0, &value);
+	kfree(input);
+	if (rc)
+		return rc;
+	rc = set_limit(value);
+	return rc ? rc : count;
+}
 
-	length = count;
-out:
-	kfree(page);
-	return length;
+static ssize_t sel_write_maxns(
+	struct file *file,
+	const char __user *buffer,
+	size_t count,
+	loff_t *position)
+{
+	return sel_write_namespace_limit(
+		file,
+		buffer,
+		count,
+		position,
+		SECURITY__SETMAXNS,
+		selinux_state_set_maxns);
 }
 
 static const struct file_operations sel_maxns_ops = {
@@ -736,66 +484,41 @@ static const struct file_operations sel_maxns_ops = {
 	.llseek		= generic_file_llseek,
 };
 
-static ssize_t sel_read_maxnsdepth(struct file *filp, char __user *buf,
-				   size_t count, loff_t *ppos)
+static ssize_t sel_read_maxnsdepth(
+	struct file *file,
+	char __user *buffer,
+	size_t count,
+	loff_t *position)
 {
-	char tmpbuf[TMPBUFLEN];
+	char value[TMPBUFLEN];
 	ssize_t length;
 
-	length = scnprintf(tmpbuf, TMPBUFLEN, "%u",
-			   READ_ONCE(selinux_maxnsdepth));
-	return simple_read_from_buffer(buf, count, ppos, tmpbuf, length);
+	length = scnprintf(
+		value,
+		sizeof(value),
+		"%u",
+		READ_ONCE(selinux_maxnsdepth));
+	return simple_read_from_buffer(
+		buffer,
+		count,
+		position,
+		value,
+		length);
 }
 
-
-static ssize_t sel_write_maxnsdepth(struct file *file, const char __user *buf,
-				    size_t count, loff_t *ppos)
-
+static ssize_t sel_write_maxnsdepth(
+	struct file *file,
+	const char __user *buffer,
+	size_t count,
+	loff_t *position)
 {
-	struct selinux_fs_info *fsi = file_inode(file)->i_sb->s_fs_info;
-	struct selinux_state *state = fsi->state;
-	char *page = NULL;
-	ssize_t length;
-	unsigned int new_value;
-
-	/*
-	 * Only permit setting from the init SELinux namespace, and only
-	 * on the init SELinux namespace.
-	 */
-	if (current_selinux_state != init_selinux_state ||
-	    state != init_selinux_state)
-		return -EPERM;
-
-	length = avc_has_perm(current_selinux_state,
-			      current_sid(), SECINITSID_SECURITY,
-			      SECCLASS_SECURITY, SECURITY__SETMAXNSDEPTH,
-			      NULL);
-	if (length)
-		return length;
-
-	if (count >= PAGE_SIZE)
-		return -ENOMEM;
-
-	/* No partial writes. */
-	if (*ppos != 0)
-		return -EINVAL;
-
-	page = memdup_user_nul(buf, count);
-	if (IS_ERR(page))
-		return PTR_ERR(page);
-
-	length = kstrtouint(page, 0, &new_value);
-	if (length)
-		goto out;
-
-	length = selinux_state_set_maxnsdepth(new_value);
-	if (length)
-		goto out;
-
-	length = count;
-out:
-	kfree(page);
-	return length;
+	return sel_write_namespace_limit(
+		file,
+		buffer,
+		count,
+		position,
+		SECURITY__SETMAXNSDEPTH,
+		selinux_state_set_maxnsdepth);
 }
 
 static const struct file_operations sel_maxnsdepth_ops = {
@@ -803,537 +526,6 @@ static const struct file_operations sel_maxnsdepth_ops = {
 	.write		= sel_write_maxnsdepth,
 	.llseek		= generic_file_llseek,
 };
-
-static int selinux_ns_parent_authority_cred(
-	struct selinux_ns_control *control, const struct cred *actor)
-{
-	struct selinux_state *state = control->state;
-	const struct cred_security_struct *actorsec;
-
-	if (!actor)
-		return -EINVAL;
-	actorsec = selinux_cred(actor);
-	if (!selinux_ns_control_parent(control, actorsec->state))
-		return -EPERM;
-	if (security_capable(actor, actor->user_ns, CAP_SYS_ADMIN,
-			     CAP_OPT_NONE) ||
-	    security_capable(actor, state->label_domain->owner_userns,
-			     CAP_SYS_ADMIN, CAP_OPT_NONE))
-		return -EPERM;
-	return cred_self_has_perm(actor, SECCLASS_PROCESS2,
-				  PROCESS2__UNSHARE_SELINUXNS, NULL);
-}
-
-static __maybe_unused int selinux_ns_parent_authority(
-	struct selinux_ns_control *control)
-{
-	return selinux_ns_parent_authority_cred(control, current_cred());
-}
-
-static int selinux_ns_copy_context(u64 address, u32 len, char **context)
-{
-	char *copy;
-
-	if (!address || !len || len >= PAGE_SIZE)
-		return -EINVAL;
-	copy = memdup_user_nul(u64_to_user_ptr(address), len);
-	if (IS_ERR(copy))
-		return PTR_ERR(copy);
-	if (memchr(copy, '\0', len)) {
-		kfree(copy);
-		return -EINVAL;
-	}
-	*context = copy;
-	return 0;
-}
-
-static long selinux_nsfd_load_policy(struct selinux_ns_control *control,
-				     unsigned long arg)
-{
-	struct selinux_ns_policy request;
-	struct selinux_load_state load_state;
-	struct selinux_state *state = control->state;
-	void *data;
-	int rc;
-
-	if (copy_from_user(&request, (void __user *)arg, sizeof(request)))
-		return -EFAULT;
-	if (request.flags || !request.data || !request.size)
-		return -EINVAL;
-	if (request.size > CONFIG_SECURITY_SELINUX_POLICY_MAX_BYTES)
-		return -EFBIG;
-	rc = cred_tsid_has_perm(current_cred(), SECINITSID_SECURITY,
-				SECCLASS_SECURITY, SECURITY__LOAD_POLICY, NULL);
-	if (rc)
-		return rc;
-
-	mutex_lock(&control->lock);
-	if (selinux_state_active(state)) {
-		rc = -EBUSY;
-		goto out_control;
-	}
-	if (selinux_initialized(state)) {
-		rc = -EALREADY;
-		goto out_control;
-	}
-
-	mutex_lock(&state->policy_mutex);
-	data = vmalloc(request.size);
-	if (!data) {
-		rc = -ENOMEM;
-		goto out_policy;
-	}
-	if (copy_from_user(data, u64_to_user_ptr(request.data), request.size)) {
-		rc = -EFAULT;
-		goto out_data;
-	}
-	rc = security_load_policy(state, data, request.size, &load_state);
-	if (!rc) {
-		rc = selinux_policy_commit(state, &load_state);
-		if (rc) {
-			selinux_policy_cancel(state, &load_state);
-			goto out_data;
-		}
-		audit_log(audit_context(), GFP_KERNEL, AUDIT_MAC_POLICY_LOAD,
-			  "auid=%u ses=%u lsm=selinux selinuxns=%llu res=1",
-			  from_kuid(&init_user_ns, audit_get_loginuid(current)),
-			  audit_get_sessionid(current), state->label_domain->id);
-	}
-out_data:
-	vfree(data);
-out_policy:
-	mutex_unlock(&state->policy_mutex);
-out_control:
-	mutex_unlock(&control->lock);
-	return rc;
-}
-
-static long selinux_nsfd_add_map(struct selinux_ns_control *control,
-				 unsigned long arg)
-{
-	struct selinux_ns_map_pair request;
-	char *source = NULL, *target = NULL;
-	int rc;
-
-	if (copy_from_user(&request, (void __user *)arg, sizeof(request)))
-		return -EFAULT;
-	if (request.flags || request.direction >= SELINUX_LABEL_MAP_DIRECTIONS)
-		return -EINVAL;
-	rc = selinux_ns_copy_context(request.source_context,
-				     request.source_len, &source);
-	if (rc)
-		return rc;
-	rc = selinux_ns_copy_context(request.target_context,
-				     request.target_len, &target);
-	if (rc)
-		goto out;
-
-	rc = selinux_ns_control_add_map(control, current_selinux_state,
-					request.direction, source,
-					request.source_len, target,
-					request.target_len);
-out:
-	kfree(target);
-	kfree(source);
-	return rc;
-}
-
-static long selinux_nsfd_activate(struct selinux_ns_control *control)
-{
-	return selinux_ns_control_activate(control, current_selinux_state);
-}
-
-static int selinux_ns_join_cred_sids(struct cred_security_struct *newsec,
-				    u32 target_sid)
-{
-	static const enum selinux_cred_sid_slot slots[] = {
-		SELINUX_CRED_OSID,
-		SELINUX_CRED_SID,
-		SELINUX_CRED_EXEC_SID,
-		SELINUX_CRED_CREATE_SID,
-		SELINUX_CRED_KEYCREATE_SID,
-		SELINUX_CRED_SOCKCREATE_SID,
-	};
-	struct selinux_global_sid_handle *current_handle[] = {
-		newsec->osid_handle,
-		newsec->sid_handle,
-		newsec->exec_sid_handle,
-		newsec->create_sid_handle,
-		newsec->keycreate_sid_handle,
-		newsec->sockcreate_sid_handle,
-	};
-	u32 current_sid[] = {
-		newsec->osid,
-		newsec->sid,
-		newsec->exec_sid,
-		newsec->create_sid,
-		newsec->keycreate_sid,
-		newsec->sockcreate_sid,
-	};
-	struct selinux_global_sid_handle *rollback[ARRAY_SIZE(slots)] = {};
-	struct selinux_global_sid_handle *next[ARRAY_SIZE(slots)] = {};
-	size_t i;
-	int rc;
-
-	if (!target_sid)
-		return -EINVAL;
-	/* Own a complete rollback image before changing any unpublished slot. */
-	for (i = 0; i < ARRAY_SIZE(slots); i++) {
-		if (!!current_handle[i] != !!current_sid[i] ||
-		    (current_handle[i] &&
-		     global_sid_handle_sid(current_handle[i]) != current_sid[i])) {
-			rc = -ESTALE;
-			goto out;
-		}
-		if (current_handle[i]) {
-			rollback[i] = global_sid_handle_dup(current_handle[i]);
-			if (IS_ERR(rollback[i])) {
-				rc = PTR_ERR(rollback[i]);
-				rollback[i] = NULL;
-				goto out;
-			}
-		}
-	}
-
-	next[SELINUX_CRED_OSID] = global_sid_handle_get(target_sid);
-	if (IS_ERR(next[SELINUX_CRED_OSID])) {
-		rc = PTR_ERR(next[SELINUX_CRED_OSID]);
-		next[SELINUX_CRED_OSID] = NULL;
-		goto out;
-	}
-	next[SELINUX_CRED_SID] = global_sid_handle_dup(
-		next[SELINUX_CRED_OSID]);
-	if (IS_ERR(next[SELINUX_CRED_SID])) {
-		rc = PTR_ERR(next[SELINUX_CRED_SID]);
-		next[SELINUX_CRED_SID] = NULL;
-		goto out;
-	}
-
-	for (i = 0; i < ARRAY_SIZE(slots); i++) {
-		if (next[i]) {
-			struct selinux_global_sid_handle *handle = next[i];
-
-			next[i] = NULL;
-			rc = selinux_cred_sid_take_handle(newsec, slots[i], handle);
-		} else {
-			rc = selinux_cred_sid_set(newsec, slots[i], SECSID_NULL);
-		}
-		if (rc)
-			goto rollback;
-	}
-	rc = 0;
-	goto out;
-
-rollback:
-	for (i = 0; i < ARRAY_SIZE(slots); i++) {
-		struct selinux_global_sid_handle *handle = rollback[i];
-
-		rollback[i] = NULL;
-		WARN_ON_ONCE(selinux_cred_sid_take_handle(newsec, slots[i],
-							 handle));
-	}
-out:
-	for (i = 0; i < ARRAY_SIZE(slots); i++) {
-		global_sid_handle_put(next[i]);
-		global_sid_handle_put(rollback[i]);
-	}
-	return rc;
-}
-
-int selinux_ns_control_apply_join(struct selinux_ns_control *control,
-				  const struct cred *actor, struct cred *new)
-{
-	struct cred_security_struct *newsec;
-	struct selinux_state *parent, *target, *old;
-	u32 target_sid, validated_sid;
-	int rc;
-
-	if (!actor || !new)
-		return -EINVAL;
-	if (!current_is_single_threaded())
-		return -EUSERS;
-	rc = selinux_ns_parent_authority_cred(control, actor);
-	if (rc)
-		return rc;
-	rc = selinuxfs_mm_may_change(current->mm);
-	if (rc)
-		return rc;
-	parent = selinux_cred(actor)->state;
-	target = control->state;
-	mutex_lock(&parent->policy_mutex);
-	mutex_lock_nested(&target->policy_mutex, SINGLE_DEPTH_NESTING);
-	rc = selinux_ns_control_resolve_join(
-		control, parent, selinux_cred(actor)->sid,
-					     &target_sid);
-	if (rc)
-		goto out_unlock;
-	rc = avc_has_perm(target, target_sid, target_sid, SECCLASS_PROCESS2,
-			  PROCESS2__UNSHARE_SELINUXNS, NULL);
-	if (rc)
-		goto out_unlock;
-
-	rc = selinux_ns_control_resolve_join(
-		control, parent, selinux_cred(actor)->sid,
-					     &validated_sid);
-	if (rc || validated_sid != target_sid) {
-		if (!rc)
-			rc = -ESTALE;
-		goto out_unlock;
-	}
-	newsec = selinux_cred(new);
-	rc = selinux_ns_join_cred_sids(newsec, target_sid);
-	if (rc)
-		goto out_unlock;
-	old = newsec->state;
-	newsec->state = get_selinux_state(target);
-	put_selinux_state(old);
-	put_cred(newsec->parent_cred);
-	newsec->parent_cred = get_cred(actor);
-	rc = 0;
-out_unlock:
-	mutex_unlock(&target->policy_mutex);
-	mutex_unlock(&parent->policy_mutex);
-	return rc;
-}
-
-int selinux_ns_control_prepare_join(struct selinux_ns_control *control,
-				    struct cred **prepared)
-{
-	struct cred *new;
-	int rc;
-
-	if (!prepared)
-		return -EINVAL;
-	*prepared = NULL;
-	new = prepare_creds();
-	if (!new)
-		return -ENOMEM;
-	rc = selinux_ns_control_apply_join(control, current_cred(), new);
-	if (rc) {
-		abort_creds(new);
-		return rc;
-	}
-	*prepared = new;
-	return 0;
-}
-
-static long selinux_nsfd_join(struct selinux_ns_control *control)
-{
-#if defined(CONFIG_SYSVIPC) || defined(CONFIG_POSIX_MQUEUE)
-	struct ipc_namespace_security_txn txn = {};
-#endif
-	struct cred *prepared;
-	int rc;
-
-	rc = selinux_ns_control_prepare_join(control, &prepared);
-	if (rc)
-		return rc;
-#if defined(CONFIG_SYSVIPC) || defined(CONFIG_POSIX_MQUEUE)
-	if (current->nsproxy->ipc_ns != &init_ipc_ns) {
-		rc = security_ipc_namespace_reanchor_prepare(
-			&txn, current->nsproxy->ipc_ns, prepared, NULL, NULL);
-		if (rc) {
-			abort_creds(prepared);
-			return rc;
-		}
-	}
-	security_ipc_namespace_reanchor_commit(&txn);
-#endif /* CONFIG_SYSVIPC || CONFIG_POSIX_MQUEUE */
-	commit_creds(prepared);
-	return rc;
-}
-
-static long selinux_nsfd_get_info(struct selinux_ns_control *control,
-				  unsigned long arg)
-{
-	struct selinux_state *state = control->state;
-	struct selinux_ns_info info = {
-		.id = control->ns.ns_id,
-		.parent_id = state->parent->ns_control->ns.ns_id,
-		.depth = state->depth,
-	};
-
-	if (selinux_initialized(state))
-		info.flags |= SELINUX_NS_INFO_INITIALIZED;
-	if (smp_load_acquire(&control->map->sealed))
-		info.flags |= SELINUX_NS_INFO_SEALED;
-	if (selinux_state_active(state))
-		info.flags |= SELINUX_NS_INFO_ACTIVE;
-	return copy_to_user((void __user *)arg, &info, sizeof(info)) ? -EFAULT : 0;
-}
-
-static long selinux_nsfd_get_metadata(struct selinux_ns_control *control,
-				      unsigned long arg)
-{
-	struct selinux_state *state = control->state;
-	struct selinux_policy_snapshot snapshot;
-	struct selinux_ns_metadata metadata = {
-		.size = sizeof(metadata),
-		.id = control->ns.ns_id,
-		.parent_id = state->parent->ns_control->ns.ns_id,
-		.domain_id = state->label_domain->id,
-		.parent_domain_id = state->parent->label_domain->id,
-		.map_id = control->map->id,
-		.depth = state->depth,
-	};
-	int rc;
-
-	mutex_lock(&control->lock);
-	rc = selinux_policy_snapshot_read(state, &snapshot);
-	if (rc)
-		goto out;
-	metadata.policy_seqno = snapshot.seqno;
-	metadata.map_generation = READ_ONCE(control->map->generation);
-	metadata.map_entries_parent_to_child =
-		control->map_entries[SELINUX_LABEL_MAP_PARENT_TO_CHILD];
-	metadata.map_entries_child_to_parent =
-		control->map_entries[SELINUX_LABEL_MAP_CHILD_TO_PARENT];
-	if (selinux_initialized(state))
-		metadata.flags |= SELINUX_NS_INFO_INITIALIZED;
-	if (smp_load_acquire(&control->map->sealed))
-		metadata.flags |= SELINUX_NS_INFO_SEALED;
-	if (selinux_state_active(state))
-		metadata.flags |= SELINUX_NS_INFO_ACTIVE;
-	memcpy(metadata.policy_digest, snapshot.effective_digest,
-	       sizeof(metadata.policy_digest));
-	if (control->map_digest_valid)
-		memcpy(metadata.map_digest, control->map_digest,
-		       sizeof(metadata.map_digest));
-	rc = copy_to_user((void __user *)arg, &metadata, sizeof(metadata)) ?
-		-EFAULT : 0;
-out:
-	mutex_unlock(&control->lock);
-	return rc;
-}
-
-static long selinux_nsfd_activate_restore(struct selinux_ns_control *control,
-					  unsigned long arg)
-{
-	struct selinux_ns_restore restore;
-
-	if (copy_from_user(&restore, (void __user *)arg, sizeof(restore)))
-		return -EFAULT;
-	if (restore.size != sizeof(restore) || restore.flags || restore.reserved)
-		return -EINVAL;
-	return selinux_ns_control_activate_restore(
-		control, current_selinux_state, restore.expected_id,
-		restore.expected_parent_id, restore.expected_map_generation,
-		restore.expected_policy_seqno, restore.policy_digest,
-		restore.map_digest);
-}
-
-long selinux_ns_control_ioctl(struct selinux_ns_control *control,
-			      unsigned int cmd, unsigned long arg)
-{
-	int rc = selinux_ns_parent_authority_cred(control, current_cred());
-
-	if (rc)
-		return rc;
-	switch (cmd) {
-	case SELINUX_NS_IOC_LOAD_POLICY:
-		return selinux_nsfd_load_policy(control, arg);
-	case SELINUX_NS_IOC_ADD_MAP:
-		return selinux_nsfd_add_map(control, arg);
-	case SELINUX_NS_IOC_ACTIVATE:
-		return arg ? -EINVAL : selinux_nsfd_activate(control);
-	case SELINUX_NS_IOC_JOIN:
-		return arg ? -EINVAL : selinux_nsfd_join(control);
-	case SELINUX_NS_IOC_GET_INFO:
-		return selinux_nsfd_get_info(control, arg);
-	case SELINUX_NS_IOC_GET_METADATA:
-		return selinux_nsfd_get_metadata(control, arg);
-	case SELINUX_NS_IOC_ACTIVATE_RESTORE:
-		return selinux_nsfd_activate_restore(control, arg);
-	default:
-		return -ENOTTY;
-	}
-}
-
-static long selinux_ns_create_ioctl(struct file *file, unsigned int cmd,
-				    unsigned long arg)
-{
-	struct selinux_ns_create_restore restore;
-	struct selinux_ns_control *control;
-	u64 expected_id = 0;
-	struct file *nsfile;
-	int fd, rc;
-
-	if (cmd != SELINUX_NS_IOC_CREATE &&
-	    cmd != SELINUX_NS_IOC_CREATE_RESTORE)
-		return -ENOTTY;
-	rc = selinuxfs_state_access(file);
-	if (rc)
-		return rc;
-	if (cmd == SELINUX_NS_IOC_CREATE_RESTORE ?
-	    !ns_capable(&init_user_ns, CAP_SYS_ADMIN) :
-	    !ns_capable(current_user_ns(), CAP_SYS_ADMIN))
-		return -EPERM;
-	rc = cred_self_has_perm(current_cred(), SECCLASS_PROCESS2,
-				PROCESS2__UNSHARE_SELINUXNS, NULL);
-	if (rc)
-		return rc;
-	if (cmd == SELINUX_NS_IOC_CREATE) {
-		if (arg)
-			return -EINVAL;
-	} else {
-		void __user *restore_user = (void __user *)arg;
-		u32 usize;
-
-		if (get_user(usize, (u32 __user *)restore_user))
-			return -EFAULT;
-		if (usize < SELINUX_NS_CREATE_RESTORE_SIZE_VER0 ||
-		    usize > PAGE_SIZE)
-			return -EINVAL;
-		memset(&restore, 0, sizeof(restore));
-		rc = copy_struct_from_user(&restore, sizeof(restore), restore_user,
-					   usize);
-		if (rc)
-			return rc;
-		if (restore.flags ||
-		    !restore.expected_id || restore.expected_id > S64_MAX)
-			return -EINVAL;
-		rc = selinux_ns_restore_parent_validate(
-			current_selinux_state, restore.expected_parent_id);
-		if (rc)
-			return rc;
-		expected_id = restore.expected_id;
-	}
-	if (expected_id)
-		control = selinux_ns_control_alloc_unassigned(current_cred());
-	else
-		control = selinux_ns_control_alloc(current_cred());
-	if (IS_ERR(control))
-		return PTR_ERR(control);
-	fd = get_unused_fd_flags(O_CLOEXEC);
-	if (fd < 0) {
-		selinux_ns_control_put(control);
-		return fd;
-	}
-	/* open_namespace_file() consumes control's namespace reference. */
-	nsfile = open_namespace_file(&control->ns);
-	if (IS_ERR(nsfile)) {
-		put_unused_fd(fd);
-		return PTR_ERR(nsfile);
-	}
-	if (expected_id) {
-		rc = selinux_ns_control_reserve_id(control, expected_id);
-		if (rc) {
-			fput(nsfile);
-			put_unused_fd(fd);
-			return rc;
-		}
-	}
-	fd_install(fd, nsfile);
-	return fd;
-}
-
-static const struct file_operations selinux_ns_create_ops = {
-	.owner = THIS_MODULE,
-	.unlocked_ioctl = selinux_ns_create_ioctl,
-	.compat_ioctl = compat_ptr_ioctl,
-	.llseek = noop_llseek,
-};
-#endif
 
 static ssize_t sel_read_policyvers(struct file *filp, char __user *buf,
 				   size_t count, loff_t *ppos)
@@ -1351,9 +543,7 @@ static const struct file_operations sel_policyvers_ops = {
 };
 
 /* declaration for sel_write_load */
-static int sel_make_bools(struct selinux_state *state,
-			  struct selinux_policy *newpolicy,
-			  struct dentry *bool_dir,
+static int sel_make_bools(struct selinux_policy *newpolicy, struct dentry *bool_dir,
 			  unsigned int *bool_num, char ***bool_pending_names,
 			  int **bool_pending_values);
 static int sel_make_classes(struct selinux_policy *newpolicy,
@@ -1371,22 +561,20 @@ static struct dentry *sel_make_swapover_dir(struct super_block *sb,
 static ssize_t sel_read_mls(struct file *filp, char __user *buf,
 				size_t count, loff_t *ppos)
 {
-	struct selinux_fs_info *fsi = file_inode(filp)->i_sb->s_fs_info;
 	char tmpbuf[TMPBUFLEN];
 	ssize_t length;
-	int rc = selinuxfs_state_access(filp);
 
-	if (rc)
-		return rc;
-
-	length = scnprintf(tmpbuf, TMPBUFLEN, "%d",
-			   security_mls_enabled(fsi->state));
+	length = scnprintf(
+		tmpbuf,
+		TMPBUFLEN,
+		"%d",
+		security_mls_enabled(selinux_file_state(filp)));
 	return simple_read_from_buffer(buf, count, ppos, tmpbuf, length);
 }
 
 static const struct file_operations sel_mls_ops = {
 	.read		= sel_read_mls,
-	.llseek		= selinuxfs_lseek,
+	.llseek		= generic_file_llseek,
 };
 
 struct policy_load_memory {
@@ -1398,43 +586,28 @@ struct policy_load_memory {
 
 static int sel_open_policy(struct inode *inode, struct file *filp)
 {
-	struct selinux_fs_info *fsi = inode->i_sb->s_fs_info;
-	struct selinux_state *state = fsi->state;
 	struct policy_load_memory *plm = NULL;
+	struct selinux_state *state = selinux_file_state(filp);
 	int rc;
 
-	rc = selinuxfs_state_access(filp);
-	if (rc)
-		return rc;
-	/*
-	 * Only check against the current namespace because
-	 * this operation only affects it and no others.
-	 */
-	rc = avc_has_perm(current_selinux_state,
-			  current_sid(), SECINITSID_SECURITY,
-			  SECCLASS_SECURITY, SECURITY__READ_POLICY, NULL);
+	rc = selinuxfs_has_perm(filp, SECURITY__READ_POLICY);
 	if (rc)
 		return rc;
 
 	plm = kzalloc_obj(*plm);
 	if (!plm)
 		return -ENOMEM;
-	plm->fsi = fsi;
+	plm->fsi = inode->i_sb->s_fs_info;
 
 	mutex_lock(&state->policy_mutex);
 	rc = security_policy_size(state, &plm->len);
 	if (rc)
 		goto err;
-	if (plm->len > CONFIG_SECURITY_SELINUX_POLICY_MAX_BYTES) {
-		rc = -EFBIG;
-		goto err;
-	}
 	rc = selinuxfs_snapshot_bytes_reserve(state, plm->len);
 	if (rc)
 		goto err;
 	plm->charge = plm->len;
-	rc = security_read_policy(state, &plm->data, &plm->len,
-				  CONFIG_SECURITY_SELINUX_POLICY_MAX_BYTES);
+	rc = security_read_policy(state, &plm->data, &plm->len);
 	if (rc)
 		goto err;
 	if (WARN_ON(plm->len > plm->charge)) {
@@ -1443,12 +616,19 @@ static int sel_open_policy(struct inode *inode, struct file *filp)
 	}
 	selinuxfs_snapshot_bytes_release(state, plm->charge - plm->len);
 	plm->charge = plm->len;
+	if ((size_t)i_size_read(inode) != plm->len) {
+		inode_lock(inode);
+		i_size_write(inode, plm->len);
+		inode_unlock(inode);
+	}
 	mutex_unlock(&state->policy_mutex);
 
 	filp->private_data = plm;
+
 	return 0;
 err:
 	mutex_unlock(&state->policy_mutex);
+
 	selinuxfs_snapshot_bytes_release(state, plm->charge);
 	vfree(plm->data);
 	kfree(plm);
@@ -1470,18 +650,9 @@ static ssize_t sel_read_policy(struct file *filp, char __user *buf,
 			       size_t count, loff_t *ppos)
 {
 	struct policy_load_memory *plm = filp->private_data;
-	int ret = selinuxfs_state_access(filp);
+	int ret;
 
-	if (ret)
-		return ret;
-
-	/*
-	 * Only check against the current namespace because
-	 * this operation only affects it and no others.
-	 */
-	ret = avc_has_perm(current_selinux_state,
-			   current_sid(), SECINITSID_SECURITY,
-			   SECCLASS_SECURITY, SECURITY__READ_POLICY, NULL);
+	ret = selinuxfs_has_perm(filp, SECURITY__READ_POLICY);
 	if (ret)
 		return ret;
 
@@ -1490,13 +661,10 @@ static ssize_t sel_read_policy(struct file *filp, char __user *buf,
 
 static vm_fault_t sel_mmap_policy_fault(struct vm_fault *vmf)
 {
-	struct file *file = vmf->vma->vm_file;
-	struct policy_load_memory *plm = file->private_data;
+	struct policy_load_memory *plm = vmf->vma->vm_file->private_data;
 	unsigned long offset;
 	struct page *page;
 
-	if (selinuxfs_state_access(file))
-		return VM_FAULT_SIGBUS;
 	if (vmf->flags & (FAULT_FLAG_MKWRITE | FAULT_FLAG_WRITE))
 		return VM_FAULT_SIGBUS;
 
@@ -1513,20 +681,12 @@ static vm_fault_t sel_mmap_policy_fault(struct vm_fault *vmf)
 }
 
 static const struct vm_operations_struct sel_mmap_policy_ops = {
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	.open = selinuxfs_vma_open,
-	.close = selinuxfs_vma_close,
-#endif
 	.fault = sel_mmap_policy_fault,
 	.page_mkwrite = sel_mmap_policy_fault,
 };
 
 static int sel_mmap_policy(struct file *filp, struct vm_area_struct *vma)
 {
-	int rc = selinuxfs_state_access(filp);
-
-	if (rc)
-		return rc;
 	if (vma->vm_flags & VM_SHARED) {
 		/* do not allow mprotect to make mapping writable */
 		vm_flags_clear(vma, VM_MAYWRITE);
@@ -1536,24 +696,9 @@ static int sel_mmap_policy(struct file *filp, struct vm_area_struct *vma)
 	}
 
 	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	rc = selinuxfs_vma_track_initial(vma);
-	if (rc)
-		return rc;
-#endif
 	vma->vm_ops = &sel_mmap_policy_ops;
 
 	return 0;
-}
-
-static loff_t sel_lseek_policy(struct file *filp, loff_t offset, int whence)
-{
-	struct policy_load_memory *plm = filp->private_data;
-	int rc = selinuxfs_state_access(filp);
-
-	if (rc)
-		return rc;
-	return fixed_size_llseek(filp, offset, whence, plm->len);
 }
 
 static const struct file_operations sel_policy_ops = {
@@ -1561,26 +706,7 @@ static const struct file_operations sel_policy_ops = {
 	.read		= sel_read_policy,
 	.mmap		= sel_mmap_policy,
 	.release	= sel_release_policy,
-	.llseek		= sel_lseek_policy,
-};
-
-static ssize_t sel_read_policy_max_bytes(struct file *filp, char __user *buf,
-					 size_t count, loff_t *ppos)
-{
-	char tmpbuf[32];
-	ssize_t length;
-	int rc = selinuxfs_state_access(filp);
-
-	if (rc)
-		return rc;
-	length = scnprintf(tmpbuf, sizeof(tmpbuf), "%u",
-			   CONFIG_SECURITY_SELINUX_POLICY_MAX_BYTES);
-	return simple_read_from_buffer(buf, count, ppos, tmpbuf, length);
-}
-
-static const struct file_operations sel_policy_max_bytes_ops = {
-	.read		= sel_read_policy_max_bytes,
-	.llseek		= selinuxfs_lseek,
+	.llseek		= generic_file_llseek,
 };
 
 static void sel_remove_old_bool_data(unsigned int bool_num, char **bool_names,
@@ -1624,7 +750,7 @@ static int sel_make_policy_nodes(struct selinux_fs_info *fsi,
 		goto out;
 	}
 
-	ret = sel_make_bools(fsi->state, newpolicy, tmp_bool_dir, &bool_num,
+	ret = sel_make_bools(newpolicy, tmp_bool_dir, &bool_num,
 			     &bool_names, &bool_values);
 	if (ret)
 		goto out;
@@ -1676,52 +802,35 @@ static ssize_t sel_write_load(struct file *file, const char __user *buf,
 			      size_t count, loff_t *ppos)
 
 {
-	struct selinux_fs_info *fsi = file_inode(file)->i_sb->s_fs_info;
+	struct selinux_fs_info *fsi;
+	struct selinux_state *state = selinux_file_state(file);
 	struct selinux_load_state load_state;
 	ssize_t length;
 	void *data = NULL;
 
-	length = selinuxfs_state_access(file);
-	if (length)
-		return length;
 	/* no partial writes */
 	if (*ppos)
 		return -EINVAL;
 	/* no empty policies */
 	if (!count)
 		return -EINVAL;
-	if (count > CONFIG_SECURITY_SELINUX_POLICY_MAX_BYTES) {
-		pr_warn_ratelimited("SELinux: policy load size %zu exceeds limit %u\n",
-				    count,
-				    CONFIG_SECURITY_SELINUX_POLICY_MAX_BYTES);
+	if (count > CONFIG_SECURITY_SELINUX_POLICY_MAX_BYTES)
 		return -EFBIG;
-	}
-	/*
-	 * Only check against the current namespace because
-	 * this operation only affects it and no others.
-	 */
-	length = avc_has_perm(current_selinux_state,
-			      current_sid(), SECINITSID_SECURITY,
-			      SECCLASS_SECURITY, SECURITY__LOAD_POLICY, NULL);
+
+	length = selinuxfs_mutation_allowed(file, SECURITY__LOAD_POLICY);
 	if (length)
 		return length;
-	/*
-	 * Serialize before allocating.  This makes the input accounting exact:
-	 * one state can stage at most one buffer, bounded by
-	 * CONFIG_SECURITY_SELINUX_POLICY_MAX_BYTES.
-	 */
-	mutex_lock(&fsi->state->policy_mutex);
+
 	data = vmalloc(count);
-	if (!data) {
-		length = -ENOMEM;
-		goto out_unlock;
-	}
+	if (!data)
+		return -ENOMEM;
 	if (copy_from_user(data, buf, count) != 0) {
 		length = -EFAULT;
-		goto out_unlock;
+		goto out;
 	}
 
-	length = security_load_policy(fsi->state, data, count, &load_state);
+	mutex_lock(&state->policy_mutex);
+	length = security_load_policy(state, data, count, &load_state);
 	if (length) {
 		pr_warn_ratelimited("SELinux: failed to load policy\n");
 		goto out_unlock;
@@ -1730,15 +839,25 @@ static ssize_t sel_write_load(struct file *file, const char __user *buf,
 	length = sel_make_policy_nodes(fsi, load_state.policy);
 	if (length) {
 		pr_warn_ratelimited("SELinux: failed to initialize selinuxfs\n");
-		selinux_policy_cancel(fsi->state, &load_state);
+		selinux_policy_cancel(state, &load_state);
 		goto out_unlock;
 	}
 
-	length = selinux_policy_commit(fsi->state, &load_state);
+	length = selinux_chain_update_prepare(state);
 	if (length) {
-		selinux_policy_cancel(fsi->state, &load_state);
+		selinux_policy_cancel(state, &load_state);
 		goto out_unlock;
 	}
+	length = selinux_chain_update_begin(state);
+	if (length) {
+		selinux_chain_update_abort(state);
+		selinux_policy_cancel(state, &load_state);
+		goto out_unlock;
+	}
+	sha256(data, count, state->policy_digest);
+	selinux_policy_commit(state, &load_state);
+	selinux_chain_update_end(state);
+	selinux_chain_update_complete(state);
 	length = count;
 	audit_log(audit_context(), GFP_KERNEL, AUDIT_MAC_POLICY_LOAD,
 		"auid=%u ses=%u lsm=selinux res=1",
@@ -1746,82 +865,67 @@ static ssize_t sel_write_load(struct file *file, const char __user *buf,
 		audit_get_sessionid(current));
 
 out_unlock:
+	mutex_unlock(&state->policy_mutex);
+out:
 	vfree(data);
-	mutex_unlock(&fsi->state->policy_mutex);
 	return length;
 }
 
 static const struct file_operations sel_load_ops = {
 	.write		= sel_write_load,
-	.llseek		= selinuxfs_lseek,
+	.llseek		= generic_file_llseek,
 };
 
 static ssize_t sel_write_context(struct file *file, char *buf, size_t size)
 {
-	struct selinux_fs_info *fsi = file_inode(file)->i_sb->s_fs_info;
-	struct selinux_state *state = fsi->state;
-	const char *canon = NULL;
+	struct selinux_state *state = selinux_file_state(file);
+	char *canon = NULL;
 	u32 sid, len;
 	ssize_t length;
 
-	/*
-	 * Only check against the current namespace because
-	 * this operation only affects it and no others.
-	 */
-	length = avc_has_perm(current_selinux_state,
-			      current_sid(), SECINITSID_SECURITY,
-			      SECCLASS_SECURITY, SECURITY__CHECK_CONTEXT, NULL);
+	length = selinuxfs_has_perm(file, SECURITY__CHECK_CONTEXT);
 	if (length)
 		goto out;
 
-	length = selinux_ss_context_to_sid(state, buf, size, &sid, GFP_KERNEL);
+	length = security_context_to_sid(state, buf, size, &sid, GFP_KERNEL);
 	if (length)
 		goto out;
 
-	rcu_read_lock();
-	length = selinux_ss_sid_to_context(state, sid, &canon, &len);
+	length = security_sid_to_context(state, sid, &canon, &len);
 	if (length)
-		goto out_unlock;
+		goto out;
 
 	length = -ERANGE;
 	if (len > SIMPLE_TRANSACTION_LIMIT) {
 		pr_err("SELinux: %s:  context size (%u) exceeds "
 			"payload max\n", __func__, len);
-		goto out_unlock;
+		goto out;
 	}
 
 	memcpy(buf, canon, len);
 	length = len;
-out_unlock:
-	rcu_read_unlock();
 out:
+	kfree(canon);
 	return length;
 }
 
 static ssize_t sel_read_checkreqprot(struct file *filp, char __user *buf,
 				     size_t count, loff_t *ppos)
 {
-	struct selinux_fs_info *fsi = file_inode(filp)->i_sb->s_fs_info;
 	char tmpbuf[TMPBUFLEN];
 	ssize_t length;
-	int rc = selinuxfs_state_access(filp);
 
-	if (rc)
-		return rc;
-
-	length = scnprintf(tmpbuf, TMPBUFLEN, "%u",
-			   checkreqprot_get(fsi->state));
+	length = scnprintf(
+		tmpbuf,
+		TMPBUFLEN,
+		"%u",
+		checkreqprot_get(selinux_file_state(filp)));
 	return simple_read_from_buffer(buf, count, ppos, tmpbuf, length);
 }
 
 static ssize_t sel_write_checkreqprot(struct file *file, const char __user *buf,
 				      size_t count, loff_t *ppos)
 {
-	int rc = selinuxfs_state_access(file);
-
-	if (rc)
-		return rc;
-
 	/*
 	 * Setting checkreqprot is no longer supported, see
 	 * https://github.com/SELinuxProject/selinux-kernel/wiki/DEPRECATE-checkreqprot
@@ -1833,32 +937,21 @@ static ssize_t sel_write_checkreqprot(struct file *file, const char __user *buf,
 static const struct file_operations sel_checkreqprot_ops = {
 	.read		= sel_read_checkreqprot,
 	.write		= sel_write_checkreqprot,
-	.llseek		= selinuxfs_lseek,
+	.llseek		= generic_file_llseek,
 };
 
 static ssize_t sel_write_validatetrans(struct file *file,
 					const char __user *buf,
 					size_t count, loff_t *ppos)
 {
-	struct selinux_fs_info *fsi = file_inode(file)->i_sb->s_fs_info;
-	struct selinux_state *state = fsi->state;
+	struct selinux_state *state = selinux_file_state(file);
 	char *oldcon = NULL, *newcon = NULL, *taskcon = NULL;
 	char *req = NULL;
 	u32 osid, nsid, tsid;
 	u16 tclass;
 	int rc;
 
-	rc = selinuxfs_state_access(file);
-	if (rc)
-		return rc;
-
-	/*
-	 * Only check against the current namespace because
-	 * this operation only affects it and no others.
-	 */
-	rc = avc_has_perm(current_selinux_state,
-			  current_sid(), SECINITSID_SECURITY,
-			  SECCLASS_SECURITY, SECURITY__VALIDATE_TRANS, NULL);
+	rc = selinuxfs_has_perm(file, SECURITY__VALIDATE_TRANS);
 	if (rc)
 		goto out;
 
@@ -1895,19 +988,24 @@ static ssize_t sel_write_validatetrans(struct file *file,
 	if (sscanf(req, "%s %s %hu %s", oldcon, newcon, &tclass, taskcon) != 4)
 		goto out;
 
-	rc = selinux_ss_context_str_to_sid(state, oldcon, &osid, GFP_KERNEL);
+	rc = security_context_str_to_sid(state, oldcon, &osid, GFP_KERNEL);
 	if (rc)
 		goto out;
 
-	rc = selinux_ss_context_str_to_sid(state, newcon, &nsid, GFP_KERNEL);
+	rc = security_context_str_to_sid(state, newcon, &nsid, GFP_KERNEL);
 	if (rc)
 		goto out;
 
-	rc = selinux_ss_context_str_to_sid(state, taskcon, &tsid, GFP_KERNEL);
+	rc = security_context_str_to_sid(state, taskcon, &tsid, GFP_KERNEL);
 	if (rc)
 		goto out;
 
-	rc = selinux_ss_validate_transition_user(state, osid, nsid, tsid, tclass);
+	rc = security_validate_transition_user(
+		state,
+		osid,
+		nsid,
+		tsid,
+		tclass);
 	if (!rc)
 		rc = count;
 out:
@@ -1920,7 +1018,7 @@ out:
 
 static const struct file_operations sel_transition_ops = {
 	.write		= sel_write_validatetrans,
-	.llseek		= selinuxfs_lseek,
+	.llseek		= generic_file_llseek,
 };
 
 /*
@@ -1947,10 +1045,6 @@ static ssize_t selinux_transaction_write(struct file *file, const char __user *b
 	char *data;
 	ssize_t rv;
 
-	rv = selinuxfs_state_access(file);
-	if (rv)
-		return rv;
-
 	if (ino >= ARRAY_SIZE(write_op) || !write_op[ino])
 		return -EINVAL;
 
@@ -1966,21 +1060,11 @@ static ssize_t selinux_transaction_write(struct file *file, const char __user *b
 	return rv;
 }
 
-static ssize_t selinux_transaction_read(struct file *file, char __user *buf,
-					size_t size, loff_t *pos)
-{
-	int rc = selinuxfs_state_access(file);
-
-	if (rc)
-		return rc;
-	return simple_transaction_read(file, buf, size, pos);
-}
-
 static const struct file_operations transaction_ops = {
 	.write		= selinux_transaction_write,
-	.read		= selinux_transaction_read,
+	.read		= simple_transaction_read,
 	.release	= simple_transaction_release,
-	.llseek		= selinuxfs_lseek,
+	.llseek		= generic_file_llseek,
 };
 
 /*
@@ -1991,21 +1075,14 @@ static const struct file_operations transaction_ops = {
 
 static ssize_t sel_write_access(struct file *file, char *buf, size_t size)
 {
-	struct selinux_fs_info *fsi = file_inode(file)->i_sb->s_fs_info;
-	struct selinux_state *state = fsi->state;
+	struct selinux_state *state = selinux_file_state(file);
 	char *scon = NULL, *tcon = NULL;
 	u32 ssid, tsid;
 	u16 tclass;
 	struct av_decision avd;
 	ssize_t length;
 
-	/*
-	 * Only check against the current namespace because
-	 * this operation only affects it and no others.
-	 */
-	length = avc_has_perm(current_selinux_state,
-			      current_sid(), SECINITSID_SECURITY,
-			      SECCLASS_SECURITY, SECURITY__COMPUTE_AV, NULL);
+	length = selinuxfs_has_perm(file, SECURITY__COMPUTE_AV);
 	if (length)
 		goto out;
 
@@ -2023,15 +1100,15 @@ static ssize_t sel_write_access(struct file *file, char *buf, size_t size)
 	if (sscanf(buf, "%s %s %hu", scon, tcon, &tclass) != 3)
 		goto out;
 
-	length = selinux_ss_context_str_to_sid(state, scon, &ssid, GFP_KERNEL);
+	length = security_context_str_to_sid(state, scon, &ssid, GFP_KERNEL);
 	if (length)
 		goto out;
 
-	length = selinux_ss_context_str_to_sid(state, tcon, &tsid, GFP_KERNEL);
+	length = security_context_str_to_sid(state, tcon, &tsid, GFP_KERNEL);
 	if (length)
 		goto out;
 
-	selinux_ss_compute_av_user(state, ssid, tsid, tclass, &avd);
+	security_compute_av_user(state, ssid, tsid, tclass, &avd);
 
 	length = scnprintf(buf, SIMPLE_TRANSACTION_LIMIT,
 			  "%x %x %x %x %u %x",
@@ -2046,25 +1123,17 @@ out:
 
 static ssize_t sel_write_create(struct file *file, char *buf, size_t size)
 {
-	struct selinux_fs_info *fsi = file_inode(file)->i_sb->s_fs_info;
-	struct selinux_state *state = fsi->state;
+	struct selinux_state *state = selinux_file_state(file);
 	char *scon = NULL, *tcon = NULL;
 	char *namebuf = NULL, *objname = NULL;
 	u32 ssid, tsid, newsid;
 	u16 tclass;
 	ssize_t length;
-	const char *newcon = NULL;
+	char *newcon = NULL;
 	u32 len;
 	int nargs;
 
-	/*
-	 * Only check against the current namespace because
-	 * this operation only affects it and no others.
-	 */
-	length = avc_has_perm(current_selinux_state,
-			      current_sid(), SECINITSID_SECURITY,
-			      SECCLASS_SECURITY, SECURITY__COMPUTE_CREATE,
-			      NULL);
+	length = selinuxfs_has_perm(file, SECURITY__COMPUTE_CREATE);
 	if (length)
 		goto out;
 
@@ -2118,36 +1187,39 @@ static ssize_t sel_write_create(struct file *file, char *buf, size_t size)
 		objname = namebuf;
 	}
 
-	length = selinux_ss_context_str_to_sid(state, scon, &ssid, GFP_KERNEL);
+	length = security_context_str_to_sid(state, scon, &ssid, GFP_KERNEL);
 	if (length)
 		goto out;
 
-	length = selinux_ss_context_str_to_sid(state, tcon, &tsid, GFP_KERNEL);
+	length = security_context_str_to_sid(state, tcon, &tsid, GFP_KERNEL);
 	if (length)
 		goto out;
 
-	length = selinux_ss_transition_sid_user(state, ssid, tsid, tclass,
-					      objname, &newsid);
+	length = security_transition_sid_user(
+		state,
+		ssid,
+		tsid,
+		tclass,
+		objname,
+		&newsid);
 	if (length)
 		goto out;
 
-	rcu_read_lock();
-	length = selinux_ss_sid_to_context(state, newsid, &newcon, &len);
+	length = security_sid_to_context(state, newsid, &newcon, &len);
 	if (length)
-		goto out_unlock;
+		goto out;
 
 	length = -ERANGE;
 	if (len > SIMPLE_TRANSACTION_LIMIT) {
 		pr_err("SELinux: %s:  context size (%u) exceeds "
 			"payload max\n", __func__, len);
-		goto out_unlock;
+		goto out;
 	}
 
 	memcpy(buf, newcon, len);
 	length = len;
-out_unlock:
-	rcu_read_unlock();
 out:
+	kfree(newcon);
 	kfree(namebuf);
 	kfree(tcon);
 	kfree(scon);
@@ -2156,23 +1228,15 @@ out:
 
 static ssize_t sel_write_relabel(struct file *file, char *buf, size_t size)
 {
-	struct selinux_fs_info *fsi = file_inode(file)->i_sb->s_fs_info;
-	struct selinux_state *state = fsi->state;
+	struct selinux_state *state = selinux_file_state(file);
 	char *scon = NULL, *tcon = NULL;
 	u32 ssid, tsid, newsid;
 	u16 tclass;
 	ssize_t length;
-	const char *newcon = NULL;
+	char *newcon = NULL;
 	u32 len;
 
-	/*
-	 * Only check against the current namespace because
-	 * this operation only affects it and no others.
-	 */
-	length = avc_has_perm(current_selinux_state,
-			      current_sid(), SECINITSID_SECURITY,
-			      SECCLASS_SECURITY, SECURITY__COMPUTE_RELABEL,
-			      NULL);
+	length = selinuxfs_has_perm(file, SECURITY__COMPUTE_RELABEL);
 	if (length)
 		goto out;
 
@@ -2190,32 +1254,30 @@ static ssize_t sel_write_relabel(struct file *file, char *buf, size_t size)
 	if (sscanf(buf, "%s %s %hu", scon, tcon, &tclass) != 3)
 		goto out;
 
-	length = selinux_ss_context_str_to_sid(state, scon, &ssid, GFP_KERNEL);
+	length = security_context_str_to_sid(state, scon, &ssid, GFP_KERNEL);
 	if (length)
 		goto out;
 
-	length = selinux_ss_context_str_to_sid(state, tcon, &tsid, GFP_KERNEL);
+	length = security_context_str_to_sid(state, tcon, &tsid, GFP_KERNEL);
 	if (length)
 		goto out;
 
-	length = selinux_ss_change_sid(state, ssid, tsid, tclass, &newsid);
+	length = security_change_sid(state, ssid, tsid, tclass, &newsid);
 	if (length)
 		goto out;
 
-	rcu_read_lock();
-	length = selinux_ss_sid_to_context(state, newsid, &newcon, &len);
+	length = security_sid_to_context(state, newsid, &newcon, &len);
 	if (length)
-		goto out_unlock;
+		goto out;
 
 	length = -ERANGE;
 	if (len > SIMPLE_TRANSACTION_LIMIT)
-		goto out_unlock;
+		goto out;
 
 	memcpy(buf, newcon, len);
 	length = len;
-out_unlock:
-	rcu_read_unlock();
 out:
+	kfree(newcon);
 	kfree(tcon);
 	kfree(scon);
 	return length;
@@ -2232,23 +1294,15 @@ static ssize_t sel_write_user(struct file *file, char *buf, size_t size)
 
 static ssize_t sel_write_member(struct file *file, char *buf, size_t size)
 {
-	struct selinux_fs_info *fsi = file_inode(file)->i_sb->s_fs_info;
-	struct selinux_state *state = fsi->state;
+	struct selinux_state *state = selinux_file_state(file);
 	char *scon = NULL, *tcon = NULL;
 	u32 ssid, tsid, newsid;
 	u16 tclass;
 	ssize_t length;
-	const char *newcon = NULL;
+	char *newcon = NULL;
 	u32 len;
 
-	/*
-	 * Only check against the current namespace because
-	 * this operation only affects it and no others.
-	 */
-	length = avc_has_perm(current_selinux_state,
-			      current_sid(), SECINITSID_SECURITY,
-			      SECCLASS_SECURITY, SECURITY__COMPUTE_MEMBER,
-			      NULL);
+	length = selinuxfs_has_perm(file, SECURITY__COMPUTE_MEMBER);
 	if (length)
 		goto out;
 
@@ -2266,35 +1320,33 @@ static ssize_t sel_write_member(struct file *file, char *buf, size_t size)
 	if (sscanf(buf, "%s %s %hu", scon, tcon, &tclass) != 3)
 		goto out;
 
-	length = selinux_ss_context_str_to_sid(state, scon, &ssid, GFP_KERNEL);
+	length = security_context_str_to_sid(state, scon, &ssid, GFP_KERNEL);
 	if (length)
 		goto out;
 
-	length = selinux_ss_context_str_to_sid(state, tcon, &tsid, GFP_KERNEL);
+	length = security_context_str_to_sid(state, tcon, &tsid, GFP_KERNEL);
 	if (length)
 		goto out;
 
-	length = selinux_ss_member_sid(state, ssid, tsid, tclass, &newsid);
+	length = security_member_sid(state, ssid, tsid, tclass, &newsid);
 	if (length)
 		goto out;
 
-	rcu_read_lock();
-	length = selinux_ss_sid_to_context(state, newsid, &newcon, &len);
+	length = security_sid_to_context(state, newsid, &newcon, &len);
 	if (length)
-		goto out_unlock;
+		goto out;
 
 	length = -ERANGE;
 	if (len > SIMPLE_TRANSACTION_LIMIT) {
 		pr_err("SELinux: %s:  context size (%u) exceeds "
 			"payload max\n", __func__, len);
-		goto out_unlock;
+		goto out;
 	}
 
 	memcpy(buf, newcon, len);
 	length = len;
-out_unlock:
-	rcu_read_unlock();
 out:
+	kfree(newcon);
 	kfree(tcon);
 	kfree(scon);
 	return length;
@@ -2309,6 +1361,58 @@ static struct inode *sel_make_inode(struct super_block *sb, umode_t mode)
 		simple_inode_init_ts(ret);
 	}
 	return ret;
+}
+
+static int selinuxfs_inode_set_label(
+	struct selinux_state *leaf,
+	struct selinux_policy *leaf_policy,
+	struct inode *inode,
+	const char *path,
+	u16 sclass,
+	u32 fallback_sid)
+{
+	struct inode_security_struct *isec = selinux_inode(inode);
+	struct selinux_state *state;
+	unsigned int depth = 0;
+	int rc;
+
+	if (!isec || !isec->object)
+		return -EUCLEAN;
+	for (state = leaf; state; state = state->parent) {
+		struct selinux_object_label_value label = {
+			.sid = fallback_sid,
+			.sclass = sclass,
+			.source = SELINUX_LABEL_SOURCE_GENFS,
+		};
+
+		if (depth++ > SELINUX_NS_MAX_DEPTH)
+			return -E2BIG;
+		if (state == leaf && leaf_policy)
+			rc = selinux_policy_genfs_sid(
+				leaf_policy,
+				"selinuxfs",
+				path,
+				sclass,
+				&label.sid);
+		else
+			rc = security_genfs_sid(
+				state,
+				"selinuxfs",
+				path,
+				sclass,
+				&label.sid);
+		if (rc)
+			label.sid = fallback_sid;
+		rc = selinux_object_label_set(
+			state,
+			isec->object,
+			&label,
+			GFP_KERNEL_ACCOUNT);
+		if (rc)
+			return rc;
+	}
+	isec->sclass = sclass;
+	return 0;
 }
 
 static struct dentry *sel_attach(struct dentry *parent, const char *name,
@@ -2342,9 +1446,6 @@ static ssize_t sel_read_bool(struct file *filep, char __user *buf,
 	unsigned index = file_inode(filep)->i_ino & SEL_INO_MASK;
 	const char *name = filep->f_path.dentry->d_name.name;
 
-	ret = selinuxfs_state_access(filep);
-	if (ret)
-		return ret;
 	mutex_lock(&fsi->state->policy_mutex);
 
 	ret = -EINVAL;
@@ -2377,10 +1478,6 @@ static ssize_t sel_write_bool(struct file *filep, const char __user *buf,
 	unsigned index = file_inode(filep)->i_ino & SEL_INO_MASK;
 	const char *name = filep->f_path.dentry->d_name.name;
 
-	length = selinuxfs_state_access(filep);
-	if (length)
-		return length;
-
 	if (count >= PAGE_SIZE)
 		return -ENOMEM;
 
@@ -2394,14 +1491,7 @@ static ssize_t sel_write_bool(struct file *filep, const char __user *buf,
 
 	mutex_lock(&fsi->state->policy_mutex);
 
-	/*
-	 * Only check against the current namespace because
-	 * this operation only affects it and no others.
-	 */
-	length = avc_has_perm(current_selinux_state,
-			      current_sid(), SECINITSID_SECURITY,
-			      SECCLASS_SECURITY, SECURITY__SETBOOL,
-			      NULL);
+	length = selinuxfs_mutation_allowed(filep, SECURITY__SETBOOL);
 	if (length)
 		goto out;
 
@@ -2429,7 +1519,7 @@ out:
 static const struct file_operations sel_bool_ops = {
 	.read		= sel_read_bool,
 	.write		= sel_write_bool,
-	.llseek		= selinuxfs_lseek,
+	.llseek		= generic_file_llseek,
 };
 
 static ssize_t sel_commit_bools_write(struct file *filep,
@@ -2440,10 +1530,6 @@ static ssize_t sel_commit_bools_write(struct file *filep,
 	char *page = NULL;
 	ssize_t length;
 	int new_value;
-
-	length = selinuxfs_state_access(filep);
-	if (length)
-		return length;
 
 	if (count >= PAGE_SIZE)
 		return -ENOMEM;
@@ -2458,14 +1544,7 @@ static ssize_t sel_commit_bools_write(struct file *filep,
 
 	mutex_lock(&fsi->state->policy_mutex);
 
-	/*
-	 * Only check against the current namespace because
-	 * this operation only affects it and no others.
-	 */
-	length = avc_has_perm(current_selinux_state,
-			      current_sid(), SECINITSID_SECURITY,
-			      SECCLASS_SECURITY, SECURITY__SETBOOL,
-			      NULL);
+	length = selinuxfs_mutation_allowed(filep, SECURITY__SETBOOL);
 	if (length)
 		goto out;
 
@@ -2474,9 +1553,22 @@ static ssize_t sel_commit_bools_write(struct file *filep,
 		goto out;
 
 	length = 0;
-	if (new_value && fsi->bool_pending_values)
-		length = security_set_bools(fsi->state, fsi->bool_num,
-					    fsi->bool_pending_values);
+	if (new_value && fsi->bool_pending_values) {
+		length = selinux_chain_update_prepare(fsi->state);
+		if (length)
+			goto out;
+		length = selinux_chain_update_begin(fsi->state);
+		if (length) {
+			selinux_chain_update_abort(fsi->state);
+			goto out;
+		}
+		length = security_set_bools(
+			fsi->state,
+			fsi->bool_num,
+			fsi->bool_pending_values);
+		selinux_chain_update_end(fsi->state);
+		selinux_chain_update_complete(fsi->state);
+	}
 
 	if (!length)
 		length = count;
@@ -2489,12 +1581,10 @@ out:
 
 static const struct file_operations sel_commit_bools_ops = {
 	.write		= sel_commit_bools_write,
-	.llseek		= selinuxfs_lseek,
+	.llseek		= generic_file_llseek,
 };
 
-static int sel_make_bools(struct selinux_state *state,
-			  struct selinux_policy *newpolicy,
-			  struct dentry *bool_dir,
+static int sel_make_bools(struct selinux_policy *newpolicy, struct dentry *bool_dir,
 			  unsigned int *bool_num, char ***bool_pending_names,
 			  int **bool_pending_values)
 {
@@ -2515,14 +1605,7 @@ static int sel_make_bools(struct selinux_state *state,
 
 	for (i = 0; !ret && i < num; i++) {
 		struct inode *inode;
-		struct inode_security_struct *isec;
 		ssize_t len;
-		u32 sid;
-#ifdef CONFIG_SECURITY_SELINUX_NS
-		struct selinux_global_sid_handle *sid_handle;
-		enum selinux_label_source source = SELINUX_LABEL_SOURCE_GENFS;
-		u16 sclass = SECCLASS_FILE;
-#endif
 
 		len = snprintf(page, PAGE_SIZE, "/%s/%s", BOOL_DIR_NAME, names[i]);
 		if (len >= PAGE_SIZE) {
@@ -2536,44 +1619,15 @@ static int sel_make_bools(struct selinux_state *state,
 			break;
 		}
 
-		isec = selinux_inode(inode);
-#ifdef CONFIG_SECURITY_SELINUX_NS
-		sid_handle = selinux_policy_genfs_sid_handle(
-			state, newpolicy, "selinuxfs", page, sclass, &sid);
-		if (IS_ERR(sid_handle) && PTR_ERR(sid_handle) == -ENOENT) {
-			pr_warn_ratelimited("SELinux: no sid found, defaulting to security isid for %s\n",
-					   page);
-			sid = SECINITSID_SECURITY;
-			source = SELINUX_LABEL_SOURCE_KERNEL_INITIAL;
-			sid_handle = global_sid_handle_get(sid);
-		}
-		if (IS_ERR(sid_handle)) {
-			ret = PTR_ERR(sid_handle);
-			iput(inode);
+		ret = selinuxfs_inode_set_label(
+			((struct selinux_fs_info *)bool_dir->d_sb->s_fs_info)->state,
+			newpolicy,
+			inode,
+			page,
+			SECCLASS_FILE,
+			SECINITSID_SECURITY);
+		if (ret)
 			break;
-		}
-		ret = selinux_inode_security_take_sid_handle(
-			isec, sid_handle, &sclass, source, LABEL_INITIALIZED);
-		if (ret) {
-			iput(inode);
-			break;
-		}
-#else
-		ret = selinux_policy_genfs_sid(state, newpolicy, "selinuxfs", page,
-					 SECCLASS_FILE, &sid);
-		if (ret == -ENOENT) {
-			pr_warn_ratelimited("SELinux: no sid found, defaulting to security isid for %s\n",
-					   page);
-			sid = SECINITSID_SECURITY;
-			ret = 0;
-		} else if (ret) {
-			iput(inode);
-			break;
-		}
-
-		isec->sid = sid;
-		isec->initialized = LABEL_INITIALIZED;
-#endif
 		inode->i_fop = &sel_bool_ops;
 		inode->i_ino = i|SEL_BOOL_INO_OFFSET;
 
@@ -2587,17 +1641,14 @@ out:
 static ssize_t sel_read_avc_cache_threshold(struct file *filp, char __user *buf,
 					    size_t count, loff_t *ppos)
 {
-	struct selinux_fs_info *fsi = file_inode(filp)->i_sb->s_fs_info;
-	struct selinux_state *state = fsi->state;
 	char tmpbuf[TMPBUFLEN];
 	ssize_t length;
-	int rc = selinuxfs_state_access(filp);
 
-	if (rc)
-		return rc;
-
-	length = scnprintf(tmpbuf, TMPBUFLEN, "%u",
-			   avc_get_cache_threshold(state->avc));
+	length = scnprintf(
+		tmpbuf,
+		TMPBUFLEN,
+		"%u",
+		avc_get_cache_threshold(selinux_file_state(filp)->avc));
 	return simple_read_from_buffer(buf, count, ppos, tmpbuf, length);
 }
 
@@ -2606,24 +1657,11 @@ static ssize_t sel_write_avc_cache_threshold(struct file *file,
 					     size_t count, loff_t *ppos)
 
 {
-	struct selinux_fs_info *fsi = file_inode(file)->i_sb->s_fs_info;
-	struct selinux_state *state = fsi->state;
 	char *page;
 	ssize_t ret;
 	unsigned int new_value;
 
-	ret = selinuxfs_state_access(file);
-	if (ret)
-		return ret;
-
-	/*
-	 * Only check against the current namespace because
-	 * this operation only affects it and no others.
-	 */
-	ret = avc_has_perm(current_selinux_state,
-			   current_sid(), SECINITSID_SECURITY,
-			   SECCLASS_SECURITY, SECURITY__SETSECPARAM,
-			   NULL);
+	ret = selinuxfs_mutation_allowed(file, SECURITY__SETSECPARAM);
 	if (ret)
 		return ret;
 
@@ -2642,9 +1680,7 @@ static ssize_t sel_write_avc_cache_threshold(struct file *file,
 	if (sscanf(page, "%u", &new_value) != 1)
 		goto out;
 
-	ret = avc_set_cache_threshold(state->avc, new_value);
-	if (ret)
-		goto out;
+	avc_set_cache_threshold(selinux_file_state(file)->avc, new_value);
 
 	ret = count;
 out:
@@ -2655,20 +1691,14 @@ out:
 static ssize_t sel_read_avc_hash_stats(struct file *filp, char __user *buf,
 				       size_t count, loff_t *ppos)
 {
-	struct selinux_fs_info *fsi = file_inode(filp)->i_sb->s_fs_info;
-	struct selinux_state *state = fsi->state;
 	char *page;
 	ssize_t length;
-	int rc = selinuxfs_state_access(filp);
-
-	if (rc)
-		return rc;
 
 	page = kmalloc(PAGE_SIZE, GFP_KERNEL);
 	if (!page)
 		return -ENOMEM;
 
-	length = avc_get_hash_stats(state->avc, page);
+	length = avc_get_hash_stats(selinux_file_state(filp)->avc, page);
 	if (length >= 0)
 		length = simple_read_from_buffer(buf, count, ppos, page, length);
 	kfree(page);
@@ -2679,20 +1709,14 @@ static ssize_t sel_read_avc_hash_stats(struct file *filp, char __user *buf,
 static ssize_t sel_read_sidtab_hash_stats(struct file *filp, char __user *buf,
 					size_t count, loff_t *ppos)
 {
-	struct selinux_fs_info *fsi = file_inode(filp)->i_sb->s_fs_info;
-	struct selinux_state *state = fsi->state;
 	char *page;
 	ssize_t length;
-	int rc = selinuxfs_state_access(filp);
-
-	if (rc)
-		return rc;
 
 	page = kmalloc(PAGE_SIZE, GFP_KERNEL);
 	if (!page)
 		return -ENOMEM;
 
-	length = security_sidtab_hash_stats(state, page);
+	length = security_sidtab_hash_stats(selinux_file_state(filp), page);
 	if (length >= 0)
 		length = simple_read_from_buffer(buf, count, ppos, page,
 						length);
@@ -2703,18 +1727,18 @@ static ssize_t sel_read_sidtab_hash_stats(struct file *filp, char __user *buf,
 
 static const struct file_operations sel_sidtab_hash_stats_ops = {
 	.read		= sel_read_sidtab_hash_stats,
-	.llseek		= selinuxfs_lseek,
+	.llseek		= generic_file_llseek,
 };
 
 static const struct file_operations sel_avc_cache_threshold_ops = {
 	.read		= sel_read_avc_cache_threshold,
 	.write		= sel_write_avc_cache_threshold,
-	.llseek		= selinuxfs_lseek,
+	.llseek		= generic_file_llseek,
 };
 
 static const struct file_operations sel_avc_hash_stats_ops = {
 	.read		= sel_read_avc_hash_stats,
-	.llseek		= selinuxfs_lseek,
+	.llseek		= generic_file_llseek,
 };
 
 #ifdef CONFIG_SECURITY_SELINUX_AVC_STATS
@@ -2777,37 +1801,13 @@ static const struct seq_operations sel_avc_cache_stats_seq_ops = {
 
 static int sel_open_avc_cache_stats(struct inode *inode, struct file *file)
 {
-	int rc = selinuxfs_state_access(file);
-
-	if (rc)
-		return rc;
 	return seq_open(file, &sel_avc_cache_stats_seq_ops);
-}
-
-static ssize_t sel_read_avc_cache_stats(struct file *file, char __user *buf,
-					size_t size, loff_t *ppos)
-{
-	int rc = selinuxfs_state_access(file);
-
-	if (rc)
-		return rc;
-	return seq_read(file, buf, size, ppos);
-}
-
-static loff_t sel_lseek_avc_cache_stats(struct file *file, loff_t offset,
-					int whence)
-{
-	int rc = selinuxfs_state_access(file);
-
-	if (rc)
-		return rc;
-	return seq_lseek(file, offset, whence);
 }
 
 static const struct file_operations sel_avc_cache_stats_ops = {
 	.open		= sel_open_avc_cache_stats,
-	.read		= sel_read_avc_cache_stats,
-	.llseek		= sel_lseek_avc_cache_stats,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
 	.release	= seq_release,
 };
 #endif
@@ -2872,38 +1872,27 @@ static int sel_make_ss_files(struct dentry *dir)
 static ssize_t sel_read_initcon(struct file *file, char __user *buf,
 				size_t count, loff_t *ppos)
 {
-	struct selinux_fs_info *fsi = file_inode(file)->i_sb->s_fs_info;
-	const char *con;
-	char *con2;
+	char *con;
 	u32 sid, len;
 	ssize_t ret;
 
-	ret = selinuxfs_state_access(file);
+	sid = file_inode(file)->i_ino&SEL_INO_MASK;
+	ret = security_sid_to_context(
+		selinux_file_state(file),
+		sid,
+		&con,
+		&len);
 	if (ret)
 		return ret;
-	sid = file_inode(file)->i_ino&SEL_INO_MASK;
-	rcu_read_lock();
-	ret = selinux_ss_sid_to_context(fsi->state, sid, &con, &len);
-	if (ret)
-		goto err;
-	con2 = kmemdup(con, len, GFP_ATOMIC);
-	if (!con2) {
-		ret = -ENOMEM;
-		goto err;
-	}
-	rcu_read_unlock();
 
-	ret = simple_read_from_buffer(buf, count, ppos, con2, len);
-	kfree(con2);
-	return ret;
-err:
-	rcu_read_unlock();
+	ret = simple_read_from_buffer(buf, count, ppos, con, len);
+	kfree(con);
 	return ret;
 }
 
 static const struct file_operations sel_initcon_ops = {
 	.read		= sel_read_initcon,
-	.llseek		= selinuxfs_lseek,
+	.llseek		= generic_file_llseek,
 };
 
 static int sel_make_initcon_files(struct dentry *dir)
@@ -2955,18 +1944,13 @@ static ssize_t sel_read_class(struct file *file, char __user *buf,
 {
 	unsigned long ino = file_inode(file)->i_ino;
 	char res[TMPBUFLEN];
-	ssize_t len;
-	int rc = selinuxfs_state_access(file);
-
-	if (rc)
-		return rc;
-	len = scnprintf(res, sizeof(res), "%d", sel_ino_to_class(ino));
+	ssize_t len = scnprintf(res, sizeof(res), "%d", sel_ino_to_class(ino));
 	return simple_read_from_buffer(buf, count, ppos, res, len);
 }
 
 static const struct file_operations sel_class_ops = {
 	.read		= sel_read_class,
-	.llseek		= selinuxfs_lseek,
+	.llseek		= generic_file_llseek,
 };
 
 static ssize_t sel_read_perm(struct file *file, char __user *buf,
@@ -2974,34 +1958,26 @@ static ssize_t sel_read_perm(struct file *file, char __user *buf,
 {
 	unsigned long ino = file_inode(file)->i_ino;
 	char res[TMPBUFLEN];
-	ssize_t len;
-	int rc = selinuxfs_state_access(file);
-
-	if (rc)
-		return rc;
-	len = scnprintf(res, sizeof(res), "%d", sel_ino_to_perm(ino));
+	ssize_t len = scnprintf(res, sizeof(res), "%d", sel_ino_to_perm(ino));
 	return simple_read_from_buffer(buf, count, ppos, res, len);
 }
 
 static const struct file_operations sel_perm_ops = {
 	.read		= sel_read_perm,
-	.llseek		= selinuxfs_lseek,
+	.llseek		= generic_file_llseek,
 };
 
 static ssize_t sel_read_policycap(struct file *file, char __user *buf,
 				  size_t count, loff_t *ppos)
 {
-	struct selinux_fs_info *fsi = file_inode(file)->i_sb->s_fs_info;
 	int value;
 	char tmpbuf[TMPBUFLEN];
 	ssize_t length;
 	unsigned long i_ino = file_inode(file)->i_ino;
-	int rc = selinuxfs_state_access(file);
 
-	if (rc)
-		return rc;
-
-	value = security_policycap_supported(fsi->state, i_ino & SEL_INO_MASK);
+	value = security_policycap_supported(
+		selinux_file_state(file),
+		i_ino & SEL_INO_MASK);
 	length = scnprintf(tmpbuf, TMPBUFLEN, "%d", value);
 
 	return simple_read_from_buffer(buf, count, ppos, tmpbuf, length);
@@ -3009,7 +1985,7 @@ static ssize_t sel_read_policycap(struct file *file, char __user *buf,
 
 static const struct file_operations sel_policycap_ops = {
 	.read		= sel_read_policycap,
-	.llseek		= selinuxfs_lseek,
+	.llseek		= generic_file_llseek,
 };
 
 static int sel_make_perm_files(struct selinux_policy *newpolicy,
@@ -3149,7 +2125,7 @@ static struct dentry *sel_make_dir(struct dentry *dir, const char *name,
 		return ERR_PTR(-ENOMEM);
 
 	inode->i_op = &simple_dir_inode_operations;
-	inode->i_fop = &selinuxfs_dir_operations;
+	inode->i_fop = &simple_dir_operations;
 	inode->i_ino = ++(*ino);
 	/* directory inodes start off with i_nlink == 2 (for "." entry) */
 	inc_nlink(inode);
@@ -3203,7 +2179,6 @@ static int sel_fill_super(struct super_block *sb, struct fs_context *fc)
 	int ret;
 	struct dentry *dentry;
 	struct inode *inode;
-	struct inode_security_struct *isec;
 
 	static const struct tree_descr selinux_files[] = {
 		[SEL_LOAD] = {"load", &sel_load_ops, S_IRUSR|S_IWUSR},
@@ -3225,20 +2200,15 @@ static int sel_fill_super(struct super_block *sb, struct fs_context *fc)
 		[SEL_POLICY] = {"policy", &sel_policy_ops, S_IRUGO},
 		[SEL_VALIDATE_TRANS] = {"validatetrans", &sel_transition_ops,
 					S_IWUGO},
-#ifdef CONFIG_SECURITY_SELINUX_NS
 		[SEL_MAXNS] = {"maxns", &sel_maxns_ops, 0600},
 		[SEL_MAXNSDEPTH] = {"maxnsdepth", &sel_maxnsdepth_ops, 0600},
-		[SEL_NS_CREATE] = {"ns_create", &selinux_ns_create_ops, 0600},
-#endif
-		[SEL_POLICY_MAX_BYTES] = {"policy_max_bytes",
-					  &sel_policy_max_bytes_ops, 0444},
+		[SEL_NS_CREATE] = {"ns_create", &sel_ns_create_ops, S_IRUSR},
 		/* last one */ {"", NULL, 0}
 	};
 
 	ret = simple_fill_super(sb, SELINUX_MAGIC, selinux_files);
 	if (ret)
 		goto err;
-	sb->s_root->d_inode->i_fop = &selinuxfs_dir_operations;
 
 	fsi = sb->s_fs_info;
 	fsi->sb = sb;
@@ -3255,37 +2225,15 @@ static int sel_fill_super(struct super_block *sb, struct fs_context *fc)
 		goto err;
 
 	inode->i_ino = ++fsi->last_ino;
-	isec = selinux_inode(inode);
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	{
-		struct selinux_global_sid_handle *sid_handle;
-		u16 sclass = SECCLASS_CHR_FILE;
-
-		sid_handle = global_sid_handle_get(SECINITSID_DEVNULL);
-		if (IS_ERR(sid_handle)) {
-			ret = PTR_ERR(sid_handle);
-			iput(inode);
-			goto err;
-		}
-		if (global_sid_handle_sid(sid_handle) != SECINITSID_DEVNULL) {
-			global_sid_handle_put(sid_handle);
-			ret = -ESTALE;
-			iput(inode);
-			goto err;
-		}
-		ret = selinux_inode_security_take_sid_handle(
-			isec, sid_handle, &sclass,
-			SELINUX_LABEL_SOURCE_KERNEL_INITIAL, LABEL_INITIALIZED);
-		if (ret) {
-			iput(inode);
-			goto err;
-		}
-	}
-#else
-	isec->sid = SECINITSID_DEVNULL;
-	isec->sclass = SECCLASS_CHR_FILE;
-	isec->initialized = LABEL_INITIALIZED;
-#endif
+	ret = selinuxfs_inode_set_label(
+		fsi->state,
+		NULL,
+		inode,
+		"/null",
+		SECCLASS_CHR_FILE,
+		SECINITSID_DEVNULL);
+	if (ret)
+		goto err;
 
 	init_special_inode(inode, S_IFCHR | S_IRUGO | S_IWUGO, MKDEV(MEM_MAJOR, 3));
 	ret = sel_attach_file(sb->s_root, NULL_FILE_NAME, inode);
@@ -3349,31 +2297,27 @@ err:
 	return ret;
 }
 
-static int selinuxfs_compare(struct super_block *sb, struct fs_context *fc)
+static int selinuxfs_compare(
+	struct super_block *sb,
+	struct fs_context *fc)
 {
-	struct selinux_fs_info *fsi = sb->s_fs_info;
+	const struct selinux_fs_info *existing = sb->s_fs_info;
+	const struct selinux_fs_info *requested = fc->s_fs_info;
 
 	/*
 	 * The state selects the policy authority; the user namespace selects
-	 * inode ownership and the VFS capability domain.  Matching only the state
-	 * makes sget_fc() find a superblock owned by another user namespace and
-	 * reject an otherwise authorized rootless mount with -EBUSY.
+	 * inode ownership and the VFS capability domain. Both are part of the
+	 * identity of a selinuxfs instance.
 	 */
-	return current_selinux_state == fsi->state &&
+	return existing->state == requested->state &&
 	       sb->s_user_ns == fc->user_ns;
 }
 
 static int sel_get_tree(struct fs_context *fc)
 {
-	struct selinux_fs_info *fsi;
 	struct super_block *sb;
 	int err;
 
-	fsi = selinux_fs_info_create();
-	if (!fsi)
-		return -ENOMEM;
-
-	fc->s_fs_info = fsi;
 	sb = sget_fc(fc, selinuxfs_compare, set_anon_super_fc);
 	if (IS_ERR(sb))
 		return PTR_ERR(sb);
@@ -3394,15 +2338,19 @@ static int sel_get_tree(struct fs_context *fc)
 static void sel_free_fs_context(struct fs_context *fc)
 {
 	selinux_fs_info_free(fc->s_fs_info);
+	fc->s_fs_info = NULL;
 }
 
 static const struct fs_context_operations sel_context_ops = {
-	.free		= sel_free_fs_context,
 	.get_tree	= sel_get_tree,
+	.free		= sel_free_fs_context,
 };
 
 static int sel_init_fs_context(struct fs_context *fc)
 {
+	fc->s_fs_info = selinux_fs_info_create(current_selinux_state);
+	if (!fc->s_fs_info)
+		return -ENOMEM;
 	fc->ops = &sel_context_ops;
 	return 0;
 }
@@ -3419,9 +2367,7 @@ static struct file_system_type sel_fs_type = {
 	.name		= "selinuxfs",
 	.init_fs_context = sel_init_fs_context,
 	.kill_sb	= sel_kill_sb,
-#ifdef CONFIG_SECURITY_SELINUX_NS
 	.fs_flags	= FS_USERNS_MOUNT,
-#endif
 };
 
 struct path selinux_null __ro_after_init;
@@ -3433,12 +2379,6 @@ int __init init_sel_fs(void)
 
 	if (!selinux_enabled_boot)
 		return 0;
-
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	err = selinuxfs_mm_vmas_init();
-	if (err)
-		return err;
-#endif
 
 	err = sysfs_create_mount_point(fs_kobj, "selinux");
 	if (err)
@@ -3471,7 +2411,7 @@ int __init init_sel_fs(void)
 	 * Try to pre-allocate the status page, so the sequence number of the
 	 * initial policy load can be stored.
 	 */
-	(void) selinux_kernel_status_page(current_selinux_state);
+	(void)selinux_kernel_status_page(init_selinux_state);
 
 	return err;
 }

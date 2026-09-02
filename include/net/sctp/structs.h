@@ -1545,9 +1545,7 @@ struct sctp_priv_assoc_stats {
 
 /* Here we have information about each individual association. */
 struct sctp_association {
-	/* Composite LSM blob owned by this association. */
 	void *security;
-	bool security_initialized;
 
 	/* A base structure common to endpoint and association.
 	 * In this context, it represents the associations's view
@@ -2076,16 +2074,6 @@ struct sctp_association {
 
 	__u64 abandoned_unsent[SCTP_PR_INDEX(MAX) + 1];
 	__u64 abandoned_sent[SCTP_PR_INDEX(MAX) + 1];
-
-	/* Security identifiers from incoming (INIT). These are set by
-	 * security_sctp_assoc_request(). These will only be used by
-	 * SCTP TCP type sockets and peeled off connections as they
-	 * cause a new socket to be generated. security_sctp_sk_clone()
-	 * will then plug these into the new socket.
-	 */
-
-	u32 secid;
-	u32 peer_secid;
 
 	struct rcu_head rcu;
 };

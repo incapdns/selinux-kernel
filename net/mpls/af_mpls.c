@@ -657,12 +657,7 @@ static struct net_device *inet6_fib_lookup_dev(struct net *net,
 
 	memset(&fl6, 0, sizeof(fl6));
 	memcpy(&fl6.daddr, addr, sizeof(struct in6_addr));
-	{
-		struct xfrm_flow_origin origin = xfrm_flow_origin_none();
-
-		dst = ip6_dst_lookup_flow_origin(net, NULL, &fl6, NULL,
-						 &origin);
-	}
+	dst = ip6_dst_lookup_flow(net, NULL, &fl6, NULL);
 	if (IS_ERR(dst))
 		return ERR_CAST(dst);
 

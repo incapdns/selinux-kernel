@@ -2686,7 +2686,7 @@ static int smb2_set_ea(struct smb2_ea_info *eabuf, unsigned int buf_len,
 
 		if (!eabuf->EaValueLength) {
 			rc = ksmbd_vfs_casexattr_len(idmap,
-						     path,
+						     path->dentry,
 						     attr_name,
 						     XATTR_USER_PREFIX_LEN +
 						     eabuf->EaNameLength);
@@ -2763,7 +2763,7 @@ static noinline int smb2_set_stream_name_xattr(const struct path *path,
 
 	/* Check if there is stream prefix in xattr space */
 	rc = ksmbd_vfs_casexattr_len(idmap,
-				     path,
+				     path->dentry,
 				     xattr_stream_name,
 				     xattr_stream_size);
 	if (rc >= 0)
@@ -2787,7 +2787,7 @@ static int smb2_remove_smb_xattrs(const struct path *path)
 	ssize_t xattr_list_len;
 	int err = 0;
 
-	xattr_list_len = ksmbd_vfs_listxattr(path, &xattr_list);
+	xattr_list_len = ksmbd_vfs_listxattr(path->dentry, &xattr_list);
 	if (xattr_list_len < 0) {
 		goto out;
 	} else if (!xattr_list_len) {
@@ -2868,7 +2868,7 @@ static void smb2_update_xattrs(struct ksmbd_tree_connect *tcon,
 		return;
 
 	rc = ksmbd_vfs_get_dos_attrib_xattr(mnt_idmap(path->mnt),
-					    path, &da);
+					    path->dentry, &da);
 	if (rc > 0) {
 		fp->f_ci->m_fattr = cpu_to_le32(da.attr);
 		fp->create_time = da.create_time;
@@ -3610,7 +3610,9 @@ int smb2_open(struct ksmbd_work *work)
 		if (!file_present) {
 			daccess = cpu_to_le32(GENERIC_ALL_FLAGS);
 		} else {
-			ksmbd_vfs_query_maximal_access(idmap, &path, &daccess);
+			ksmbd_vfs_query_maximal_access(idmap,
+							    path.dentry,
+							    &daccess);
 			already_permitted = true;
 		}
 		maximal_access = daccess;
@@ -3667,17 +3669,17 @@ int smb2_open(struct ksmbd_work *work)
 		 * is already granted.
 		 */
 		if (daccess & ~(FILE_READ_ATTRIBUTES_LE | FILE_READ_CONTROL_LE)) {
-			rc = inode_permission_mnt(idmap, path.mnt,
-						  d_inode(path.dentry), may_flags);
+			rc = inode_permission(idmap,
+					      d_inode(path.dentry),
+					      may_flags);
 			if (rc)
 				goto err_out;
 
 			if ((daccess & FILE_DELETE_LE) ||
 			    (req->CreateOptions & FILE_DELETE_ON_CLOSE_LE)) {
-				rc = inode_permission_mnt(
-					idmap, path.mnt,
-					d_inode(path.dentry->d_parent),
-					MAY_EXEC | MAY_WRITE);
+				rc = inode_permission(idmap,
+						      d_inode(path.dentry->d_parent),
+						      MAY_EXEC | MAY_WRITE);
 				if (rc)
 					goto err_out;
 			}
@@ -3980,7 +3982,7 @@ int smb2_open(struct ksmbd_work *work)
 	if (!created)
 		smb2_update_xattrs(tcon, &path, fp);
 
-	ksmbd_vfs_update_compressed_fattr(&path, &fp->f_ci->m_fattr);
+	ksmbd_vfs_update_compressed_fattr(path.dentry, &fp->f_ci->m_fattr);
 
 	if (created)
 		smb2_new_xattrs(tcon, &path, fp);
@@ -4072,7 +4074,8 @@ reconnected_fp:
 		struct create_context *mxac_ccontext;
 
 		if (maximal_access == 0)
-			ksmbd_vfs_query_maximal_access(idmap, &path,
+			ksmbd_vfs_query_maximal_access(idmap,
+						       path.dentry,
 						       &maximal_access);
 		mxac_ccontext = (struct create_context *)(rsp->Buffer +
 				le32_to_cpu(rsp->CreateContextsLength));
@@ -4573,11 +4576,10 @@ static int process_query_dir_entries(struct smb2_query_dir_private *priv)
 		if (dentry_name(priv->d_info, priv->info_level))
 			return -EINVAL;
 
-		dent = lookup_one_unlocked_mnt(
-			idmap, priv->dir_fp->filp->f_path.mnt,
-			&QSTR_LEN(priv->d_info->name,
-				  priv->d_info->name_len),
-			priv->dir_fp->filp->f_path.dentry);
+		dent = lookup_one_unlocked(idmap,
+					   &QSTR_LEN(priv->d_info->name,
+						     priv->d_info->name_len),
+					   priv->dir_fp->filp->f_path.dentry);
 
 		if (IS_ERR(dent)) {
 			ksmbd_debug(SMB, "Cannot lookup `%s' [%ld]\n",
@@ -4850,7 +4852,9 @@ int smb2_query_dir(struct ksmbd_work *work)
 	}
 
 	if (!(dir_fp->daccess & FILE_LIST_DIRECTORY_LE) ||
-	    file_permission(dir_fp->filp, MAY_READ | MAY_EXEC)) {
+	    inode_permission(file_mnt_idmap(dir_fp->filp),
+			     file_inode(dir_fp->filp),
+			     MAY_READ | MAY_EXEC)) {
 		pr_err("no right to enumerate directory (%pD)\n", dir_fp->filp);
 		rc = -EACCES;
 		goto err_out2;
@@ -5167,7 +5171,7 @@ static int smb2_get_ea(struct ksmbd_work *work, struct ksmbd_file *fp,
 	if (buf_free_len < 0)
 		return -EINVAL;
 
-	rc = ksmbd_vfs_listxattr(path, &xattr_list);
+	rc = ksmbd_vfs_listxattr(path->dentry, &xattr_list);
 	if (rc < 0) {
 		rsp->hdr.Status = STATUS_INVALID_HANDLE;
 		goto out;
@@ -5217,7 +5221,7 @@ static int smb2_get_ea(struct ksmbd_work *work, struct ksmbd_file *fp,
 		buf_free_len -= (offsetof(struct smb2_ea_info, name) +
 				name_len + 1);
 		/* bailout if xattr can't fit in buf_free_len */
-		value_len = ksmbd_vfs_getxattr(idmap, path,
+		value_len = ksmbd_vfs_getxattr(idmap, path->dentry,
 					       name, &buf);
 		if (value_len <= 0) {
 			rc = -ENOENT;
@@ -5506,7 +5510,7 @@ static int get_file_stream_info(struct ksmbd_work *work,
 	if (buf_free_len < 0)
 		goto out;
 
-	xattr_list_len = ksmbd_vfs_listxattr(path, &xattr_list);
+	xattr_list_len = ksmbd_vfs_listxattr(path->dentry, &xattr_list);
 	if (xattr_list_len < 0) {
 		goto out;
 	} else if (!xattr_list_len) {
@@ -5991,7 +5995,7 @@ static int smb2_get_info_filesystem(struct ksmbd_work *work,
 			FILE_UNICODE_ON_DISK |
 			FILE_SUPPORTS_BLOCK_REFCOUNTING;
 
-		err = vfs_fileattr_get_mnt(path.mnt, path.dentry, &fa);
+		err = vfs_fileattr_get(path.dentry, &fa);
 		/*
 		 * -EINVAL, -EOPNOTSUPP: ntfs-3g and other FUSE
 		 * filesystems that lack FS_IOC_FSGETXATTR support.
@@ -6230,7 +6234,7 @@ static int smb2_get_info_sec(struct ksmbd_work *work,
 	if (test_share_config_flag(work->tcon->share_conf,
 				   KSMBD_SHARE_FLAG_ACL_XATTR))
 		ppntsd_size = ksmbd_vfs_get_sd_xattr(work->conn, idmap,
-						     &fp->filp->f_path,
+						     fp->filp->f_path.dentry,
 						     &ppntsd);
 
 	/* Check if sd buffer size exceeds response buffer size */
@@ -6752,8 +6756,7 @@ static int set_file_basic_info(struct ksmbd_file *fp,
 			return -EACCES;
 
 		inode_lock(inode);
-		rc = notify_change_mnt(idmap, filp->f_path.mnt, dentry, &attrs,
-				       NULL);
+		rc = notify_change(idmap, dentry, &attrs, NULL);
 		inode_unlock(inode);
 	}
 	return rc;
@@ -8824,7 +8827,7 @@ static inline int fsctl_set_sparse(struct ksmbd_work *work, u64 id,
 		struct xattr_dos_attrib da;
 
 		ret = ksmbd_vfs_get_dos_attrib_xattr(idmap,
-						     &fp->filp->f_path, &da);
+						     fp->filp->f_path.dentry, &da);
 		if (ret <= 0)
 			goto out;
 

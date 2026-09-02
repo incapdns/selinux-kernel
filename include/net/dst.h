@@ -501,23 +501,11 @@ enum {
 };
 
 struct flowi;
-struct xfrm_flow_origin;
 #ifndef CONFIG_XFRM
 static inline struct dst_entry *xfrm_lookup(struct net *net,
 					    struct dst_entry *dst_orig,
 					    const struct flowi *fl,
 					    const struct sock *sk,
-					    int flags)
-{
-	return dst_orig;
-}
-
-static inline struct dst_entry *xfrm_lookup_origin(
-					    struct net *net,
-					    struct dst_entry *dst_orig,
-					    const struct flowi *fl,
-					    const struct sock *sk,
-					    const struct xfrm_flow_origin *origin,
 					    int flags)
 {
 	return dst_orig;
@@ -531,33 +519,11 @@ xfrm_lookup_with_ifid(struct net *net, struct dst_entry *dst_orig,
 	return dst_orig;
 }
 
-static inline struct dst_entry *xfrm_lookup_with_ifid_origin(
-					    struct net *net,
-					    struct dst_entry *dst_orig,
-					    const struct flowi *fl,
-					    const struct sock *sk,
-					    const struct xfrm_flow_origin *origin,
-					    int flags, u32 if_id)
-{
-	return dst_orig;
-}
-
 static inline struct dst_entry *xfrm_lookup_route(struct net *net,
 						  struct dst_entry *dst_orig,
 						  const struct flowi *fl,
 						  const struct sock *sk,
 						  int flags)
-{
-	return dst_orig;
-}
-
-static inline struct dst_entry *xfrm_lookup_route_origin(
-					    struct net *net,
-					    struct dst_entry *dst_orig,
-					    const struct flowi *fl,
-					    const struct sock *sk,
-					    const struct xfrm_flow_origin *origin,
-					    int flags)
 {
 	return dst_orig;
 }
@@ -568,18 +534,9 @@ static inline struct xfrm_state *dst_xfrm(const struct dst_entry *dst)
 }
 
 #else
-struct dst_entry *xfrm_lookup(struct net *net,
-			      struct dst_entry *dst_orig,
+struct dst_entry *xfrm_lookup(struct net *net, struct dst_entry *dst_orig,
 			      const struct flowi *fl, const struct sock *sk,
 			      int flags);
-
-struct dst_entry *xfrm_lookup_origin(
-				     struct net *net,
-				     struct dst_entry *dst_orig,
-				     const struct flowi *fl,
-				     const struct sock *sk,
-				     const struct xfrm_flow_origin *origin,
-				     int flags);
 
 struct dst_entry *xfrm_lookup_with_ifid(struct net *net,
 					struct dst_entry *dst_orig,
@@ -587,26 +544,9 @@ struct dst_entry *xfrm_lookup_with_ifid(struct net *net,
 					const struct sock *sk, int flags,
 					u32 if_id);
 
-struct dst_entry *xfrm_lookup_with_ifid_origin(
-					struct net *net,
-					struct dst_entry *dst_orig,
-					const struct flowi *fl,
-					const struct sock *sk,
-					const struct xfrm_flow_origin *origin,
-					int flags, u32 if_id);
-
-struct dst_entry *xfrm_lookup_route(
-				    struct net *net, struct dst_entry *dst_orig,
+struct dst_entry *xfrm_lookup_route(struct net *net, struct dst_entry *dst_orig,
 				    const struct flowi *fl, const struct sock *sk,
 				    int flags);
-
-struct dst_entry *xfrm_lookup_route_origin(
-					struct net *net,
-					struct dst_entry *dst_orig,
-					const struct flowi *fl,
-					const struct sock *sk,
-					const struct xfrm_flow_origin *origin,
-					int flags);
 
 /* skb attached with this dst needs transformation if dst->xfrm is valid */
 static inline struct xfrm_state *dst_xfrm(const struct dst_entry *dst)

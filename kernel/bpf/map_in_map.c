@@ -3,7 +3,6 @@
  */
 #include <linux/slab.h>
 #include <linux/bpf.h>
-#include <linux/security.h>
 #include <linux/btf.h>
 
 #include "map_in_map.h"
@@ -12,15 +11,11 @@ struct bpf_map *bpf_map_meta_alloc(int inner_map_ufd)
 {
 	struct bpf_map *inner_map, *inner_map_meta;
 	u32 inner_map_meta_size;
-	int err;
 	CLASS(fd, f)(inner_map_ufd);
 
 	inner_map = __bpf_map_get(f);
 	if (IS_ERR(inner_map))
 		return inner_map;
-	err = security_bpf_map(inner_map, fd_file(f)->f_mode);
-	if (err)
-		return ERR_PTR(err);
 
 	/* Does not support >1 level map-in-map */
 	if (inner_map->inner_map_meta)
@@ -102,15 +97,11 @@ void *bpf_map_fd_get_ptr(struct bpf_map *map,
 			 int ufd)
 {
 	struct bpf_map *inner_map, *inner_map_meta;
-	int err;
 	CLASS(fd, f)(ufd);
 
 	inner_map = __bpf_map_get(f);
 	if (IS_ERR(inner_map))
 		return inner_map;
-	err = security_bpf_map(inner_map, fd_file(f)->f_mode);
-	if (err)
-		return ERR_PTR(err);
 	if (inner_map->excl_prog_sha)
 		return ERR_PTR(-ENOTSUPP);
 

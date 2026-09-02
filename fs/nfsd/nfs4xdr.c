@@ -3947,8 +3947,7 @@ nfsd4_encode_fattr4(struct svc_rqst *rqstp, struct xdr_stream *xdr,
 	    (attrmask[1] & (FATTR4_WORD1_TIME_ACCESS |
 			    FATTR4_WORD1_TIME_MODIFY |
 			    FATTR4_WORD1_TIME_METADATA))) {
-		status = nfsd4_deleg_getattr_conflict(rqstp, path.mnt,
-						       dentry, &dp);
+		status = nfsd4_deleg_getattr_conflict(rqstp, dentry, &dp);
 		if (status)
 			goto out;
 	}
@@ -4026,8 +4025,7 @@ nfsd4_encode_fattr4(struct svc_rqst *rqstp, struct xdr_stream *xdr,
 		 */
 		if (case_cache && !d_is_dir(dentry)) {
 			if (!case_cache->valid) {
-				err = nfsd_get_case_info(fhp->fh_export->ex_path.mnt,
-							 case_cache->dir,
+				err = nfsd_get_case_info(case_cache->dir,
 							 &case_cache->insensitive,
 							 &case_cache->preserving);
 				if (err && err != -EOPNOTSUPP)
@@ -4037,8 +4035,7 @@ nfsd4_encode_fattr4(struct svc_rqst *rqstp, struct xdr_stream *xdr,
 			args.case_insensitive = case_cache->insensitive;
 			args.case_preserving = case_cache->preserving;
 		} else {
-			err = nfsd_get_case_info(fhp->fh_export->ex_path.mnt,
-					 dentry,
+			err = nfsd_get_case_info(dentry,
 						 &args.case_insensitive,
 						 &args.case_preserving);
 			if (err && err != -EOPNOTSUPP)
@@ -4241,9 +4238,9 @@ nfsd4_encode_entry4_fattr(struct nfsd4_readdir *cd, const char *name,
 	int ignore_crossmnt = 0;
 	bool crossed = false;
 
-	dentry = lookup_one_positive_unlocked_mnt(
-		&nop_mnt_idmap, exp->ex_path.mnt,
-		&QSTR_LEN(name, namlen), cd->rd_fhp->fh_dentry);
+	dentry = lookup_one_positive_unlocked(&nop_mnt_idmap,
+					      &QSTR_LEN(name, namlen),
+					      cd->rd_fhp->fh_dentry);
 	if (IS_ERR(dentry))
 		return nfserrno(PTR_ERR(dentry));
 

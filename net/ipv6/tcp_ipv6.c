@@ -285,12 +285,7 @@ static int tcp_v6_connect(struct sock *sk, struct sockaddr_unsized *uaddr,
 	 */
 	ip6_ecmp_set_mp_hash(net, fl6, sk->sk_txhash);
 
-	{
-		struct xfrm_flow_origin origin = xfrm_flow_origin_sock(sk);
-
-		dst = ip6_dst_lookup_flow_origin(net, sk, fl6, final_p,
-						 &origin);
-	}
+	dst = ip6_dst_lookup_flow(net, sk, fl6, final_p);
 	if (IS_ERR(dst)) {
 		err = PTR_ERR(dst);
 		goto failure;
@@ -990,16 +985,10 @@ static void tcp_v6_send_response(const struct sock *sk, struct sk_buff *skb, u32
 	 * Underlying function will use this to retrieve the network
 	 * namespace
 	 */
-	{
-		struct xfrm_flow_origin origin = xfrm_flow_origin_skb(skb);
-
-		if (sk && sk->sk_state != TCP_TIME_WAIT)
-			dst = ip6_dst_lookup_flow_origin(net, sk, &fl6, NULL,
-							&origin);
-		else
-			dst = ip6_dst_lookup_flow_origin(net, ctl_sk, &fl6, NULL,
-							&origin);
-	}
+	if (sk && sk->sk_state != TCP_TIME_WAIT)
+		dst = ip6_dst_lookup_flow(net, sk, &fl6, NULL); /*sk's xfrm_policy can be referred*/
+	else
+		dst = ip6_dst_lookup_flow(net, ctl_sk, &fl6, NULL);
 	if (!IS_ERR(dst)) {
 		skb_dst_set(buff, dst);
 		ip6_xmit(ctl_sk, buff, &fl6, fl6.flowi6_mark, NULL,

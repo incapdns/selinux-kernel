@@ -9,6 +9,7 @@
 #include <linux/pid_namespace.h>
 
 struct path;
+struct file;
 struct task_struct;
 struct proc_ns_operations;
 
@@ -21,15 +22,10 @@ int ns_get_path_cb(struct path *path, ns_get_path_helper_t ns_get_cb,
 bool ns_match(const struct ns_common *ns, dev_t dev, ino_t ino);
 
 int ns_get_name(char *buf, size_t size, struct task_struct *task,
-			const struct proc_ns_operations *ns_ops);
-void nsfs_init(void);
-int open_namespace(struct ns_common *ns);
+		 const struct proc_ns_operations *ns_ops);
 struct file *open_namespace_file(struct ns_common *ns);
-
-#if IS_ENABLED(CONFIG_KUNIT)
-bool nsfs_kunit_handle_fields_valid(u64 ns_id, u32 ns_inum, u32 ns_type);
-void nsfs_kunit_fail_security_init_once(struct ns_common *ns, int error);
-#endif
+int open_namespace(struct ns_common *ns);
+void nsfs_init(void);
 
 #define __current_namespace_from_type(__ns)				\
 	_Generic((__ns),						\

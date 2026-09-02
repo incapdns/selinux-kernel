@@ -83,7 +83,7 @@ int ovl_copy_xattr(struct super_block *sb, const struct path *oldpath, struct de
 	if (!old->d_inode->i_op->listxattr || !new->d_inode->i_op->listxattr)
 		return 0;
 
-	list_size = vfs_listxattr_mnt(oldpath->mnt, old, NULL, 0);
+	list_size = vfs_listxattr(old, NULL, 0);
 	if (list_size <= 0) {
 		if (list_size == -EOPNOTSUPP)
 			return 0;
@@ -94,7 +94,7 @@ int ovl_copy_xattr(struct super_block *sb, const struct path *oldpath, struct de
 	if (!buf)
 		return -ENOMEM;
 
-	list_size = vfs_listxattr_mnt(oldpath->mnt, old, buf, list_size);
+	list_size = vfs_listxattr(old, buf, list_size);
 	if (list_size <= 0) {
 		error = list_size;
 		goto out;
@@ -113,7 +113,7 @@ int ovl_copy_xattr(struct super_block *sb, const struct path *oldpath, struct de
 		if (ovl_is_private_xattr(sb, name))
 			continue;
 
-		error = security_inode_copy_up_xattr(oldpath->mnt, old, name);
+		error = security_inode_copy_up_xattr(old, name);
 		if (error == -ECANCELED) {
 			error = 0;
 			continue; /* Discard */
@@ -557,8 +557,6 @@ static int ovl_create_index(struct dentry *dentry, const struct ovl_fh *fh,
 		goto out;
 
 	rd.mnt_idmap = ovl_upper_mnt_idmap(ofs);
-	rd.old_mnt = ovl_upper_mnt(ofs);
-	rd.new_mnt = ovl_upper_mnt(ofs);
 	rd.old_parent = indexdir;
 	rd.new_parent = indexdir;
 	err = start_renaming_dentry(&rd, 0, temp, &name);
@@ -592,8 +590,6 @@ struct ovl_copy_up_ctx {
 	bool metacopy;
 	bool metacopy_digest;
 	bool metadata_fsync;
-	/* Extra reference retaining LSM pre-copy state until the post hook. */
-	const struct cred *copy_up_cred;
 };
 
 static int ovl_link_up(struct ovl_copy_up_ctx *c)
@@ -728,39 +724,19 @@ static int ovl_copy_up_metadata(struct ovl_copy_up_ctx *c, struct dentry *temp)
 	return err;
 }
 
-static const struct cred *
-ovl_prepare_copy_up_creds(struct ovl_copy_up_ctx *ctx)
+static const struct cred *ovl_prepare_copy_up_creds(struct dentry *dentry)
 {
 	struct cred *copy_up_cred = NULL;
-	struct ovl_fs *ofs = OVL_FS(ctx->dentry->d_sb);
 	int err;
 
-	err = security_inode_copy_up(&ctx->lowerpath, ovl_upper_mnt(ofs),
-				     &copy_up_cred);
-	if (err < 0) {
-		/*
-		 * The LSM stack transfers ownership through @copy_up_cred as soon
-		 * as any hook publishes a prepared credential.  A later hook may
-		 * still reject the operation, so the caller must release that
-		 * partial stacked result on the aggregate error path.
-		 */
-		if (copy_up_cred)
-			abort_creds(copy_up_cred);
+	err = security_inode_copy_up(dentry, &copy_up_cred);
+	if (err < 0)
 		return ERR_PTR(err);
-	}
 
 	if (!copy_up_cred)
 		return NULL;
 
-	ctx->copy_up_cred = get_cred(copy_up_cred);
 	return override_creds(copy_up_cred);
-}
-
-static void ovl_copy_up_cred_put(struct ovl_copy_up_ctx *ctx)
-{
-	if (ctx->copy_up_cred)
-		put_cred(ctx->copy_up_cred);
-	ctx->copy_up_cred = NULL;
 }
 
 static void ovl_revert_copy_up_creds(const struct cred *orig_cred)
@@ -773,7 +749,7 @@ static void ovl_revert_copy_up_creds(const struct cred *orig_cred)
 
 DEFINE_CLASS(copy_up_creds, const struct cred *,
 	     if (!IS_ERR_OR_NULL(_T)) ovl_revert_copy_up_creds(_T),
-	     ovl_prepare_copy_up_creds(ctx), struct ovl_copy_up_ctx *ctx)
+	     ovl_prepare_copy_up_creds(dentry), struct dentry *dentry)
 
 /*
  * Copyup using workdir to prepare temp file.  Used when copying up directories,
@@ -794,7 +770,7 @@ static int ovl_copy_up_workdir(struct ovl_copy_up_ctx *c)
 		.link = c->link
 	};
 
-	scoped_class(copy_up_creds, copy_up_creds, c) {
+	scoped_class(copy_up_creds, copy_up_creds, c->dentry) {
 		if (IS_ERR(copy_up_creds))
 			return PTR_ERR(copy_up_creds);
 
@@ -804,20 +780,13 @@ static int ovl_copy_up_workdir(struct ovl_copy_up_ctx *c)
 	}
 
 	if (IS_ERR(temp))
-		goto out_cred;
+		return PTR_ERR(temp);
 
 	/*
 	 * Copy up data first and then xattrs. Writing data after
 	 * xattrs will remove security.capability xattr automatically.
 	 */
 	path.dentry = temp;
-	err = security_inode_copy_up_post(&c->lowerpath, ovl_upper_mnt(ofs),
-					  temp, c->copy_up_cred);
-	ovl_copy_up_cred_put(c);
-	if (err) {
-		ovl_start_write(c->dentry);
-		goto cleanup_unlocked;
-	}
 	err = ovl_copy_up_data(c, &path);
 	ovl_start_write(c->dentry);
 	if (err)
@@ -836,8 +805,6 @@ static int ovl_copy_up_workdir(struct ovl_copy_up_ctx *c)
 	 * temp wasn't moved before copy up completion or cleanup.
 	 */
 	rd.mnt_idmap = ovl_upper_mnt_idmap(ofs);
-	rd.old_mnt = ovl_upper_mnt(ofs);
-	rd.new_mnt = ovl_upper_mnt(ofs);
 	rd.old_parent = c->workdir;
 	rd.new_parent = c->destdir;
 	rd.flags = 0;
@@ -875,11 +842,6 @@ out:
 
 	return err;
 
-out_cred:
-	err = PTR_ERR(temp);
-	ovl_copy_up_cred_put(c);
-	return err;
-
 cleanup_unlocked:
 	ovl_cleanup(ofs, c->workdir, temp);
 	dput(temp);
@@ -895,7 +857,7 @@ static int ovl_copy_up_tmpfile(struct ovl_copy_up_ctx *c)
 	struct file *tmpfile;
 	int err;
 
-	scoped_class(copy_up_creds, copy_up_creds, c) {
+	scoped_class(copy_up_creds, copy_up_creds, c->dentry) {
 		if (IS_ERR(copy_up_creds))
 			return PTR_ERR(copy_up_creds);
 
@@ -905,14 +867,9 @@ static int ovl_copy_up_tmpfile(struct ovl_copy_up_ctx *c)
 	}
 
 	if (IS_ERR(tmpfile))
-		goto out_cred;
+		return PTR_ERR(tmpfile);
 
 	temp = tmpfile->f_path.dentry;
-	err = security_inode_copy_up_post(&c->lowerpath, ovl_upper_mnt(ofs),
-					  temp, c->copy_up_cred);
-	ovl_copy_up_cred_put(c);
-	if (err)
-		goto out_fput;
 	if (!c->metacopy && c->stat.size) {
 		err = ovl_copy_up_file(ofs, c->dentry, tmpfile, c->stat.size,
 				       !c->metadata_fsync);
@@ -960,11 +917,6 @@ out:
 	ovl_end_write(c->dentry);
 out_fput:
 	fput(tmpfile);
-	return err;
-
-out_cred:
-	err = PTR_ERR(tmpfile);
-	ovl_copy_up_cred_put(c);
 	return err;
 }
 
@@ -1230,8 +1182,7 @@ static int ovl_copy_up_one(struct dentry *parent, struct dentry *dentry,
 		ctx.stat.size = 0;
 
 	if (S_ISLNK(ctx.stat.mode)) {
-		ctx.link = vfs_get_link_mnt(ctx.lowerpath.mnt,
-					 ctx.lowerpath.dentry, &done);
+		ctx.link = vfs_get_link(ctx.lowerpath.dentry, &done);
 		if (IS_ERR(ctx.link))
 			return PTR_ERR(ctx.link);
 	}

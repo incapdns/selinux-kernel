@@ -62,7 +62,7 @@ void dm_audit_log_ti(int audit_type, const char *dm_msg_prefix, const char *op,
 	}
 
 	audit_log_format(ab, " res=%d", result);
-	(void)audit_log_end_status(ab);
+	audit_log_end(ab);
 }
 EXPORT_SYMBOL_GPL(dm_audit_log_ti);
 
@@ -79,6 +79,6 @@ void dm_audit_log_bio(const char *dm_msg_prefix, const char *op,
 
 	audit_log_format(ab, " dev=%d:%d sector=%llu res=%d",
 			 dev_major, dev_minor, sector, result);
-	(void)audit_log_end_status(ab);
+	audit_log_end(ab);
 }
 EXPORT_SYMBOL_GPL(dm_audit_log_bio);

@@ -418,8 +418,8 @@ static bool is_v3header(int size, const struct vfs_cap_data *cap)
  * so that's good.
  */
 int cap_inode_getsecurity(struct mnt_idmap *idmap,
-			  const struct vfsmount *mnt, struct inode *inode,
-			  const char *name, void **buffer, bool alloc)
+			  struct inode *inode, const char *name, void **buffer,
+			  bool alloc)
 {
 	int size;
 	kuid_t kroot;
@@ -438,9 +438,8 @@ int cap_inode_getsecurity(struct mnt_idmap *idmap,
 	dentry = d_find_any_alias(inode);
 	if (!dentry)
 		return -EINVAL;
-	size = vfs_getxattr_alloc_mnt(idmap, mnt, dentry, XATTR_NAME_CAPS,
-				      &tmpbuf, sizeof(struct vfs_ns_cap_data),
-				      GFP_NOFS);
+	size = vfs_getxattr_alloc(idmap, dentry, XATTR_NAME_CAPS, &tmpbuf,
+				  sizeof(struct vfs_ns_cap_data), GFP_NOFS);
 	dput(dentry);
 	/* gcc11 complains if we don't check for !tmpbuf */
 	if (size < 0 || !tmpbuf)

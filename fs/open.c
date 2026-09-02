@@ -36,9 +36,8 @@
 
 #include "internal.h"
 
-int do_truncate_mnt(struct mnt_idmap *idmap, const struct vfsmount *mnt,
-		    struct dentry *dentry, loff_t length,
-		    unsigned int time_attrs, struct file *filp)
+int do_truncate(struct mnt_idmap *idmap, struct dentry *dentry,
+		loff_t length, unsigned int time_attrs, struct file *filp)
 {
 	int ret;
 	struct iattr newattrs;
@@ -66,16 +65,9 @@ int do_truncate_mnt(struct mnt_idmap *idmap, const struct vfsmount *mnt,
 		return ret;
 
 	/* Note any delegations or leases have already been broken: */
-	ret = notify_change_mnt(idmap, mnt, dentry, &newattrs, NULL);
+	ret = notify_change(idmap, dentry, &newattrs, NULL);
 	inode_unlock(dentry->d_inode);
 	return ret;
-}
-
-int do_truncate(struct mnt_idmap *idmap, struct dentry *dentry,
-		loff_t length, unsigned int time_attrs, struct file *filp)
-{
-	return do_truncate_mnt(idmap, filp ? filp->f_path.mnt : NULL, dentry,
-			       length, time_attrs, filp);
 }
 
 int vfs_truncate(const struct path *path, loff_t length)
@@ -93,7 +85,7 @@ int vfs_truncate(const struct path *path, loff_t length)
 		return -EINVAL;
 
 	idmap = mnt_idmap(path->mnt);
-	error = inode_permission_mnt(idmap, path->mnt, inode, MAY_WRITE);
+	error = inode_permission(idmap, inode, MAY_WRITE);
 	if (error)
 		return error;
 
@@ -123,8 +115,7 @@ int vfs_truncate(const struct path *path, loff_t length)
 
 	error = security_path_truncate(path);
 	if (!error)
-		error = do_truncate_mnt(idmap, path->mnt, path->dentry, length, 0,
-					NULL);
+		error = do_truncate(idmap, path->dentry, length, 0, NULL);
 
 put_write_and_out:
 	put_write_access(inode);
@@ -200,8 +191,7 @@ int do_ftruncate(struct file *file, loff_t length, unsigned int flags)
 		return error;
 
 	scoped_guard(super_write, inode->i_sb)
-		return do_truncate_mnt(file_mnt_idmap(file), file->f_path.mnt,
-				       dentry, length,
+		return do_truncate(file_mnt_idmap(file), dentry, length,
 				   ATTR_MTIME | ATTR_CTIME, file);
 }
 
@@ -511,8 +501,7 @@ retry:
 			goto out_path_release;
 	}
 
-	res = inode_permission_mnt(mnt_idmap(path.mnt), path.mnt, inode,
-				   mode | MAY_ACCESS);
+	res = inode_permission(mnt_idmap(path.mnt), inode, mode | MAY_ACCESS);
 	/* SuS v2 requires we report a read only fs too */
 	if (res || !(mode & S_IWOTH) || special_file(inode->i_mode))
 		goto out_path_release;
@@ -645,8 +634,8 @@ retry_deleg:
 		goto out_unlock;
 	newattrs.ia_mode = (mode & S_IALLUGO) | (inode->i_mode & ~S_IALLUGO);
 	newattrs.ia_valid = ATTR_MODE | ATTR_CTIME;
-	error = notify_change_mnt(mnt_idmap(path->mnt), path->mnt,
-				  path->dentry, &newattrs, &delegated_inode);
+	error = notify_change(mnt_idmap(path->mnt), path->dentry,
+			      &newattrs, &delegated_inode);
 out_unlock:
 	inode_unlock(inode);
 	if (is_delegated(&delegated_inode)) {
@@ -784,8 +773,8 @@ retry_deleg:
 		from_vfsuid(idmap, fs_userns, newattrs.ia_vfsuid),
 		from_vfsgid(idmap, fs_userns, newattrs.ia_vfsgid));
 	if (!error)
-		error = notify_change_mnt(idmap, path->mnt, path->dentry,
-					  &newattrs, &delegated_inode);
+		error = notify_change(idmap, path->dentry, &newattrs,
+				      &delegated_inode);
 	inode_unlock(inode);
 	if (is_delegated(&delegated_inode)) {
 		error = break_deleg_wait(&delegated_inode);
@@ -905,9 +894,6 @@ static int do_dentry_open(struct file *f,
 	f->f_mapping = inode->i_mapping;
 	f->f_wb_err = filemap_sample_wb_err(f->f_mapping);
 	f->f_sb_err = file_sample_sb_err(f);
-	error = security_file_set_path(f);
-	if (unlikely(error))
-		goto cleanup_file;
 
 	if (unlikely(f->f_flags & O_PATH)) {
 		f->f_mode = FMODE_PATH | FMODE_OPENED;

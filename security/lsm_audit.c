@@ -422,7 +422,7 @@ static void dump_common_audit_data(struct audit_buffer *ab,
 }
 
 /**
- * common_lsm_audit_status - generic LSM auditing function with status
+ * common_lsm_audit - generic LSM auditing function
  * @a:  auxiliary audit data
  * @pre_audit: lsm-specific pre-audit callback
  * @post_audit: lsm-specific post-audit callback
@@ -430,20 +430,20 @@ static void dump_common_audit_data(struct audit_buffer *ab,
  * setup the audit buffer for common security information
  * uses callback to print LSM specific information
  */
-int common_lsm_audit_status(struct common_audit_data *a,
+void common_lsm_audit(struct common_audit_data *a,
 	void (*pre_audit)(struct audit_buffer *, void *),
 	void (*post_audit)(struct audit_buffer *, void *))
 {
 	struct audit_buffer *ab;
 
 	if (a == NULL)
-		return -EINVAL;
+		return;
 	/* we use GFP_ATOMIC so we won't sleep */
 	ab = audit_log_start(audit_context(), GFP_ATOMIC | __GFP_NOWARN,
 			     AUDIT_AVC);
 
 	if (ab == NULL)
-		return -ENOBUFS;
+		return;
 
 	if (pre_audit)
 		pre_audit(ab, a);
@@ -453,18 +453,5 @@ int common_lsm_audit_status(struct common_audit_data *a,
 	if (post_audit)
 		post_audit(ab, a);
 
-	return audit_log_end_status(ab);
-}
-
-/**
- * common_lsm_audit - generic LSM auditing compatibility wrapper
- * @a: auxiliary audit data
- * @pre_audit: LSM-specific pre-audit callback
- * @post_audit: LSM-specific post-audit callback
- */
-void common_lsm_audit(struct common_audit_data *a,
-	void (*pre_audit)(struct audit_buffer *, void *),
-	void (*post_audit)(struct audit_buffer *, void *))
-{
-	common_lsm_audit_status(a, pre_audit, post_audit);
+	audit_log_end(ab);
 }

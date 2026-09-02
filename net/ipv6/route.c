@@ -3332,9 +3332,8 @@ out:
 	return mtu - lwtunnel_headroom(nh->fib_nh_lws, mtu);
 }
 
-struct dst_entry *icmp6_dst_alloc_origin(
-	struct net_device *dev, struct flowi6 *fl6,
-	const struct xfrm_flow_origin *origin)
+struct dst_entry *icmp6_dst_alloc(struct net_device *dev,
+				  struct flowi6 *fl6)
 {
 	struct dst_entry *dst;
 	struct rt6_info *rt;
@@ -3364,19 +3363,10 @@ struct dst_entry *icmp6_dst_alloc_origin(
 	 */
 	rt6_uncached_list_add(rt);
 
-	dst = xfrm_lookup_origin(net, &rt->dst, flowi6_to_flowi(fl6), NULL,
-				 origin, 0);
+	dst = xfrm_lookup(net, &rt->dst, flowi6_to_flowi(fl6), NULL, 0);
 
 out:
 	return dst;
-}
-
-struct dst_entry *icmp6_dst_alloc(struct net_device *dev,
-					   struct flowi6 *fl6)
-{
-	struct xfrm_flow_origin origin = xfrm_flow_origin_none();
-
-	return icmp6_dst_alloc_origin(dev, fl6, &origin);
 }
 
 static void ip6_dst_gc(struct dst_ops *ops)

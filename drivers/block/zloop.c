@@ -708,9 +708,8 @@ static int zloop_record_safe_wps(struct zloop_device *zlo)
 
 		if (!zloop_zone_is_active(zone))
 			continue;
-		ret = vfs_setxattr_mnt(file_mnt_idmap(file), file->f_path.mnt,
-				       file_dentry(file), "user.zloop.wp",
-				       &zone->wp, sizeof(zone->wp), 0);
+		ret = vfs_setxattr(file_mnt_idmap(file), file_dentry(file),
+				"user.zloop.wp", &zone->wp, sizeof(zone->wp), 0);
 		if (ret) {
 			pr_err("%pg: failed to record write pointer (%d)\n",
 				zlo->disk->part0, ret);
@@ -1378,9 +1377,8 @@ static void zloop_forget_cache(struct zloop_device *zlo)
 		if (!zloop_zone_is_active(zone))
 			continue;
 
-		ret = vfs_getxattr_mnt(file_mnt_idmap(file), file->f_path.mnt,
-				       file_dentry(file), "user.zloop.wp", &old_wp,
-				       sizeof(old_wp));
+		ret = vfs_getxattr(file_mnt_idmap(file), file_dentry(file),
+				"user.zloop.wp", &old_wp, sizeof(old_wp));
 		if (ret == -ENODATA) {
 			old_wp = 0;
 		} else if (ret != sizeof(old_wp)) {

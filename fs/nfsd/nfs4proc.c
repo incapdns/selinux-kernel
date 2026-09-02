@@ -293,9 +293,8 @@ nfsd4_create_file(struct svc_rqst *rqstp, struct svc_fh *fhp,
 		open->op_pacl = NULL;
 	}
 
-	child = start_creating_mnt(&nop_mnt_idmap,
-				   fhp->fh_export->ex_path.mnt, parent,
-				   &QSTR_LEN(open->op_fname, open->op_fnamelen));
+	child = start_creating(&nop_mnt_idmap, parent,
+			       &QSTR_LEN(open->op_fname, open->op_fnamelen));
 	if (IS_ERR(child)) {
 		status = nfserrno(PTR_ERR(child));
 		goto out;

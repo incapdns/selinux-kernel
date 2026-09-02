@@ -5,7 +5,6 @@
  */
 
 #include <linux/spinlock.h>
-#include <linux/cred.h>
 #include <linux/init.h>
 #include <linux/security.h>
 #include <linux/slab.h>
@@ -31,18 +30,6 @@ struct ipc_namespace init_ipc_ns = {
 	.ns = NS_COMMON_INIT(init_ipc_ns),
 	.user_ns = &init_user_ns,
 };
-
-static int __init init_ipc_security(void)
-{
-	int rc;
-
-	rc = security_ipc_namespace_alloc(
-		&init_ipc_ns, NULL, current_cred(), true);
-	if (rc)
-		panic("initial IPC namespace LSM allocation failed: %d\n", rc);
-	return 0;
-}
-pure_initcall(init_ipc_security);
 
 struct msg_msgseg {
 	struct msg_msgseg *next;

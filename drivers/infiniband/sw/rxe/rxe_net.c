@@ -141,12 +141,7 @@ static struct dst_entry *rxe_find_route6(struct rxe_qp *qp,
 	memcpy(&fl6.daddr, daddr, sizeof(*daddr));
 	fl6.flowi6_proto = IPPROTO_UDP;
 
-	{
-		struct sock *sk = rxe_ns_pernet_sk6(net);
-		struct xfrm_flow_origin origin = xfrm_flow_origin_sock(sk);
-
-		ndst = ip6_dst_lookup_flow_origin(net, sk, &fl6, NULL, &origin);
-	}
+	ndst = ip6_dst_lookup_flow(net, rxe_ns_pernet_sk6(net), &fl6, NULL);
 	if (IS_ERR(ndst)) {
 		rxe_dbg_qp(qp, "no route to %pI6\n", daddr);
 		return NULL;

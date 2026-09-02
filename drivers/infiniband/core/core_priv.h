@@ -242,7 +242,6 @@ int ib_mad_agent_security_setup(struct ib_mad_agent *agent,
 void ib_mad_agent_security_cleanup(struct ib_mad_agent *agent);
 int ib_mad_enforce_security(struct ib_mad_agent_private *map, u16 pkey_index);
 void ib_mad_agent_security_change(void);
-int ib_policy_scope_security_change(u64 scope_id, bool pre);
 #else
 static inline void ib_security_release_port_pkey_list(struct ib_device *device)
 {
@@ -311,13 +310,6 @@ static inline int ib_mad_enforce_security(struct ib_mad_agent_private *map,
 
 static inline void ib_mad_agent_security_change(void)
 {
-}
-
-static inline int ib_policy_scope_security_change(u64 scope_id, bool pre)
-{
-	(void)scope_id;
-	(void)pre;
-	return 0;
 }
 #endif
 

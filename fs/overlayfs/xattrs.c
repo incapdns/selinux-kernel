@@ -45,9 +45,7 @@ static int ovl_xattr_set(struct dentry *dentry, struct inode *inode, const char 
 	if (!value && !upperdentry) {
 		ovl_path_lower(dentry, &realpath);
 		with_ovl_creds(dentry->d_sb)
-			err = vfs_getxattr_mnt(mnt_idmap(realpath.mnt),
-					       realpath.mnt, realdentry, name,
-					       NULL, 0);
+			err = vfs_getxattr(mnt_idmap(realpath.mnt), realdentry, name, NULL, 0);
 		if (err < 0)
 			goto out;
 	}
@@ -87,8 +85,7 @@ static int ovl_xattr_get(struct dentry *dentry, struct inode *inode, const char 
 
 	ovl_i_path_real(inode, &realpath);
 	with_ovl_creds(dentry->d_sb)
-		return vfs_getxattr_mnt(mnt_idmap(realpath.mnt), realpath.mnt,
-					realpath.dentry, name, value, size);
+		return vfs_getxattr(mnt_idmap(realpath.mnt), realpath.dentry, name, value, size);
 }
 
 static bool ovl_can_list(struct super_block *sb, const char *s)
@@ -107,17 +104,15 @@ static bool ovl_can_list(struct super_block *sb, const char *s)
 
 ssize_t ovl_listxattr(struct dentry *dentry, char *list, size_t size)
 {
+	struct dentry *realdentry = ovl_dentry_real(dentry);
 	struct ovl_fs *ofs = OVL_FS(dentry->d_sb);
-	struct path realpath;
 	ssize_t res;
 	size_t len;
 	char *s;
 	size_t prefix_len, name_len;
 
-	ovl_path_real(dentry, &realpath);
 	with_ovl_creds(dentry->d_sb)
-		res = vfs_listxattr_mnt(realpath.mnt, realpath.dentry,
-					   list, size);
+		res = vfs_listxattr(realdentry, list, size);
 	if (res <= 0 || size == 0)
 		return res;
 

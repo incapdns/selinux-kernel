@@ -9,7 +9,6 @@
 #include <net/ip6_fib.h>
 #include <net/ip6_checksum.h>
 #include <net/netfilter/ipv6/nf_reject.h>
-#include <net/xfrm.h>
 #include <linux/netfilter_ipv6.h>
 #include <linux/netfilter_bridge.h>
 
@@ -352,12 +351,7 @@ void nf_send_reset6(struct net *net, struct sock *sk, struct sk_buff *oldskb,
 		dst_release(dst);
 		return;
 	}
-	{
-		struct xfrm_flow_origin origin = xfrm_flow_origin_skb(oldskb);
-
-		dst = xfrm_lookup_origin(net, dst, flowi6_to_flowi(&fl6), NULL,
-					 &origin, 0);
-	}
+	dst = xfrm_lookup(net, dst, flowi6_to_flowi(&fl6), NULL, 0);
 	if (IS_ERR(dst))
 		return;
 

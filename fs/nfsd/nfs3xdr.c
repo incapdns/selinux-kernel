@@ -1001,9 +1001,9 @@ compose_entry_fh(struct nfsd3_readdirres *cd, struct svc_fh *fhp,
 		} else
 			dchild = dget(dparent);
 	} else
-		dchild = lookup_one_positive_unlocked_mnt(
-			&nop_mnt_idmap, exp->ex_path.mnt,
-			&QSTR_LEN(name, namlen), dparent);
+		dchild = lookup_one_positive_unlocked(&nop_mnt_idmap,
+						      &QSTR_LEN(name, namlen),
+						      dparent);
 	if (IS_ERR(dchild))
 		return rv;
 	if (d_mountpoint(dchild))

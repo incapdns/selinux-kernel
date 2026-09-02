@@ -11,13 +11,9 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 #include <linux/module.h>
 #include <linux/security.h>
-#include <linux/selinux_net.h>
 #include <linux/skbuff.h>
 #include <linux/netfilter/x_tables.h>
 #include <linux/netfilter/xt_SECMARK.h>
-#ifdef CONFIG_SECURITY_SELINUX_NS
-#include <linux/xarray.h>
-#endif
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("James Morris <jmorris@redhat.com>");
@@ -27,41 +23,8 @@ MODULE_ALIAS("ip6t_SECMARK");
 
 static u8 mode;
 
-#ifdef CONFIG_SECURITY_SELINUX_NS
-/*
- * The xtables userspace ABI has no room for an internal pointer.  Rules own
- * one immutable provenance reference in this side table; packet evaluation
- * only takes a reference and never allocates.
- */
-static DEFINE_XARRAY(secmark_provenance);
-
-struct secmark_provenance_binding {
-	struct rcu_head rcu;
-	struct selinux_net_provenance *provenance;
-};
-
-static void secmark_provenance_binding_free_rcu(struct rcu_head *rcu)
-{
-	struct secmark_provenance_binding *binding =
-		container_of(rcu, struct secmark_provenance_binding, rcu);
-
-	selinux_net_provenance_put(binding->provenance);
-	kfree(binding);
-}
-
-static struct selinux_net_provenance *
-secmark_provenance_load(const void *key)
-{
-	struct secmark_provenance_binding *binding;
-
-	binding = xa_load(&secmark_provenance, (unsigned long)key);
-	return binding ? binding->provenance : NULL;
-}
-#endif
-
 static unsigned int
-secmark_tg(struct sk_buff *skb, const struct xt_secmark_target_info_v1 *info,
-	   const void *key)
+secmark_tg(struct sk_buff *skb, const struct xt_secmark_target_info_v1 *info)
 {
 	u32 secmark = 0;
 
@@ -73,113 +36,51 @@ secmark_tg(struct sk_buff *skb, const struct xt_secmark_target_info_v1 *info,
 		BUG();
 	}
 
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	rcu_read_lock();
-	skb_set_secmark(skb, secmark, secmark_provenance_load(key));
-	rcu_read_unlock();
-#else
 	skb->secmark = secmark;
-#endif
 	return XT_CONTINUE;
 }
 
-static int checkentry_lsm(struct xt_secmark_target_info_v1 *info,
-			  const struct net *net, const void *key)
+static int checkentry_lsm(struct xt_secmark_target_info_v1 *info)
 {
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	struct secmark_provenance_binding *binding;
-#endif
-	struct lsm_prop_ref *prop_ref = NULL;
-	struct lsm_secmark secmark;
 	int err;
 
 	info->secctx[SECMARK_SECCTX_MAX - 1] = '\0';
 	info->secid = 0;
 
-	err = security_secctx_to_lsmprop_ref(info->secctx, strlen(info->secctx),
-					 LSM_ID_UNDEF, GFP_KERNEL, &prop_ref);
+	err = security_secctx_to_secid(info->secctx, strlen(info->secctx),
+				       &info->secid);
 	if (err) {
 		if (err == -EINVAL)
 			pr_info_ratelimited("invalid security context \'%s\'\n",
 					    info->secctx);
 		return err;
 	}
-	if (security_lsm_prop_ref_provider_count(prop_ref) != 1) {
-		err = -ENOTUNIQ;
-		goto out_ref;
-	}
-	if (!security_lsm_prop_ref_source_secid(prop_ref, &info->secid)) {
-		pr_info_ratelimited("invalid security context \'%s\'\n",
-				    info->secctx);
-		err = -EINVAL;
-		goto out_ref;
-	}
 
 	if (!info->secid) {
 		pr_info_ratelimited("unable to map security context \'%s\'\n",
 				    info->secctx);
-		err = -ENOENT;
-		goto out_ref;
+		return -ENOENT;
 	}
 
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	binding = kzalloc(sizeof(*binding), GFP_KERNEL);
-	if (!binding) {
-		err = -ENOMEM;
-		goto out_ref;
-	}
-#endif
-
-	err = security_secmark_relabel_packet(net, info->secid, &secmark);
-	security_lsm_prop_ref_put(prop_ref);
-	prop_ref = NULL;
+	err = security_secmark_relabel_packet(info->secid);
 	if (err) {
 		pr_info_ratelimited("unable to obtain relabeling permission\n");
-#ifdef CONFIG_SECURITY_SELINUX_NS
-		kfree(binding);
 		return err;
-#else
-		return err;
-#endif
 	}
 
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	binding->provenance = selinux_secmark_provenance_take(&secmark);
-	security_secmark_release(&secmark);
-	if (!binding->provenance) {
-		err = -EACCES;
-		goto out_binding;
-	}
-	err = xa_insert(&secmark_provenance, (unsigned long)key, binding,
-			GFP_KERNEL);
-	if (err)
-		goto out_binding;
-#else
-	security_secmark_release(&secmark);
-#endif
 	security_secmark_refcount_inc();
 	return 0;
-
-#ifdef CONFIG_SECURITY_SELINUX_NS
-out_binding:
-	selinux_net_provenance_put(binding->provenance);
-	kfree(binding);
-#endif
-out_ref:
-	security_lsm_prop_ref_put(prop_ref);
-	return err;
 }
 
 static int
-secmark_tg_check(const struct xt_tgchk_param *par,
-		 struct xt_secmark_target_info_v1 *info)
+secmark_tg_check(const char *table, struct xt_secmark_target_info_v1 *info)
 {
 	int err;
 
-	if (strcmp(par->table, "mangle") != 0 &&
-	    strcmp(par->table, "security") != 0) {
+	if (strcmp(table, "mangle") != 0 &&
+	    strcmp(table, "security") != 0) {
 		pr_info_ratelimited("only valid in \'mangle\' or \'security\' table, not \'%s\'\n",
-				    par->table);
+				    table);
 		return -EINVAL;
 	}
 
@@ -197,7 +98,7 @@ secmark_tg_check(const struct xt_tgchk_param *par,
 		return -EINVAL;
 	}
 
-	err = checkentry_lsm(info, par->net, par->targinfo);
+	err = checkentry_lsm(info);
 	if (err)
 		return err;
 
@@ -208,14 +109,6 @@ secmark_tg_check(const struct xt_tgchk_param *par,
 
 static void secmark_tg_destroy(const struct xt_tgdtor_param *par)
 {
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	struct secmark_provenance_binding *binding;
-
-	binding = xa_erase(&secmark_provenance,
-			   (unsigned long)par->targinfo);
-	if (binding)
-		call_rcu(&binding->rcu, secmark_provenance_binding_free_rcu);
-#endif
 	switch (mode) {
 	case SECMARK_MODE_SEL:
 		security_secmark_refcount_dec();
@@ -232,7 +125,7 @@ static int secmark_tg_check_v0(const struct xt_tgchk_param *par)
 
 	memcpy(newinfo.secctx, info->secctx, SECMARK_SECCTX_MAX);
 
-	ret = secmark_tg_check(par, &newinfo);
+	ret = secmark_tg_check(par->table, &newinfo);
 	info->secid = newinfo.secid;
 
 	return ret;
@@ -246,18 +139,18 @@ secmark_tg_v0(struct sk_buff *skb, const struct xt_action_param *par)
 		.secid	= info->secid,
 	};
 
-	return secmark_tg(skb, &newinfo, info);
+	return secmark_tg(skb, &newinfo);
 }
 
 static int secmark_tg_check_v1(const struct xt_tgchk_param *par)
 {
-	return secmark_tg_check(par, par->targinfo);
+	return secmark_tg_check(par->table, par->targinfo);
 }
 
 static unsigned int
 secmark_tg_v1(struct sk_buff *skb, const struct xt_action_param *par)
 {
-	return secmark_tg(skb, par->targinfo, par->targinfo);
+	return secmark_tg(skb, par->targinfo);
 }
 
 static struct xt_target secmark_tg_reg[] __read_mostly = {
@@ -315,10 +208,6 @@ static int __init secmark_tg_init(void)
 static void __exit secmark_tg_exit(void)
 {
 	xt_unregister_targets(secmark_tg_reg, ARRAY_SIZE(secmark_tg_reg));
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	/* secmark_provenance_binding_free_rcu() lives in this module. */
-	rcu_barrier();
-#endif
 }
 
 module_init(secmark_tg_init);

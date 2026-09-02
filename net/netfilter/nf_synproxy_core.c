@@ -8,7 +8,6 @@
 #include <linux/unaligned.h>
 #include <net/tcp.h>
 #include <net/netns/generic.h>
-#include <net/xfrm.h>
 #include <linux/proc_fs.h>
 
 #include <linux/netfilter_ipv4.h>
@@ -848,13 +847,7 @@ synproxy_send_tcp_ipv6(struct net *net,
 		goto free_nskb;
 	}
 
-	{
-		struct xfrm_flow_origin origin =
-			xfrm_flow_origin_skb((const struct sk_buff *)skb);
-
-		dst = xfrm_lookup_origin(net, dst, flowi6_to_flowi(&fl6),
-					 NULL, &origin, 0);
-	}
+	dst = xfrm_lookup(net, dst, flowi6_to_flowi(&fl6), NULL, 0);
 	if (IS_ERR(dst))
 		goto free_nskb;
 

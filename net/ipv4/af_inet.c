@@ -1328,11 +1328,7 @@ int inet_sk_rebuild_header(struct sock *sk)
 	/* Reroute. */
 	fl4 = &inet->cork.fl.u.ip4;
 	inet_sk_init_flowi4(inet, fl4);
-	{
-		struct xfrm_flow_origin origin = xfrm_flow_origin_sock(sk);
-
-		rt = ip_route_output_flow_origin(sock_net(sk), fl4, sk, &origin);
-	}
+	rt = ip_route_output_flow(sock_net(sk), fl4, sk);
 	if (!IS_ERR(rt)) {
 		err = 0;
 		sk_setup_caps(sk, &rt->dst);

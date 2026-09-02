@@ -170,7 +170,7 @@ void ipe_audit_match(const struct ipe_eval_ctx *const ctx,
 		audit_log_format(ab, " rule=\"DEFAULT action=%s\"",
 				 ACTSTR(act));
 
-	(void)audit_log_end_status(ab);
+	audit_log_end(ab);
 }
 
 /**
@@ -224,7 +224,7 @@ void ipe_audit_policy_activation(const struct ipe_policy *const op,
 			 from_kuid(&init_user_ns, audit_get_loginuid(current)),
 			 audit_get_sessionid(current));
 
-	(void)audit_log_end_status(ab);
+	audit_log_end(ab);
 }
 
 /**
@@ -252,7 +252,7 @@ void ipe_audit_policy_load(const struct ipe_policy *const p)
 			 from_kuid(&init_user_ns, audit_get_loginuid(current)),
 			 audit_get_sessionid(current), !err, err);
 
-	(void)audit_log_end_status(ab);
+	audit_log_end(ab);
 }
 
 /**
@@ -275,5 +275,5 @@ void ipe_audit_enforce(bool new_enforce, bool old_enforce)
 		  from_kuid(&init_user_ns, audit_get_loginuid(current)),
 		  audit_get_sessionid(current));
 
-	(void)audit_log_end_status(ab);
+	audit_log_end(ab);
 }

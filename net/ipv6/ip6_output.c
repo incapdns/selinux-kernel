@@ -1269,23 +1269,19 @@ int ip6_dst_lookup(struct net *net, struct sock *sk, struct dst_entry **dst,
 EXPORT_SYMBOL_GPL(ip6_dst_lookup);
 
 /**
- *	ip6_dst_lookup_flow_origin - perform route lookup on flow with ipsec
+ *	ip6_dst_lookup_flow - perform route lookup on flow with ipsec
  *	@net: Network namespace to perform lookup in
  *	@sk: socket which provides route info
  *	@fl6: flow to lookup
  *	@final_dst: final destination address for ipsec lookup
- *	@origin: typed borrowed owner of the flow security identity
  *
  *	This function performs a route lookup on the given flow.
  *
  *	It returns a valid dst pointer on success, or a pointer encoded
  *	error code.
  */
-struct dst_entry *ip6_dst_lookup_flow_origin(
-				      struct net *net, const struct sock *sk,
-				      struct flowi6 *fl6,
-				      const struct in6_addr *final_dst,
-				      const struct xfrm_flow_origin *origin)
+struct dst_entry *ip6_dst_lookup_flow(struct net *net, const struct sock *sk, struct flowi6 *fl6,
+				      const struct in6_addr *final_dst)
 {
 	struct dst_entry *dst = NULL;
 	int err;
@@ -1298,19 +1294,7 @@ struct dst_entry *ip6_dst_lookup_flow_origin(
 	if (final_dst)
 		fl6->daddr = *final_dst;
 
-	return xfrm_lookup_route_origin(net, dst, flowi6_to_flowi(fl6), sk,
-					origin, 0);
-}
-EXPORT_SYMBOL_GPL(ip6_dst_lookup_flow_origin);
-
-struct dst_entry *ip6_dst_lookup_flow(
-				      struct net *net, const struct sock *sk,
-				      struct flowi6 *fl6,
-				      const struct in6_addr *final_dst)
-{
-	struct xfrm_flow_origin origin = xfrm_flow_origin_sock(sk);
-
-	return ip6_dst_lookup_flow_origin(net, sk, fl6, final_dst, &origin);
+	return xfrm_lookup_route(net, dst, flowi6_to_flowi(fl6), sk, 0);
 }
 EXPORT_SYMBOL_GPL(ip6_dst_lookup_flow);
 
@@ -1342,12 +1326,7 @@ struct dst_entry *ip6_sk_dst_lookup_flow(struct sock *sk, struct flowi6 *fl6,
 	if (dst)
 		return dst;
 
-	{
-		struct xfrm_flow_origin origin = xfrm_flow_origin_sock(sk);
-
-		dst = ip6_dst_lookup_flow_origin(sock_net(sk), sk, fl6,
-						 final_dst, &origin);
-	}
+	dst = ip6_dst_lookup_flow(sock_net(sk), sk, fl6, final_dst);
 	if (connected && !IS_ERR(dst))
 		ip6_sk_dst_store_flow(sk, dst_clone(dst), fl6);
 

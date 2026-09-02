@@ -82,7 +82,7 @@ struct audit_names {
 	kuid_t			uid;
 	kgid_t			gid;
 	dev_t			rdev;
-	struct lsm_prop_ref	*oprop;
+	struct lsm_prop		oprop;
 	struct audit_cap_data	fcap;
 	unsigned int		fcap_ver;
 	unsigned char		type;		/* record type */
@@ -149,7 +149,7 @@ struct audit_context {
 	kuid_t		    target_auid;
 	kuid_t		    target_uid;
 	unsigned int	    target_sessionid;
-	struct lsm_prop_ref *target_ref;
+	struct lsm_prop	    target_ref;
 	char		    target_comm[TASK_COMM_LEN];
 
 	struct audit_tree_refs *trees, *first_trees;
@@ -166,7 +166,7 @@ struct audit_context {
 			kuid_t			uid;
 			kgid_t			gid;
 			umode_t			mode;
-			struct lsm_prop_ref	*oprop;
+			struct lsm_prop		oprop;
 			int			has_perm;
 			uid_t			perm_uid;
 			gid_t			perm_gid;

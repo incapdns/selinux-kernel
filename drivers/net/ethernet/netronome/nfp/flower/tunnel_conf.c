@@ -650,15 +650,14 @@ static void nfp_tun_neigh_update(struct work_struct *work)
 		flow6.daddr = *(struct in6_addr *)n->primary_key;
 		if (!neigh_invalid) {
 			struct dst_entry *dst;
-			struct xfrm_flow_origin origin = xfrm_flow_origin_none();
 			/* Use ip6_dst_lookup_flow to populate flow6->saddr
 			 * and other fields. This information is only needed
 			 * for new entries, lookup can be skipped when an entry
 			 * gets invalidated - as only the daddr is needed for
 			 * deleting.
 			 */
-			dst = ip6_dst_lookup_flow_origin(dev_net(n->dev), NULL,
-							 &flow6, NULL, &origin);
+			dst = ip6_dst_lookup_flow(dev_net(n->dev), NULL,
+						  &flow6, NULL);
 			if (IS_ERR(dst))
 				goto out;
 
@@ -816,12 +815,7 @@ void nfp_tunnel_request_route_v6(struct nfp_app *app, struct sk_buff *skb)
 	flow.flowi6_proto = IPPROTO_UDP;
 
 #if IS_ENABLED(CONFIG_INET) && IS_ENABLED(CONFIG_IPV6)
-	{
-		struct xfrm_flow_origin origin = xfrm_flow_origin_none();
-
-		dst = ip6_dst_lookup_flow_origin(dev_net(netdev), NULL, &flow,
-						 NULL, &origin);
-	}
+	dst = ip6_dst_lookup_flow(dev_net(netdev), NULL, &flow, NULL);
 	if (IS_ERR(dst))
 		goto fail_rcu_unlock;
 #else

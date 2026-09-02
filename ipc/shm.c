@@ -733,7 +733,7 @@ static int newseg(struct ipc_namespace *ns, struct ipc_params *params)
 	shp->mlock_ucounts = NULL;
 
 	shp->shm_perm.security = NULL;
-	error = security_shm_alloc(ns, &shp->shm_perm);
+	error = security_shm_alloc(&shp->shm_perm);
 	if (error) {
 		kfree(shp);
 		return error;
@@ -782,7 +782,6 @@ static int newseg(struct ipc_namespace *ns, struct ipc_params *params)
 	error = ipc_addid(&shm_ids(ns), &shp->shm_perm, ns->shm_ctlmni);
 	if (error < 0)
 		goto no_id;
-	security_ipc_namespace_object_published(ns);
 
 	shp->ns = ns;
 

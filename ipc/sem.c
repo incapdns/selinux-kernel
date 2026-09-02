@@ -550,7 +550,7 @@ static int newary(struct ipc_namespace *ns, struct ipc_params *params)
 	sma->sem_perm.key = key;
 
 	sma->sem_perm.security = NULL;
-	retval = security_sem_alloc(ns, &sma->sem_perm);
+	retval = security_sem_alloc(&sma->sem_perm);
 	if (retval) {
 		kvfree(sma);
 		return retval;
@@ -576,7 +576,6 @@ static int newary(struct ipc_namespace *ns, struct ipc_params *params)
 		ipc_rcu_putref(&sma->sem_perm, sem_rcu_free);
 		return retval;
 	}
-	security_ipc_namespace_object_published(ns);
 	ns->used_sems += nsems;
 
 	sem_unlock(sma, -1);

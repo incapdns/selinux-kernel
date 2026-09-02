@@ -33,7 +33,6 @@ Security-related interfaces
    seccomp_filter
    landlock
    lsm
-   selinux-namespaces
    mfd_noexec
    spec_ctrl
    tee

@@ -499,12 +499,6 @@ struct file *memfd_alloc_file(const char *name, unsigned int flags)
 			*file_seals &= ~F_SEAL_SEAL;
 	}
 
-	err = security_file_init_security_anon(file);
-	if (err) {
-		fput(file);
-		return ERR_PTR(err);
-	}
-
 	return file;
 }
 

@@ -446,7 +446,7 @@ doi_add_return:
 		audit_log_format(audit_buf,
 				 " cipso_doi=%u cipso_type=%s res=%u",
 				 doi, type_str, ret_val == 0 ? 1 : 0);
-		(void)audit_log_end_status(audit_buf);
+		audit_log_end(audit_buf);
 	}
 
 	return ret_val;
@@ -531,7 +531,7 @@ doi_remove_return:
 		audit_log_format(audit_buf,
 				 " cipso_doi=%u res=%u",
 				 doi, ret_val == 0 ? 1 : 0);
-		(void)audit_log_end_status(audit_buf);
+		audit_log_end(audit_buf);
 	}
 
 	return ret_val;

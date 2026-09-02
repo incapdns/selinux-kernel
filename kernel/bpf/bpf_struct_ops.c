@@ -13,7 +13,6 @@
 #include <linux/btf_ids.h>
 #include <linux/rcupdate_wait.h>
 #include <linux/poll.h>
-#include <linux/security.h>
 
 struct bpf_struct_ops_value {
 	struct bpf_struct_ops_common_value common;
@@ -1422,7 +1421,7 @@ int bpf_struct_ops_link_create(union bpf_attr *attr)
 	bpf_link_init(&link->link, BPF_LINK_TYPE_STRUCT_OPS, &bpf_struct_ops_map_lops, NULL,
 		      attr->link_create.attach_type);
 
-	err = bpf_link_prime(&link->link, &link_primer, NULL, map);
+	err = bpf_link_prime(&link->link, &link_primer);
 	if (err)
 		goto err_out;
 
@@ -1453,11 +1452,6 @@ err_out:
 int bpf_prog_assoc_struct_ops(struct bpf_prog *prog, struct bpf_map *map)
 {
 	struct bpf_map *st_ops_assoc;
-	int err;
-
-	err = security_bpf_prog_map_relation(prog, map);
-	if (err)
-		return err;
 
 	guard(mutex)(&prog->aux->st_ops_assoc_mutex);
 

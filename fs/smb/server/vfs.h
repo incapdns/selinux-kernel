@@ -74,7 +74,7 @@ struct ksmbd_kstat {
 
 int ksmbd_vfs_lock_parent(struct dentry *parent, struct dentry *child);
 void ksmbd_vfs_query_maximal_access(struct mnt_idmap *idmap,
-				   const struct path *path, __le32 *daccess);
+				   struct dentry *dentry, __le32 *daccess);
 int ksmbd_vfs_create(struct ksmbd_work *work, const char *name, umode_t mode);
 int ksmbd_vfs_mkdir(struct ksmbd_work *work, const char *name, umode_t mode);
 int ksmbd_vfs_read(struct ksmbd_work *work, struct ksmbd_file *fp, size_t count,
@@ -100,13 +100,13 @@ int ksmbd_vfs_copy_file_ranges(struct ksmbd_work *work,
 			       unsigned int *chunk_count_written,
 			       unsigned int *chunk_size_written,
 			       loff_t  *total_size_written);
-ssize_t ksmbd_vfs_listxattr(const struct path *path, char **list);
+ssize_t ksmbd_vfs_listxattr(struct dentry *dentry, char **list);
 ssize_t ksmbd_vfs_getxattr(struct mnt_idmap *idmap,
-			   const struct path *path,
+			   struct dentry *dentry,
 			   char *xattr_name,
 			   char **xattr_buf);
 ssize_t ksmbd_vfs_casexattr_len(struct mnt_idmap *idmap,
-				const struct path *path, char *attr_name,
+				struct dentry *dentry, char *attr_name,
 				int attr_name_len);
 int ksmbd_vfs_setxattr(struct mnt_idmap *idmap,
 		       const struct path *path, const char *attr_name,
@@ -154,22 +154,21 @@ int ksmbd_vfs_set_sd_xattr(struct ksmbd_conn *conn,
 			   bool get_write);
 int ksmbd_vfs_get_sd_xattr(struct ksmbd_conn *conn,
 			   struct mnt_idmap *idmap,
-			   const struct path *path,
+			   struct dentry *dentry,
 			   struct smb_ntsd **pntsd);
 int ksmbd_vfs_set_dos_attrib_xattr(struct mnt_idmap *idmap,
 				   const struct path *path,
 				   struct xattr_dos_attrib *da,
 				   bool get_write);
 int ksmbd_vfs_get_dos_attrib_xattr(struct mnt_idmap *idmap,
-				   const struct path *path,
+				   struct dentry *dentry,
 				   struct xattr_dos_attrib *da);
 int ksmbd_vfs_set_init_posix_acl(struct mnt_idmap *idmap,
 				 const struct path *path);
 int ksmbd_vfs_inherit_posix_acl(struct mnt_idmap *idmap,
 				const struct path *path,
 				struct inode *parent_inode);
-void ksmbd_vfs_update_compressed_fattr(const struct path *path,
-				       __le32 *fattr);
+void ksmbd_vfs_update_compressed_fattr(struct dentry *dentry, __le32 *fattr);
 int ksmbd_vfs_get_compression(struct ksmbd_file *fp, u16 *fmt);
 int ksmbd_vfs_set_compression(struct ksmbd_work *work, struct ksmbd_file *fp, u16 fmt);
 #endif /* __KSMBD_VFS_H__ */

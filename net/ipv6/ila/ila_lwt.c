@@ -13,7 +13,6 @@
 #include <net/ip6_route.h>
 #include <net/lwtunnel.h>
 #include <net/protocol.h>
-#include <net/xfrm.h>
 #include <uapi/linux/ila.h>
 #include "ila.h"
 
@@ -64,7 +63,6 @@ static int ila_output(struct net *net, struct sock *sk, struct sk_buff *skb)
 	local_bh_enable();
 	if (unlikely(!dst)) {
 		struct ipv6hdr *ip6h = ipv6_hdr(skb);
-		struct xfrm_flow_origin origin = xfrm_flow_origin_none();
 		struct flowi6 fl6;
 
 		/* Lookup a route for the new destination. Take into
@@ -84,8 +82,7 @@ static int ila_output(struct net *net, struct sock *sk, struct sk_buff *skb)
 			goto drop;
 		}
 
-		dst = xfrm_lookup_origin(net, dst, flowi6_to_flowi(&fl6), NULL,
-					 &origin, 0);
+		dst = xfrm_lookup(net, dst, flowi6_to_flowi(&fl6), NULL, 0);
 		if (IS_ERR(dst)) {
 			err = PTR_ERR(dst);
 			goto drop;

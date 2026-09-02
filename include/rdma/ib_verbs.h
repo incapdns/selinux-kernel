@@ -1867,7 +1867,6 @@ enum port_pkey_state {
 };
 
 struct ib_qp_security;
-struct ib_policy_scope_watch;
 
 struct ib_port_pkey {
 	enum port_pkey_state	state;
@@ -1894,12 +1893,7 @@ struct ib_qp_security {
 	 */
 	struct list_head        shared_qp_list;
 	void                   *security;
-	struct ib_policy_scope_watch *policy_scope_watch;
 	bool			destroying;
-	atomic_t		policy_blocked;
-	atomic_t		policy_pending;
-	atomic_t		policy_revoked;
-	atomic_t		policy_error;
 	atomic_t		error_list_count;
 	struct completion	error_complete;
 	int			error_comps_pending;
@@ -4097,14 +4091,6 @@ static inline int ib_post_send(struct ib_qp *qp,
 {
 	const struct ib_send_wr *dummy;
 
-#ifdef CONFIG_SECURITY_INFINIBAND
-	if (qp->real_qp->qp_sec &&
-	    atomic_read(&qp->real_qp->qp_sec->policy_blocked)) {
-		if (bad_send_wr)
-			*bad_send_wr = send_wr;
-		return -EACCES;
-	}
-#endif
 	return qp->device->ops.post_send(qp, send_wr, bad_send_wr ? : &dummy);
 }
 
@@ -4122,14 +4108,6 @@ static inline int ib_post_recv(struct ib_qp *qp,
 {
 	const struct ib_recv_wr *dummy;
 
-#ifdef CONFIG_SECURITY_INFINIBAND
-	if (qp->real_qp->qp_sec &&
-	    atomic_read(&qp->real_qp->qp_sec->policy_blocked)) {
-		if (bad_recv_wr)
-			*bad_recv_wr = recv_wr;
-		return -EACCES;
-	}
-#endif
 	return qp->device->ops.post_recv(qp, recv_wr, bad_recv_wr ? : &dummy);
 }
 

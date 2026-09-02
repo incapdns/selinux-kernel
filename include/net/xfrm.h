@@ -19,7 +19,6 @@
 
 #include <net/sock.h>
 #include <net/dst.h>
-#include <net/xfrm_origin.h>
 #include <net/inet_dscp.h>
 #include <net/ip.h>
 #include <net/route.h>
@@ -1044,25 +1043,6 @@ __be16 xfrm_flowi_dport(const struct flowi *fl, const union flowi_uli *uli)
 bool xfrm_selector_match(const struct xfrm_selector *sel,
 			 const struct flowi *fl, unsigned short family);
 
-#ifdef CONFIG_SECURITY_NETWORK_XFRM
-/*	If neither has a context --> match
- * 	Otherwise, both must have a context and the sids, doi, alg must match
- */
-static inline bool xfrm_sec_ctx_match(struct xfrm_sec_ctx *s1, struct xfrm_sec_ctx *s2)
-{
-	return ((!s1 && !s2) ||
-		(s1 && s2 &&
-		 (s1->ctx_sid == s2->ctx_sid) &&
-		 (s1->ctx_doi == s2->ctx_doi) &&
-		 (s1->ctx_alg == s2->ctx_alg)));
-}
-#else
-static inline bool xfrm_sec_ctx_match(struct xfrm_sec_ctx *s1, struct xfrm_sec_ctx *s2)
-{
-	return true;
-}
-#endif
-
 /* A struct encoding bundle of transformations to apply to some set of flow.
  *
  * xdst->child points to the next element of bundle.
@@ -1708,7 +1688,6 @@ void xfrm_state_free(struct xfrm_state *x);
 struct xfrm_state *xfrm_state_find(const xfrm_address_t *daddr,
 				   const xfrm_address_t *saddr,
 				   const struct flowi *fl,
-				   const struct xfrm_flow_origin *origin,
 				   struct xfrm_tmpl *tmpl,
 				   struct xfrm_policy *pol, int *err,
 				   unsigned short family, u32 if_id);

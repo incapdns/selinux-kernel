@@ -120,6 +120,10 @@ struct pid_namespace *ipc_seq_pid_ns(struct seq_file *);
 #define ipc_init_proc_interface(path, header, ids, show) do {} while (0)
 #endif
 
+#define IPC_SEM_IDS	0
+#define IPC_MSG_IDS	1
+#define IPC_SHM_IDS	2
+
 #define ipcid_to_idx(id)  ((id) & IPCMNI_IDX_MASK)
 #define ipcid_to_seqx(id) ((id) >> ipcmni_seq_shift())
 #define ipcid_seq_max()	  (INT_MAX >> ipcmni_seq_shift())

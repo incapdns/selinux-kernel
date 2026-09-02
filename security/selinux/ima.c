@@ -15,15 +15,10 @@
 /*
  * selinux_ima_collect_state - Read selinux configuration settings
  *
- * @state: selinux_state
- * @snapshot: immutable policy metadata measured with @state
- *
  * On success returns the configuration settings string.
  * On error, returns NULL.
  */
-static char *selinux_ima_collect_state(
-	struct selinux_state *state,
-	const struct selinux_policy_snapshot *snapshot)
+static char *selinux_ima_collect_state(void)
 {
 	const char *on = "=1;", *off = "=0;";
 	char *buf;
@@ -42,27 +37,26 @@ static char *selinux_ima_collect_state(
 	rc = strscpy(buf, "initialized", buf_len);
 	WARN_ON(rc < 0);
 
-	rc = strlcat(buf, selinux_initialized(state) ? on : off, buf_len);
+	rc = strlcat(buf, selinux_initialized() ? on : off, buf_len);
 	WARN_ON(rc >= buf_len);
 
 	rc = strlcat(buf, "enforcing", buf_len);
 	WARN_ON(rc >= buf_len);
 
-	rc = strlcat(buf, enforcing_enabled(state) ? on : off, buf_len);
+	rc = strlcat(buf, enforcing_enabled() ? on : off, buf_len);
 	WARN_ON(rc >= buf_len);
 
 	rc = strlcat(buf, "checkreqprot", buf_len);
 	WARN_ON(rc >= buf_len);
 
-	rc = strlcat(buf, checkreqprot_get(state) ? on : off, buf_len);
+	rc = strlcat(buf, checkreqprot_get() ? on : off, buf_len);
 	WARN_ON(rc >= buf_len);
 
 	for (i = 0; i < __POLICYDB_CAP_MAX; i++) {
 		rc = strlcat(buf, selinux_policycap_names[i], buf_len);
 		WARN_ON(rc >= buf_len);
 
-		rc = strlcat(buf,
-			selinux_policy_snapshot_has_cap(snapshot, i) ? on : off,
+		rc = strlcat(buf, selinux_state.policycap[i] ? on : off,
 			buf_len);
 		WARN_ON(rc >= buf_len);
 	}
@@ -72,27 +66,17 @@ static char *selinux_ima_collect_state(
 
 /*
  * selinux_ima_measure_state_locked - Measure SELinux state and hash of policy
- *
- * @state: selinux state struct
  */
-void selinux_ima_measure_state_locked(struct selinux_state *state)
+void selinux_ima_measure_state_locked(void)
 {
 	char *state_str = NULL;
-	struct selinux_policy_snapshot snapshot;
 	void *policy = NULL;
 	size_t policy_len;
 	int rc = 0;
 
-	lockdep_assert_held(&state->policy_mutex);
+	lockdep_assert_held(&selinux_state.policy_mutex);
 
-	rc = selinux_policy_snapshot_read(state, &snapshot);
-	if (rc) {
-		pr_err("SELinux: %s: failed to snapshot state %d.\n",
-		       __func__, rc);
-		return;
-	}
-
-	state_str = selinux_ima_collect_state(state, &snapshot);
+	state_str = selinux_ima_collect_state();
 	if (!state_str) {
 		pr_err("SELinux: %s: failed to read state.\n", __func__);
 		return;
@@ -107,10 +91,10 @@ void selinux_ima_measure_state_locked(struct selinux_state *state)
 	/*
 	 * Measure SELinux policy only after initialization is completed.
 	 */
-	if (!selinux_initialized(state))
+	if (!selinux_initialized())
 		return;
 
-	rc = security_read_state_kernel(state, &policy, &policy_len);
+	rc = security_read_state_kernel(&policy, &policy_len);
 	if (rc) {
 		pr_err("SELinux: %s: failed to read policy %d.\n", __func__, rc);
 		return;
@@ -125,14 +109,12 @@ void selinux_ima_measure_state_locked(struct selinux_state *state)
 
 /*
  * selinux_ima_measure_state - Measure SELinux state and hash of policy
- *
- * @state: selinux state struct
  */
-void selinux_ima_measure_state(struct selinux_state *state)
+void selinux_ima_measure_state(void)
 {
-	lockdep_assert_not_held(&state->policy_mutex);
+	lockdep_assert_not_held(&selinux_state.policy_mutex);
 
-	mutex_lock(&state->policy_mutex);
-	selinux_ima_measure_state_locked(state);
-	mutex_unlock(&state->policy_mutex);
+	mutex_lock(&selinux_state.policy_mutex);
+	selinux_ima_measure_state_locked();
+	mutex_unlock(&selinux_state.policy_mutex);
 }

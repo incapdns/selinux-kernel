@@ -50,7 +50,7 @@ static const struct timeval audit_tv_default = {
 	 * Default socket timeout for audit_match_record() callers that expect a
 	 * record to arrive.  Asynchronous kauditd delivery can exceed 1 usec
 	 * under heavy debug configs (KASAN, lockdep), where kauditd_thread
-	 * scheduling between (void)audit_log_end_status() and netlink_unicast() takes longer
+	 * scheduling between audit_log_end() and netlink_unicast() takes longer
 	 * than the previous 1 usec timeout. 1 second is a generous ceiling: on
 	 * the happy path, kauditd delivers within dozens of usec.
 	 */

@@ -2182,7 +2182,7 @@ static int ib_uverbs_post_send(struct uverbs_attr_bundle *attrs)
 	}
 
 	resp.bad_wr = 0;
-	ret = ib_post_send(qp->real_qp, wr, &bad_wr);
+	ret = qp->device->ops.post_send(qp->real_qp, wr, &bad_wr);
 	if (ret)
 		for (next = wr; next; next = next->next) {
 			++resp.bad_wr;
@@ -2336,7 +2336,7 @@ static int ib_uverbs_post_recv(struct uverbs_attr_bundle *attrs)
 	}
 
 	resp.bad_wr = 0;
-	ret = ib_post_recv(qp->real_qp, wr, &bad_wr);
+	ret = qp->device->ops.post_recv(qp->real_qp, wr, &bad_wr);
 
 	rdma_lookup_put_uobject(&qp->uobject->uevent.uobject,
 				UVERBS_LOOKUP_READ);

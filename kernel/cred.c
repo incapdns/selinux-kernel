@@ -123,7 +123,7 @@ void exit_creds(struct task_struct *tsk)
  * The caller must also make sure task doesn't get deleted, either by holding a
  * ref on task or by holding tasklist_lock to prevent it from being unlinked.
  */
-const struct cred *get_task_cred(struct task_struct *task)
+const struct cred *get_task_cred(const struct task_struct *task)
 {
 	const struct cred *cred;
 
@@ -163,32 +163,26 @@ error:
 }
 
 /**
- * prepare_creds - Prepare a new set of credentials for modification
+ * prepare_creds_from - Prepare a referenced credential for modification
+ * @old: immutable credential to copy
  *
- * Prepare a new set of task credentials for modification.  A task's creds
- * shouldn't generally be modified directly, therefore this function is used to
- * prepare a new copy, which the caller then modifies and then commits by
- * calling commit_creds().
+ * The caller must hold a reference to @old.  The returned credential owns
+ * independent references to every shared component and may either be linked
+ * into another immutable credential or passed to commit_creds().
  *
- * Preparation involves making a copy of the objective creds for modification.
- *
- * Returns a pointer to the new creds-to-be if successful, NULL otherwise.
- *
- * Call commit_creds() or abort_creds() to clean up.
+ * Return: A modifiable credential on success, or %NULL on allocation failure.
  */
-struct cred *prepare_creds(void)
+struct cred *prepare_creds_from(const struct cred *old)
 {
-	struct task_struct *task = current;
-	const struct cred *old;
 	struct cred *new;
 
+	if (WARN_ON_ONCE(!old))
+		return NULL;
 	new = kmem_cache_alloc(cred_jar, GFP_KERNEL);
 	if (!new)
 		return NULL;
 
-	kdebug("prepare_creds() alloc %p", new);
-
-	old = task->cred;
+	kdebug("prepare_creds_from() alloc %p", new);
 	memcpy(new, old, sizeof(struct cred));
 
 	new->non_rcu = 0;
@@ -220,6 +214,17 @@ struct cred *prepare_creds(void)
 error:
 	abort_creds(new);
 	return NULL;
+}
+EXPORT_SYMBOL(prepare_creds_from);
+
+/**
+ * prepare_creds - Prepare the current task's credentials for modification
+ *
+ * Return: A modifiable credential on success, or %NULL on allocation failure.
+ */
+struct cred *prepare_creds(void)
+{
+	return prepare_creds_from(current->cred);
 }
 EXPORT_SYMBOL(prepare_creds);
 
@@ -617,16 +622,7 @@ EXPORT_SYMBOL(prepare_kernel_cred);
  */
 int set_security_override(struct cred *new, u32 secid)
 {
-	struct lsm_prop_ref *ref = NULL;
-	int ret;
-
-	ret = security_secid_to_lsmprop_ref(secid, LSM_ID_UNDEF, GFP_KERNEL,
-					    &ref);
-	if (ret)
-		return ret;
-	ret = security_kernel_act_as_ref(new, ref);
-	security_lsm_prop_ref_put(ref);
-	return ret;
+	return security_kernel_act_as(new, secid);
 }
 EXPORT_SYMBOL(set_security_override);
 

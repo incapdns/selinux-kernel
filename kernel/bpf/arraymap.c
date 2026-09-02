@@ -3,7 +3,6 @@
  * Copyright (c) 2016,2017 Facebook
  */
 #include <linux/bpf.h>
-#include <linux/security.h>
 #include <linux/btf.h>
 #include <linux/err.h>
 #include <linux/slab.h>
@@ -886,36 +885,10 @@ int bpf_fd_array_map_lookup_elem(struct bpf_map *map, void *key, u32 *value)
 
 	rcu_read_lock();
 	elem = array_map_lookup_elem(map, key);
-	ptr = elem ? READ_ONCE(*elem) : NULL;
-	if (!ptr) {
-		rcu_read_unlock();
-		return -ENOENT;
-	}
-	if (map->map_type == BPF_MAP_TYPE_PROG_ARRAY) {
-		struct bpf_prog *prog = bpf_prog_inc_not_zero(ptr);
-
-		rcu_read_unlock();
-		if (IS_ERR(prog))
-			return PTR_ERR(prog);
-		ret = security_bpf_prog(prog);
-		if (!ret)
-			*value = map->ops->map_fd_sys_lookup_elem(prog);
-		bpf_prog_put(prog);
-		return ret;
-	}
-	if (map->map_type == BPF_MAP_TYPE_ARRAY_OF_MAPS) {
-		struct bpf_map *inner = __bpf_map_inc_not_zero(ptr, false);
-
-		rcu_read_unlock();
-		if (IS_ERR(inner))
-			return PTR_ERR(inner);
-		ret = security_bpf_map(inner, FMODE_READ);
-		if (!ret)
-			*value = map->ops->map_fd_sys_lookup_elem(inner);
-		bpf_map_put(inner);
-		return ret;
-	}
-	*value = map->ops->map_fd_sys_lookup_elem(ptr);
+	if (elem && (ptr = READ_ONCE(*elem)))
+		*value = map->ops->map_fd_sys_lookup_elem(ptr);
+	else
+		ret = -ENOENT;
 	rcu_read_unlock();
 
 	return ret;
@@ -928,7 +901,6 @@ int bpf_fd_array_map_update_elem(struct bpf_map *map, struct file *map_file,
 	struct bpf_array *array = container_of(map, struct bpf_array, map);
 	void *new_ptr, *old_ptr;
 	u32 index = *(u32 *)key, ufd;
-	int ret;
 
 	if (map_flags != BPF_ANY)
 		return -EINVAL;
@@ -940,16 +912,6 @@ int bpf_fd_array_map_update_elem(struct bpf_map *map, struct file *map_file,
 	new_ptr = map->ops->map_fd_get_ptr(map, map_file, ufd);
 	if (IS_ERR(new_ptr))
 		return PTR_ERR(new_ptr);
-	if (map->map_type == BPF_MAP_TYPE_PROG_ARRAY)
-		ret = security_bpf_map_relation(map, NULL, new_ptr);
-	else if (map->map_type == BPF_MAP_TYPE_ARRAY_OF_MAPS)
-		ret = security_bpf_map_relation(map, new_ptr, NULL);
-	else
-		ret = 0;
-	if (ret) {
-		map->ops->map_fd_put_ptr(map, new_ptr, false);
-		return ret;
-	}
 
 	if (map->ops->map_poke_run) {
 		mutex_lock(&array->aux->poke_mutex);
@@ -1271,9 +1233,7 @@ const struct bpf_map_ops prog_array_map_ops = {
 };
 
 static struct bpf_event_entry *bpf_event_entry_gen(struct file *perf_file,
-						   struct file *map_file,
-						   struct perf_event_relation *read_relation,
-						   struct perf_event_relation *write_relation)
+						   struct file *map_file)
 {
 	struct bpf_event_entry *ee;
 
@@ -1282,8 +1242,6 @@ static struct bpf_event_entry *bpf_event_entry_gen(struct file *perf_file,
 		ee->event = perf_file->private_data;
 		ee->perf_file = perf_file;
 		ee->map_file = map_file;
-		ee->read_relation = read_relation;
-		ee->write_relation = write_relation;
 	}
 
 	return ee;
@@ -1294,8 +1252,6 @@ static void __bpf_event_entry_free(struct rcu_head *rcu)
 	struct bpf_event_entry *ee;
 
 	ee = container_of(rcu, struct bpf_event_entry, rcu);
-	security_perf_event_relation_put(ee->read_relation);
-	security_perf_event_relation_put(ee->write_relation);
 	fput(ee->perf_file);
 	kfree(ee);
 }
@@ -1310,12 +1266,8 @@ static void *perf_event_fd_array_get_ptr(struct bpf_map *map,
 {
 	struct bpf_event_entry *ee;
 	struct perf_event *event;
-	const struct perf_event_attr *attr;
-	struct perf_event_relation *read_relation = NULL;
-	struct perf_event_relation *write_relation = NULL;
 	struct file *perf_file;
 	u64 value;
-	int err;
 
 	perf_file = perf_event_get(fd);
 	if (IS_ERR(perf_file))
@@ -1323,47 +1275,14 @@ static void *perf_event_fd_array_get_ptr(struct bpf_map *map,
 
 	ee = ERR_PTR(-EOPNOTSUPP);
 	event = perf_file->private_data;
-	attr = perf_event_attrs(event);
-	if (IS_ERR(attr))
-		goto err_out;
-	/*
-	 * The setup probe below reads every event.  BPF output events can also be
-	 * consumed by the read helpers, so publish one indivisible READ|WRITE
-	 * decision and retain one reference for each use.
-	 */
-	if (attr->type == PERF_TYPE_SOFTWARE &&
-	    attr->config == PERF_COUNT_SW_BPF_OUTPUT) {
-		err = security_perf_event_relation_create_composite(
-			event, PERF_SECURITY_RELATION_READ |
-			       PERF_SECURITY_RELATION_WRITE,
-			NULL, 0, NULL, map,
-			FMODE_WRITE, &write_relation);
-		if (!err)
-			read_relation = security_perf_event_relation_get(
-				write_relation);
-	} else {
-		err = security_perf_event_relation_create_composite(
-			event, PERF_SECURITY_RELATION_READ, NULL, 0, NULL, map,
-			FMODE_WRITE, &read_relation);
-	}
-	if (err) {
-		ee = ERR_PTR(err);
-		goto err_out;
-	}
 	if (perf_event_read_local(event, &value, NULL, NULL) == -EOPNOTSUPP)
 		goto err_out;
 
-	ee = bpf_event_entry_gen(perf_file, map_file, read_relation,
-				 write_relation);
-	if (ee) {
-		read_relation = NULL;
-		write_relation = NULL;
+	ee = bpf_event_entry_gen(perf_file, map_file);
+	if (ee)
 		return ee;
-	}
 	ee = ERR_PTR(-ENOMEM);
 err_out:
-	security_perf_event_relation_put(read_relation);
-	security_perf_event_relation_put(write_relation);
 	fput(perf_file);
 	return ee;
 }

@@ -15,10 +15,6 @@
 #include <linux/audit.h>
 #include <linux/types.h>
 
-struct selinux_state;
-struct selinux_avc;
-struct lsm_prop_ref;
-
 /**
  * selinux_audit_rule_avc_callback - update the audit LSM rules on AVC events.
  * @event: the AVC event
@@ -26,7 +22,7 @@ struct lsm_prop_ref;
  * Update any audit LSM rules based on the AVC event specified in @event.
  * Returns 0 on success, negative values otherwise.
  */
-int selinux_audit_rule_avc_callback(struct selinux_avc *avc, u32 event);
+int selinux_audit_rule_avc_callback(u32 event);
 
 /**
  * selinux_audit_rule_init - alloc/init an selinux audit rule structure.
@@ -53,18 +49,8 @@ int selinux_audit_rule_init(u32 field, u32 op, char *rulestr, void **rule,
 void selinux_audit_rule_free(void *rule);
 
 /**
- * selinux_audit_rule_state - return the policy state retained by a rule.
- * @rule: pointer to the audit rule
- *
- * The returned state remains valid for the duration of a rule match because
- * the audit rule owns a reference until selinux_audit_rule_free().
- */
-struct selinux_state *selinux_audit_rule_state(void *rule);
-
-/**
  * selinux_audit_rule_match - determine if a context ID matches a rule.
- * @ref: immutable identity carrier, when available
- * @prop: includes the compatibility context ID to check
+ * @prop: includes the context ID to check
  * @field: the field this rule refers to
  * @op: the operator the rule uses
  * @rule: pointer to the audit rule to check against
@@ -72,20 +58,8 @@ struct selinux_state *selinux_audit_rule_state(void *rule);
  * Returns 1 if the context id matches the rule, 0 if it does not, and
  * -errno on failure.
  */
-#ifdef CONFIG_SECURITY_SELINUX_NS
-int selinux_audit_rule_match(const struct lsm_prop_ref *ref,
-			     const struct lsm_prop *prop, u32 field, u32 op,
+int selinux_audit_rule_match(struct lsm_prop *prop, u32 field, u32 op,
 			     void *rule);
-#else
-static inline int selinux_audit_rule_match(const struct lsm_prop_ref *ref,
-					   const struct lsm_prop *prop,
-					   u32 field,
-					   u32 op, void *rule)
-{
-	(void)ref;
-	return selinux_ss_audit_rule_match(prop, field, op, rule);
-}
-#endif
 
 /**
  * selinux_audit_rule_known - check to see if rule contains selinux fields.

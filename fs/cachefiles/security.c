@@ -18,7 +18,7 @@ int cachefiles_get_security_ID(struct cachefiles_cache *cache)
 	struct cred *new;
 	int ret;
 
-	_enter("{%u}", cache->secctx_ref ? cache->secid : 0);
+	_enter("{%u}", cache->have_secid ? cache->secid : 0);
 
 	new = prepare_kernel_cred(current);
 	if (!new) {
@@ -26,8 +26,8 @@ int cachefiles_get_security_ID(struct cachefiles_cache *cache)
 		goto error;
 	}
 
-	if (cache->secctx_ref) {
-		ret = security_kernel_act_as_ref(new, cache->secctx_ref);
+	if (cache->have_secid) {
+		ret = set_security_override(new, cache->secid);
 		if (ret < 0) {
 			put_cred(new);
 			pr_err("Security denies permission to nominate security context: error %d\n",
@@ -43,44 +43,6 @@ error:
 	return ret;
 }
 
-#ifdef CONFIG_KUNIT
-/*
- * Exercise the real CacheFiles override path while keeping the fixture local.
- * In particular, @diagnostic_secid must never become override authority.
- */
-int cachefiles_kunit_apply_secctx_ref(struct lsm_prop_ref *ref,
-				     u32 diagnostic_secid,
-				     struct lsm_prop *applied_prop)
-{
-	struct cachefiles_cache cache = {
-		.secctx_ref = ref,
-		.secid = diagnostic_secid,
-	};
-	struct lsm_prop_ref *applied_ref = NULL;
-	const struct lsm_prop *prop;
-	int ret;
-
-	if (!ref || !applied_prop)
-		return -EINVAL;
-	lsmprop_init(applied_prop);
-	ret = cachefiles_get_security_ID(&cache);
-	if (ret)
-		return ret;
-	ret = security_cred_getlsmprop_ref(cache.cache_cred, GFP_KERNEL,
-					    &applied_ref);
-	if (!ret) {
-		prop = security_lsm_prop_ref_prop(applied_ref);
-		if (prop)
-			*applied_prop = *prop;
-		else
-			ret = -EIO;
-	}
-	security_lsm_prop_ref_put(applied_ref);
-	put_cred(cache.cache_cred);
-	return ret;
-}
-#endif
-
 /*
  * see if mkdir and create can be performed in the root directory
  */
@@ -89,16 +51,14 @@ static int cachefiles_check_cache_dir(struct cachefiles_cache *cache,
 {
 	int ret;
 
-	ret = security_inode_mkdir_mnt(cache->mnt, d_backing_inode(root), root,
-				       0);
+	ret = security_inode_mkdir(d_backing_inode(root), root, 0);
 	if (ret < 0) {
 		pr_err("Security denies permission to make dirs: error %d",
 		       ret);
 		return ret;
 	}
 
-	ret = security_inode_create_mnt(cache->mnt, d_backing_inode(root), root,
-					0);
+	ret = security_inode_create(d_backing_inode(root), root, 0);
 	if (ret < 0)
 		pr_err("Security denies permission to create files: error %d",
 		       ret);

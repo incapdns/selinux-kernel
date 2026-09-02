@@ -100,7 +100,7 @@ struct audit_aux_data_pids {
 	kuid_t			target_auid[AUDIT_AUX_PIDS];
 	kuid_t			target_uid[AUDIT_AUX_PIDS];
 	unsigned int		target_sessionid[AUDIT_AUX_PIDS];
-	struct lsm_prop_ref	*target_ref[AUDIT_AUX_PIDS];
+	struct lsm_prop		target_ref[AUDIT_AUX_PIDS];
 	char 			target_comm[AUDIT_AUX_PIDS][TASK_COMM_LEN];
 	int			pid_count;
 };
@@ -228,63 +228,6 @@ static void audit_set_auditable(struct audit_context *ctx)
 		ctx->current_state = AUDIT_STATE_RECORD;
 	}
 }
-
-/*
- * Publish a complete immutable carrier or no property at all.  Capture
- * failures must not leave either a stale carrier or a partially populated
- * scalar projection in a deferred audit record.
- */
-static void audit_replace_prop_ref(struct audit_context *ctx,
-				   struct lsm_prop_ref **slot,
-				   struct lsm_prop_ref *new_ref, int rc)
-{
-	struct lsm_prop_ref *old_ref;
-
-	if (!rc && !new_ref)
-		rc = -EINVAL;
-	old_ref = xchg(slot, rc ? NULL : new_ref);
-	security_lsm_prop_ref_put(old_ref);
-	if (!rc)
-		return;
-
-	security_lsm_prop_ref_put(new_ref);
-	/*
-	 * No provider is the legacy "no object label" result, including a
-	 * SECURITY=y stack whose active LSM does not implement this source kind.
-	 * Structural, lifetime and allocation failures remain audit-loss events.
-	 */
-	if (rc == -EOPNOTSUPP)
-		return;
-	audit_set_auditable(ctx);
-	audit_log_lost("failed to capture deferred LSM property");
-}
-
-static int audit_prop_ref_rule_match(struct lsm_prop_ref *ref, u32 field,
-				     u32 op, void *rule)
-{
-	return ref ? security_audit_rule_match_ref(ref, 0, field, op, rule) : 0;
-}
-
-static int audit_names_prop_ref_rule_match(struct audit_context *ctx,
-					   u32 field, u32 op, void *rule)
-{
-	struct audit_names *name;
-
-	list_for_each_entry(name, &ctx->names_list, list) {
-		int match = audit_prop_ref_rule_match(name->oprop, field, op,
-						      rule);
-
-		if (match)
-			return match;
-	}
-	return 0;
-}
-
-struct audit_lsm_subject {
-	struct lsm_prop_ref *ref;
-	int status;
-	bool captured;
-};
 
 static int put_tree_ref(struct audit_context *ctx, struct audit_chunk *chunk)
 {
@@ -523,11 +466,11 @@ static int audit_filter_rules(struct task_struct *tsk,
 			      struct audit_context *ctx,
 			      struct audit_names *name,
 			      enum audit_state *state,
-			      bool task_creation,
-			      struct audit_lsm_subject *subject)
+			      bool task_creation)
 {
 	const struct cred *cred;
-	int i;
+	int i, need_sid = 1;
+	struct lsm_prop prop = { };
 	unsigned int sessionid;
 
 	if (ctx && rule->prio <= ctx->prio)
@@ -725,17 +668,24 @@ static int audit_filter_rules(struct task_struct *tsk,
 			   may be wanted.   An error message will also be
 			   logged upon error */
 			if (f->lsm_rule) {
-				if (!subject->captured) {
-					/* Retain @tsk's exact immutable cred carrier once. */
-					subject->status =
-						security_cred_getlsmprop_ref(
-							cred, GFP_ATOMIC,
-							&subject->ref);
-					subject->captured = true;
+				if (need_sid) {
+					/* @tsk should always be equal to
+					 * @current with the exception of
+					 * fork()/copy_process() in which case
+					 * the new @tsk creds are still a dup
+					 * of @current's creds so we can still
+					 * use
+					 * security_current_getlsmprop_subj()
+					 * here even though it always refs
+					 * @current's creds
+					 */
+					security_current_getlsmprop_subj(&prop);
+					need_sid = 0;
 				}
-				result = security_audit_rule_match_ref(
-					subject->ref, subject->status, f->type,
-					f->op, f->lsm_rule);
+				result = security_audit_rule_match(&prop,
+								   f->type,
+								   f->op,
+								   f->lsm_rule);
 			}
 			break;
 		case AUDIT_OBJ_USER:
@@ -748,25 +698,30 @@ static int audit_filter_rules(struct task_struct *tsk,
 			if (f->lsm_rule) {
 				/* Find files that match */
 				if (name) {
-					result = audit_prop_ref_rule_match(
-						name->oprop, f->type, f->op,
-						f->lsm_rule);
-				} else if (ctx)
-					result = audit_names_prop_ref_rule_match(
-						ctx, f->type, f->op, f->lsm_rule);
-				/* Find ipc objects that match */
-				if (result < 0 || !ctx || ctx->type != AUDIT_IPC)
-					break;
-				{
-					int match = audit_prop_ref_rule_match(
-						ctx->ipc.oprop, f->type, f->op,
-						f->lsm_rule);
-
-					if (match < 0)
-						result = match;
-					else if (match)
-						++result;
+					result = security_audit_rule_match(
+								&name->oprop,
+								f->type,
+								f->op,
+								f->lsm_rule);
+				} else if (ctx) {
+					list_for_each_entry(n, &ctx->names_list, list) {
+						if (security_audit_rule_match(
+								&n->oprop,
+								f->type,
+								f->op,
+								f->lsm_rule)) {
+							++result;
+							break;
+						}
+					}
 				}
+				/* Find ipc objects that match */
+				if (!ctx || ctx->type != AUDIT_IPC)
+					break;
+				if (security_audit_rule_match(&ctx->ipc.oprop,
+							      f->type, f->op,
+							      f->lsm_rule))
+					++result;
 			}
 			break;
 		case AUDIT_ARG0:
@@ -794,14 +749,8 @@ static int audit_filter_rules(struct task_struct *tsk,
 			result = audit_field_compare(tsk, cred, f, ctx, name);
 			break;
 		}
-		if (result < 0) {
-			/* Projection failure must never suppress an audit record. */
-			if (rule->action == AUDIT_NEVER)
-				goto no_match;
-			result = 1;
-		}
 		if (!result)
-			goto no_match;
+			return 0;
 	}
 
 	if (ctx) {
@@ -820,9 +769,6 @@ static int audit_filter_rules(struct task_struct *tsk,
 		break;
 	}
 	return 1;
-
-no_match:
-	return 0;
 }
 
 /* At process creation time, we can determine if system-call auditing is
@@ -832,22 +778,19 @@ no_match:
 static enum audit_state audit_filter_task(struct task_struct *tsk, char **key)
 {
 	struct audit_entry *e;
-	struct audit_lsm_subject subject = {};
 	enum audit_state   state;
 
 	rcu_read_lock();
 	list_for_each_entry_rcu(e, &audit_filter_list[AUDIT_FILTER_TASK], list) {
 		if (audit_filter_rules(tsk, &e->rule, NULL, NULL,
-				       &state, true, &subject)) {
+				       &state, true)) {
 			if (state == AUDIT_STATE_RECORD)
 				*key = kstrdup(e->rule.filterkey, GFP_ATOMIC);
 			rcu_read_unlock();
-			security_lsm_prop_ref_put(subject.ref);
 			return state;
 		}
 	}
 	rcu_read_unlock();
-	security_lsm_prop_ref_put(subject.ref);
 	return AUDIT_STATE_BUILD;
 }
 
@@ -888,19 +831,16 @@ static int __audit_filter_op(struct task_struct *tsk,
 			   unsigned long op)
 {
 	struct audit_entry *e;
-	struct audit_lsm_subject subject = {};
 	enum audit_state state;
 
 	list_for_each_entry_rcu(e, list, list) {
 		if (audit_in_mask(&e->rule, op) &&
 		    audit_filter_rules(tsk, &e->rule, ctx, name,
-				       &state, false, &subject)) {
+				       &state, false)) {
 			ctx->current_state = state;
-			security_lsm_prop_ref_put(subject.ref);
 			return 1;
 		}
 	}
-	security_lsm_prop_ref_put(subject.ref);
 	return 0;
 }
 
@@ -993,8 +933,6 @@ static inline void audit_free_names(struct audit_context *context)
 
 	list_for_each_entry_safe(n, next, &context->names_list, list) {
 		list_del(&n->list);
-		security_lsm_prop_ref_put(n->oprop);
-		n->oprop = NULL;
 		if (n->name)
 			putname(n->name);
 		if (n->should_free)
@@ -1016,29 +954,10 @@ static inline void audit_free_aux(struct audit_context *context)
 	}
 	context->aux = NULL;
 	while ((aux = context->aux_pids)) {
-		struct audit_aux_data_pids *axs = (void *)aux;
-		int i;
-
 		context->aux_pids = aux->next;
-		for (i = 0; i < axs->pid_count; i++) {
-			security_lsm_prop_ref_put(axs->target_ref[i]);
-			axs->target_ref[i] = NULL;
-		}
 		kfree(aux);
 	}
 	context->aux_pids = NULL;
-}
-
-/* Keep the IPC carrier valid despite the special-record union being reused. */
-static void audit_set_type(struct audit_context *context, int type)
-{
-	if (context->type == AUDIT_IPC && type != AUDIT_IPC) {
-		security_lsm_prop_ref_put(context->ipc.oprop);
-		context->ipc.oprop = NULL;
-	} else if (context->type != AUDIT_IPC && type == AUDIT_IPC) {
-		context->ipc.oprop = NULL;
-	}
-	context->type = type;
 }
 
 /**
@@ -1100,14 +1019,13 @@ static void audit_reset_context(struct audit_context *ctx)
 	ctx->target_pid = 0;
 	ctx->target_auid = ctx->target_uid = KUIDT_INIT(0);
 	ctx->target_sessionid = 0;
-	security_lsm_prop_ref_put(ctx->target_ref);
-	ctx->target_ref = NULL;
+	lsmprop_init(&ctx->target_ref);
 	ctx->target_comm[0] = '\0';
 	unroll_tree_refs(ctx, NULL, 0);
 	WARN_ON(!list_empty(&ctx->killed_trees));
 	audit_free_module(ctx);
 	ctx->fds[0] = -1;
-	audit_set_type(ctx, 0); /* reset last for audit_free_*() */
+	ctx->type = 0; /* reset last for audit_free_*() */
 }
 
 static inline struct audit_context *audit_alloc_context(enum audit_state state)
@@ -1176,12 +1094,10 @@ static inline void audit_free_context(struct audit_context *context)
 
 static int audit_log_pid_context(struct audit_context *context, pid_t pid,
 				 kuid_t auid, kuid_t uid,
-				 unsigned int sessionid,
-				 struct lsm_prop_ref *prop_ref,
+				 unsigned int sessionid, struct lsm_prop *prop,
 				 char *comm)
 {
 	struct audit_buffer *ab;
-	const struct lsm_prop *prop = security_lsm_prop_ref_prop(prop_ref);
 	int rc = 0;
 
 	ab = audit_log_start(context, GFP_KERNEL, AUDIT_OBJ_PID);
@@ -1191,12 +1107,12 @@ static int audit_log_pid_context(struct audit_context *context, pid_t pid,
 	audit_log_format(ab, "opid=%d oauid=%d ouid=%d oses=%d", pid,
 			 from_kuid(&init_user_ns, auid),
 			 from_kuid(&init_user_ns, uid), sessionid);
-	if (prop && lsmprop_is_set(prop) && audit_log_obj_ctx(ab, prop))
+	if (lsmprop_is_set(prop) && audit_log_obj_ctx(ab, prop))
 		rc = 1;
 
 	audit_log_format(ab, " ocomm=");
 	audit_log_untrustedstring(ab, comm);
-	(void)audit_log_end_status(ab);
+	audit_log_end(ab);
 
 	return rc;
 }
@@ -1309,7 +1225,7 @@ static void audit_log_execve_info(struct audit_context *context,
 			 *       a new buffer */
 			if ((sizeof(abuf) + 8) > len_rem) {
 				len_rem = len_max;
-				(void)audit_log_end_status(*ab);
+				audit_log_end(*ab);
 				*ab = audit_log_start(context,
 						      GFP_KERNEL, AUDIT_EXECVE);
 				if (!*ab)
@@ -1369,7 +1285,7 @@ static void audit_log_execve_info(struct audit_context *context,
 		}
 	} while (arg < context->execve.argc);
 
-	/* NOTE: the caller handles the final (void)audit_log_end_status() call */
+	/* NOTE: the caller handles the final audit_log_end() call */
 
 out:
 	kfree(buf_head);
@@ -1426,7 +1342,7 @@ static void audit_log_time(struct audit_context *context, struct audit_buffer **
 						 ntp_name[type],
 						 ntp->vals[type].oldval,
 						 ntp->vals[type].newval);
-				(void)audit_log_end_status(*ab);
+				audit_log_end(*ab);
 				*ab = NULL;
 			}
 		}
@@ -1440,7 +1356,7 @@ static void audit_log_time(struct audit_context *context, struct audit_buffer **
 		}
 		audit_log_format(*ab, "sec=%lli nsec=%li",
 				 (long long)tk->tv_sec, tk->tv_nsec);
-		(void)audit_log_end_status(*ab);
+		audit_log_end(*ab);
 		*ab = NULL;
 	}
 }
@@ -1464,20 +1380,16 @@ static void show_special(struct audit_context *context, int *call_panic)
 				context->socketcall.args[i]);
 		break; }
 	case AUDIT_IPC:
-	{
-		const struct lsm_prop *prop =
-			security_lsm_prop_ref_prop(context->ipc.oprop);
-
 		audit_log_format(ab, "ouid=%u ogid=%u mode=%#ho",
 				 from_kuid(&init_user_ns, context->ipc.uid),
 				 from_kgid(&init_user_ns, context->ipc.gid),
 				 context->ipc.mode);
-		if (prop && lsmprop_is_set(prop)) {
-			if (audit_log_obj_ctx(ab, prop))
+		if (lsmprop_is_set(&context->ipc.oprop)) {
+			if (audit_log_obj_ctx(ab, &context->ipc.oprop))
 				*call_panic = 1;
 		}
 		if (context->ipc.has_perm) {
-			(void)audit_log_end_status(ab);
+			audit_log_end(ab);
 			ab = audit_log_start(context, GFP_KERNEL,
 					     AUDIT_IPC_SET_PERM);
 			if (unlikely(!ab))
@@ -1490,7 +1402,6 @@ static void show_special(struct audit_context *context, int *call_panic)
 				context->ipc.perm_mode);
 		}
 		break;
-	}
 	case AUDIT_MQ_OPEN:
 		audit_log_format(ab,
 			"oflag=0x%x mode=%#ho mq_flags=0x%lx mq_maxmsg=%ld "
@@ -1560,7 +1471,7 @@ static void show_special(struct audit_context *context, int *call_panic)
 		audit_log_time(context, &ab);
 		break;
 	}
-	(void)audit_log_end_status(ab);
+	audit_log_end(ab);
 }
 
 static inline int audit_proctitle_rtrim(char *proctitle, int len)
@@ -1588,7 +1499,6 @@ static void audit_log_name(struct audit_context *context, struct audit_names *n,
 		    const struct path *path, int record_num, int *call_panic)
 {
 	struct audit_buffer *ab;
-	const struct lsm_prop *prop = security_lsm_prop_ref_prop(n->oprop);
 
 	ab = audit_log_start(context, GFP_KERNEL, AUDIT_PATH);
 	if (!ab)
@@ -1633,7 +1543,8 @@ static void audit_log_name(struct audit_context *context, struct audit_names *n,
 				 from_kgid(&init_user_ns, n->gid),
 				 MAJOR(n->rdev),
 				 MINOR(n->rdev));
-	if (prop && lsmprop_is_set(prop) && audit_log_obj_ctx(ab, prop))
+	if (lsmprop_is_set(&n->oprop) &&
+	    audit_log_obj_ctx(ab, &n->oprop))
 		*call_panic = 2;
 
 	/* log the audit_names record type */
@@ -1656,7 +1567,7 @@ static void audit_log_name(struct audit_context *context, struct audit_names *n,
 	}
 
 	audit_log_fcaps(ab, n);
-	(void)audit_log_end_status(ab);
+	audit_log_end(ab);
 }
 
 static void audit_log_proctitle(void)
@@ -1697,7 +1608,7 @@ static void audit_log_proctitle(void)
 	len = context->proctitle.len;
 out:
 	audit_log_n_untrustedstring(ab, msg, len);
-	(void)audit_log_end_status(ab);
+	audit_log_end(ab);
 }
 
 /**
@@ -1735,7 +1646,7 @@ static void audit_log_uring(struct audit_context *ctx)
 			 from_kgid(&init_user_ns, cred->fsgid));
 	audit_log_task_context(ab);
 	audit_log_key(ab, ctx->filterkey);
-	(void)audit_log_end_status(ab);
+	audit_log_end(ab);
 }
 
 static void audit_log_exit(void)
@@ -1771,7 +1682,7 @@ static void audit_log_exit(void)
 				 context->name_count);
 		audit_log_task_info(ab);
 		audit_log_key(ab, context->filterkey);
-		(void)audit_log_end_status(ab);
+		audit_log_end(ab);
 		break;
 	case AUDIT_CTX_URING:
 		audit_log_uring(context);
@@ -1810,7 +1721,7 @@ static void audit_log_exit(void)
 			break; }
 
 		}
-		(void)audit_log_end_status(ab);
+		audit_log_end(ab);
 	}
 
 	if (context->type)
@@ -1821,7 +1732,7 @@ static void audit_log_exit(void)
 		if (ab) {
 			audit_log_format(ab, "fd0=%d fd1=%d",
 					context->fds[0], context->fds[1]);
-			(void)audit_log_end_status(ab);
+			audit_log_end(ab);
 		}
 	}
 
@@ -1831,7 +1742,7 @@ static void audit_log_exit(void)
 			audit_log_format(ab, "saddr=");
 			audit_log_n_hex(ab, (void *)context->sockaddr,
 					context->sockaddr_len);
-			(void)audit_log_end_status(ab);
+			audit_log_end(ab);
 		}
 	}
 
@@ -1843,7 +1754,7 @@ static void audit_log_exit(void)
 						  axs->target_auid[i],
 						  axs->target_uid[i],
 						  axs->target_sessionid[i],
-						  axs->target_ref[i],
+						  &axs->target_ref[i],
 						  axs->target_comm[i]))
 				call_panic = 1;
 	}
@@ -1852,7 +1763,7 @@ static void audit_log_exit(void)
 	    audit_log_pid_context(context, context->target_pid,
 				  context->target_auid, context->target_uid,
 				  context->target_sessionid,
-				  context->target_ref,
+				  &context->target_ref,
 				  context->target_comm))
 		call_panic = 1;
 
@@ -1860,7 +1771,7 @@ static void audit_log_exit(void)
 		ab = audit_log_start(context, GFP_KERNEL, AUDIT_CWD);
 		if (ab) {
 			audit_log_d_path(ab, "cwd=", &context->pwd);
-			(void)audit_log_end_status(ab);
+			audit_log_end(ab);
 		}
 	}
 
@@ -1877,7 +1788,7 @@ static void audit_log_exit(void)
 	/* Send end of event record to help user space know we are finished */
 	ab = audit_log_start(context, GFP_KERNEL, AUDIT_EOE);
 	if (ab)
-		(void)audit_log_end_status(ab);
+		audit_log_end(ab);
 	if (call_panic)
 		audit_panic("error in audit_log_exit()");
 }
@@ -2311,17 +2222,13 @@ static void audit_copy_inode(struct audit_names *name,
 			     const struct dentry *dentry,
 			     struct inode *inode, unsigned int flags)
 {
-	struct lsm_prop_ref *oprop = NULL;
-	int rc;
-
 	name->ino   = inode->i_ino;
 	name->dev   = inode->i_sb->s_dev;
 	name->mode  = inode->i_mode;
 	name->uid   = inode->i_uid;
 	name->gid   = inode->i_gid;
 	name->rdev  = inode->i_rdev;
-	rc = security_inode_getlsmprop_ref(inode, GFP_NOFS, &oprop);
-	audit_replace_prop_ref(audit_context(), &name->oprop, oprop, rc);
+	security_inode_getlsmprop(inode, &name->oprop);
 	if (flags & AUDIT_INODE_NOEVAL) {
 		name->fcap_ver = -1;
 		return;
@@ -2581,7 +2488,6 @@ void __audit_mq_open(int oflag, umode_t mode, struct mq_attr *attr)
 {
 	struct audit_context *context = audit_context();
 
-	audit_set_type(context, AUDIT_MQ_OPEN);
 	if (attr)
 		memcpy(&context->mq_open.attr, attr, sizeof(struct mq_attr));
 	else
@@ -2590,6 +2496,7 @@ void __audit_mq_open(int oflag, umode_t mode, struct mq_attr *attr)
 	context->mq_open.oflag = oflag;
 	context->mq_open.mode = mode;
 
+	context->type = AUDIT_MQ_OPEN;
 }
 
 /**
@@ -2606,7 +2513,6 @@ void __audit_mq_sendrecv(mqd_t mqdes, size_t msg_len, unsigned int msg_prio,
 	struct audit_context *context = audit_context();
 	struct timespec64 *p = &context->mq_sendrecv.abs_timeout;
 
-	audit_set_type(context, AUDIT_MQ_SENDRECV);
 	if (abs_timeout)
 		memcpy(p, abs_timeout, sizeof(*p));
 	else
@@ -2616,6 +2522,7 @@ void __audit_mq_sendrecv(mqd_t mqdes, size_t msg_len, unsigned int msg_prio,
 	context->mq_sendrecv.msg_len = msg_len;
 	context->mq_sendrecv.msg_prio = msg_prio;
 
+	context->type = AUDIT_MQ_SENDRECV;
 }
 
 /**
@@ -2629,13 +2536,13 @@ void __audit_mq_notify(mqd_t mqdes, const struct sigevent *notification)
 {
 	struct audit_context *context = audit_context();
 
-	audit_set_type(context, AUDIT_MQ_NOTIFY);
 	if (notification)
 		context->mq_notify.sigev_signo = notification->sigev_signo;
 	else
 		context->mq_notify.sigev_signo = 0;
 
 	context->mq_notify.mqdes = mqdes;
+	context->type = AUDIT_MQ_NOTIFY;
 }
 
 /**
@@ -2648,9 +2555,9 @@ void __audit_mq_getsetattr(mqd_t mqdes, struct mq_attr *mqstat)
 {
 	struct audit_context *context = audit_context();
 
-	audit_set_type(context, AUDIT_MQ_GETSETATTR);
 	context->mq_getsetattr.mqdes = mqdes;
 	context->mq_getsetattr.mqstat = *mqstat;
+	context->type = AUDIT_MQ_GETSETATTR;
 }
 
 /**
@@ -2661,16 +2568,13 @@ void __audit_mq_getsetattr(mqd_t mqdes, struct mq_attr *mqstat)
 void __audit_ipc_obj(struct kern_ipc_perm *ipcp)
 {
 	struct audit_context *context = audit_context();
-	struct lsm_prop_ref *oprop = NULL;
-	int rc;
 
-	audit_set_type(context, AUDIT_IPC);
 	context->ipc.uid = ipcp->uid;
 	context->ipc.gid = ipcp->gid;
 	context->ipc.mode = ipcp->mode;
 	context->ipc.has_perm = 0;
-	rc = security_ipc_getlsmprop_ref(ipcp, GFP_ATOMIC, &oprop);
-	audit_replace_prop_ref(context, &context->ipc.oprop, oprop, rc);
+	security_ipc_getlsmprop(ipcp, &context->ipc.oprop);
+	context->type = AUDIT_IPC;
 }
 
 /**
@@ -2697,7 +2601,7 @@ void __audit_bprm(struct linux_binprm *bprm)
 {
 	struct audit_context *context = audit_context();
 
-	audit_set_type(context, AUDIT_EXECVE);
+	context->type = AUDIT_EXECVE;
 	context->execve.argc = bprm->argc;
 }
 
@@ -2714,7 +2618,7 @@ int __audit_socketcall(int nargs, unsigned long *args)
 
 	if (nargs <= 0 || nargs > AUDITSC_ARGS || !args)
 		return -EINVAL;
-	audit_set_type(context, AUDIT_SOCKETCALL);
+	context->type = AUDIT_SOCKETCALL;
 	context->socketcall.nargs = nargs;
 	memcpy(context->socketcall.args, args, nargs * sizeof(unsigned long));
 	return 0;
@@ -2761,16 +2665,13 @@ int __audit_sockaddr(int len, void *a)
 void __audit_ptrace(struct task_struct *t)
 {
 	struct audit_context *context = audit_context();
-	struct lsm_prop_ref *target_ref = NULL;
-	int rc;
 
 	context->target_pid = task_tgid_nr(t);
 	context->target_auid = audit_get_loginuid(t);
 	context->target_uid = task_uid(t);
 	context->target_sessionid = audit_get_sessionid(t);
 	strscpy(context->target_comm, t->comm);
-	rc = security_task_getlsmprop_ref_obj(t, GFP_ATOMIC, &target_ref);
-	audit_replace_prop_ref(context, &context->target_ref, target_ref, rc);
+	security_task_getlsmprop_obj(t, &context->target_ref);
 }
 
 /**
@@ -2784,9 +2685,7 @@ int audit_signal_info_syscall(struct task_struct *t)
 {
 	struct audit_aux_data_pids *axp;
 	struct audit_context *ctx = audit_context();
-	struct lsm_prop_ref *target_ref = NULL;
 	kuid_t t_uid = task_uid(t);
-	int rc;
 
 	if (!audit_signals || audit_dummy_context())
 		return 0;
@@ -2799,9 +2698,7 @@ int audit_signal_info_syscall(struct task_struct *t)
 		ctx->target_uid = t_uid;
 		ctx->target_sessionid = audit_get_sessionid(t);
 		strscpy(ctx->target_comm, t->comm);
-		rc = security_task_getlsmprop_ref_obj(t, GFP_ATOMIC,
-						       &target_ref);
-		audit_replace_prop_ref(ctx, &ctx->target_ref, target_ref, rc);
+		security_task_getlsmprop_obj(t, &ctx->target_ref);
 		return 0;
 	}
 
@@ -2821,9 +2718,7 @@ int audit_signal_info_syscall(struct task_struct *t)
 	axp->target_auid[axp->pid_count] = audit_get_loginuid(t);
 	axp->target_uid[axp->pid_count] = t_uid;
 	axp->target_sessionid[axp->pid_count] = audit_get_sessionid(t);
-	rc = security_task_getlsmprop_ref_obj(t, GFP_ATOMIC, &target_ref);
-	audit_replace_prop_ref(ctx, &axp->target_ref[axp->pid_count],
-			       target_ref, rc);
+	security_task_getlsmprop_obj(t, &axp->target_ref[axp->pid_count]);
 	strscpy(axp->target_comm[axp->pid_count], t->comm);
 	axp->pid_count++;
 
@@ -2889,41 +2784,41 @@ void __audit_log_capset(const struct cred *new, const struct cred *old)
 {
 	struct audit_context *context = audit_context();
 
-	audit_set_type(context, AUDIT_CAPSET);
 	context->capset.pid = task_tgid_nr(current);
 	context->capset.cap.effective   = new->cap_effective;
 	context->capset.cap.inheritable = new->cap_inheritable;
 	context->capset.cap.permitted   = new->cap_permitted;
 	context->capset.cap.ambient     = new->cap_ambient;
+	context->type = AUDIT_CAPSET;
 }
 
 void __audit_mmap_fd(int fd, int flags)
 {
 	struct audit_context *context = audit_context();
 
-	audit_set_type(context, AUDIT_MMAP);
 	context->mmap.fd = fd;
 	context->mmap.flags = flags;
+	context->type = AUDIT_MMAP;
 }
 
 void __audit_openat2_how(struct open_how *how)
 {
 	struct audit_context *context = audit_context();
 
-	audit_set_type(context, AUDIT_OPENAT2);
 	context->openat2.flags = how->flags;
 	context->openat2.mode = how->mode;
 	context->openat2.resolve = how->resolve;
+	context->type = AUDIT_OPENAT2;
 }
 
 void __audit_log_kern_module(const char *name)
 {
 	struct audit_context *context = audit_context();
 
-	audit_set_type(context, AUDIT_KERN_MODULE);
 	context->module.name = kstrdup(name, GFP_KERNEL);
 	if (!context->module.name)
 		audit_log_lost("out of memory in __audit_log_kern_module");
+	context->type = AUDIT_KERN_MODULE;
 }
 
 void __audit_fanotify(u32 response, struct fanotify_response_info_audit_rule *friar)
@@ -2949,9 +2844,8 @@ void __audit_tk_injoffset(struct timespec64 offset)
 
 	/* only set type if not already set by NTP */
 	if (!context->type)
-		audit_set_type(context, AUDIT_TIME_INJOFFSET);
-	if (context->type != AUDIT_IPC)
-		memcpy(&context->time.tk_injoffset, &offset, sizeof(offset));
+		context->type = AUDIT_TIME_INJOFFSET;
+	memcpy(&context->time.tk_injoffset, &offset, sizeof(offset));
 }
 
 void __audit_ntp_log(const struct audit_ntp_data *ad)
@@ -2962,7 +2856,7 @@ void __audit_ntp_log(const struct audit_ntp_data *ad)
 	for (type = 0; type < AUDIT_NTP_NVALS; type++)
 		if (ad->vals[type].newval != ad->vals[type].oldval) {
 			/* unconditionally set type, overwriting TK */
-			audit_set_type(context, AUDIT_TIME_ADJNTPVAL);
+			context->type = AUDIT_TIME_ADJNTPVAL;
 			memcpy(&context->time.ntp_data, ad, sizeof(*ad));
 			break;
 		}
@@ -2984,7 +2878,7 @@ void __audit_log_nfcfg(const char *name, u8 af, unsigned int nentries,
 	audit_log_task_context(ab); /* subj= */
 	audit_log_format(ab, " comm=");
 	audit_log_untrustedstring(ab, get_task_comm(comm, current));
-	(void)audit_log_end_status(ab);
+	audit_log_end(ab);
 }
 EXPORT_SYMBOL_GPL(__audit_log_nfcfg);
 
@@ -3032,7 +2926,7 @@ void audit_core_dumps(long signr)
 		return;
 	audit_log_task(ab);
 	audit_log_format(ab, " sig=%ld res=1", signr);
-	(void)audit_log_end_status(ab);
+	audit_log_end(ab);
 }
 
 /**
@@ -3058,7 +2952,7 @@ void audit_seccomp(unsigned long syscall, long signr, int code)
 	audit_log_format(ab, " sig=%ld arch=%x syscall=%ld compat=%d ip=0x%lx code=0x%x",
 			 signr, syscall_get_arch(current), syscall,
 			 in_compat_syscall(), KSTK_EIP(current), code);
-	(void)audit_log_end_status(ab);
+	audit_log_end(ab);
 }
 
 void audit_seccomp_actions_logged(const char *names, const char *old_names,
@@ -3077,7 +2971,7 @@ void audit_seccomp_actions_logged(const char *names, const char *old_names,
 	audit_log_format(ab,
 			 "op=seccomp-logging actions=%s old-actions=%s res=%d",
 			 names, old_names, res);
-	(void)audit_log_end_status(ab);
+	audit_log_end(ab);
 }
 
 struct list_head *audit_killed_trees(void)

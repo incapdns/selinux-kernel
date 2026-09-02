@@ -1171,12 +1171,7 @@ void ipv4_sk_update_pmtu(struct sk_buff *skb, struct sock *sk, u32 mtu)
 
 	rt = dst_rtable(odst);
 	if (READ_ONCE(odst->obsolete) && !odst->ops->check(odst, 0)) {
-		{
-			struct xfrm_flow_origin origin = xfrm_flow_origin_skb(skb);
-
-			rt = ip_route_output_flow_origin(sock_net(sk), &fl4, sk,
-							 &origin);
-		}
+		rt = ip_route_output_flow(sock_net(sk), &fl4, sk);
 		if (IS_ERR(rt))
 			goto out;
 
@@ -1189,12 +1184,7 @@ void ipv4_sk_update_pmtu(struct sk_buff *skb, struct sock *sk, u32 mtu)
 		if (new)
 			dst_release(&rt->dst);
 
-		{
-			struct xfrm_flow_origin origin = xfrm_flow_origin_skb(skb);
-
-			rt = ip_route_output_flow_origin(sock_net(sk), &fl4, sk,
-							 &origin);
-		}
+		rt = ip_route_output_flow(sock_net(sk), &fl4, sk);
 		if (IS_ERR(rt))
 			goto out;
 
@@ -2960,44 +2950,22 @@ struct dst_entry *ipv4_blackhole_route(struct net *net, struct dst_entry *dst_or
 	return rt ? &rt->dst : ERR_PTR(-ENOMEM);
 }
 
-struct rtable *ip_route_output_flow_origin_hash(
-				    struct net *net, struct flowi4 *flp4,
-				    const struct sock *sk,
-				    const struct sk_buff *skb,
-				    const struct xfrm_flow_origin *origin)
+struct rtable *ip_route_output_flow(struct net *net, struct flowi4 *flp4,
+				    const struct sock *sk)
 {
-	struct rtable *rt = ip_route_output_key_hash(net, flp4, skb);
+	struct rtable *rt = __ip_route_output_key(net, flp4);
 
 	if (IS_ERR(rt))
 		return rt;
 
 	if (flp4->flowi4_proto) {
 		flp4->flowi4_oif = rt->dst.dev->ifindex;
-		rt = dst_rtable(xfrm_lookup_route_origin(net, &rt->dst,
-							 flowi4_to_flowi(flp4),
-							 sk, origin, 0));
+		rt = dst_rtable(xfrm_lookup_route(net, &rt->dst,
+						  flowi4_to_flowi(flp4),
+						  sk, 0));
 	}
 
 	return rt;
-}
-EXPORT_SYMBOL_GPL(ip_route_output_flow_origin_hash);
-
-struct rtable *ip_route_output_flow_origin(
-				    struct net *net, struct flowi4 *flp4,
-				    const struct sock *sk,
-				    const struct xfrm_flow_origin *origin)
-{
-	return ip_route_output_flow_origin_hash(net, flp4, sk, NULL, origin);
-}
-EXPORT_SYMBOL_GPL(ip_route_output_flow_origin);
-
-struct rtable *ip_route_output_flow(struct net *net,
-					     struct flowi4 *flp4,
-					     const struct sock *sk)
-{
-	struct xfrm_flow_origin origin = xfrm_flow_origin_sock(sk);
-
-	return ip_route_output_flow_origin(net, flp4, sk, &origin);
 }
 EXPORT_SYMBOL_GPL(ip_route_output_flow);
 

@@ -23,28 +23,26 @@
 #include <net/net_namespace.h>
 
 #include "initcalls.h"
-#include "global_sidtab.h"
 #include "security.h"
 #include "objsec.h"
 #include "netif.h"
+#include "namespace.h"
+#include "object_label.h"
 
 #define SEL_NETIF_HASH_SIZE	64
 #define SEL_NETIF_HASH_MAX	1024
 
 struct sel_netif {
 	struct list_head list;
-	struct list_head lru;
 	struct netif_security_struct nsec;
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	struct selinux_global_sid_handle *sid_handle;
-#endif
 	struct rcu_head rcu_head;
 };
 
 static u32 sel_netif_total;
 static DEFINE_SPINLOCK(sel_netif_lock);
 static struct list_head sel_netif_hash[SEL_NETIF_HASH_SIZE];
-static LIST_HEAD(sel_netif_lru);
+
+static void sel_netif_free(struct rcu_head *rcu);
 
 /**
  * sel_netif_hashfn - Hashing function for the interface table
@@ -63,8 +61,6 @@ static inline u32 sel_netif_hashfn(const struct net *ns, int ifindex)
 
 /**
  * sel_netif_find - Search for an interface record
- * @domain_id: stable SELinux label-domain identity
- * @snapshot: immutable policy generation
  * @ns: the network namespace
  * @ifindex: the network interface
  *
@@ -73,52 +69,18 @@ static inline u32 sel_netif_hashfn(const struct net *ns, int ifindex)
  * If an entry can not be found in the table return NULL.
  *
  */
-static inline struct sel_netif *sel_netif_find(
-	u64 domain_id,
-	const struct selinux_policy_snapshot *snapshot, const struct net *ns,
-	int ifindex)
+static inline struct sel_netif *sel_netif_find(const struct net *ns,
+					       int ifindex)
 {
 	u32 idx = sel_netif_hashfn(ns, ifindex);
 	struct sel_netif *netif;
 
 	list_for_each_entry_rcu(netif, &sel_netif_hash[idx], list)
 		if (net_eq(netif->nsec.ns, ns) &&
-		    netif->nsec.ifindex == ifindex &&
-#ifdef CONFIG_SECURITY_SELINUX_NS
-		    netif->sid_handle &&
-		    global_sid_handle_sid(netif->sid_handle) == netif->nsec.sid &&
-#endif
-		    selinux_policy_cache_key_matches(&netif->nsec.policy,
-						     domain_id, snapshot))
+		    netif->nsec.ifindex == ifindex)
 			return netif;
 
 	return NULL;
-}
-
-/**
- * sel_netif_free - Free an interface record after its RCU grace period
- * @rcu: embedded RCU head
- *
- * Description:
- * Release an interface record after readers can no longer observe it.
- *
- */
-static void sel_netif_free(struct rcu_head *rcu)
-{
-	struct sel_netif *netif = container_of(rcu, struct sel_netif, rcu_head);
-
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	global_sid_handle_put(netif->sid_handle);
-#endif
-	kfree(netif);
-}
-
-static void sel_netif_destroy(struct sel_netif *netif)
-{
-	list_del_rcu(&netif->list);
-	list_del(&netif->lru);
-	sel_netif_total--;
-	call_rcu(&netif->rcu_head, sel_netif_free);
 }
 
 /**
@@ -126,34 +88,89 @@ static void sel_netif_destroy(struct sel_netif *netif)
  * @netif: the new interface record
  *
  * Description:
- * Add a new interface record to the network interface hash table, evicting
- * the oldest record in O(1) when the global bound has been reached.
+ * Add a new interface record to the network interface hash table.  Returns
+ * zero on success, negative values on failure.
+ *
  */
-static void sel_netif_insert(struct sel_netif *netif)
+static int sel_netif_insert(struct sel_netif *netif)
 {
 	u32 idx;
 
-	if (sel_netif_total >= SEL_NETIF_HASH_MAX) {
-		struct sel_netif *victim;
-
-		victim = list_last_entry(&sel_netif_lru, struct sel_netif, lru);
-		sel_netif_destroy(victim);
-	}
+	if (sel_netif_total >= SEL_NETIF_HASH_MAX)
+		return -ENOSPC;
 
 	idx = sel_netif_hashfn(netif->nsec.ns, netif->nsec.ifindex);
 	list_add_rcu(&netif->list, &sel_netif_hash[idx]);
-	list_add(&netif->lru, &sel_netif_lru);
 	sel_netif_total++;
+
+	return 0;
 }
 
 /**
- * sel_netif_sid_slow - Lookup the SID of a network interface using the policy
- * @state: the SELinux state
- * @snapshot: immutable policy generation
+ * sel_netif_destroy - Remove an interface record from the table
+ * @netif: the existing interface record
+ *
+ * Description:
+ * Remove an existing interface record from the network interface table.
+ *
+ */
+static void sel_netif_destroy(struct sel_netif *netif)
+{
+	list_del_rcu(&netif->list);
+	sel_netif_total--;
+	call_rcu(&netif->rcu_head, sel_netif_free);
+}
+
+static void sel_netif_free(struct rcu_head *rcu)
+{
+	struct sel_netif *netif = container_of(rcu, struct sel_netif, rcu_head);
+
+	selinux_object_identity_put(netif->nsec.object);
+	kfree(netif);
+}
+
+static int sel_netif_populate_labels(
+	const struct cred *cred,
+	const struct net_device *dev,
+	struct selinux_object_identity *object)
+{
+	struct selinux_object_label_value
+		values[SELINUX_NS_MAX_DEPTH + 1] = {};
+	struct selinux_state *states[SELINUX_NS_MAX_DEPTH + 1] = {};
+	const struct cred *level_cred = cred;
+	struct selinux_state *state = cred_selinux_state(cred);
+	u16 count = 0;
+	int rc;
+
+	while (state) {
+		const struct cred_security_struct *security;
+
+		if (!level_cred || count >= ARRAY_SIZE(states))
+			return -ESTALE;
+		security = selinux_cred(level_cred);
+		if (security->state != state)
+			return -ESTALE;
+		states[count] = state;
+		rc = security_netif_sid(state, dev->name, &values[count].sid);
+		if (rc)
+			return rc;
+		values[count].sclass = SECCLASS_NETIF;
+		values[count].source = SELINUX_LABEL_SOURCE_NETWORK;
+		count++;
+		level_cred = security->parent_cred;
+		state = state->parent;
+	}
+	if (level_cred)
+		return -ESTALE;
+	return selinux_object_labels_set_chain(
+		object, states, values, count, GFP_ATOMIC);
+}
+
+/**
+ * sel_netif_object_slow - Resolve a network interface identity for the chain
  * @ns: the network namespace
  * @ifindex: the network interface
  * @sid: interface SID
- * @out_handle: strong handle paired with @sid
  *
  * Description:
  * This function determines the SID of a network interface by querying the
@@ -162,29 +179,16 @@ static void sel_netif_insert(struct sel_netif *netif)
  * failure.
  *
  */
-static int sel_netif_sid_slow(
-	struct selinux_state *state,
-	const struct selinux_policy_snapshot *snapshot, struct net *ns,
-	int ifindex, u32 *sid,
-	struct selinux_global_sid_handle **out_handle)
+static int sel_netif_object_slow(
+	const struct cred *cred,
+	struct net *ns,
+	int ifindex,
+	struct selinux_object_identity **object)
 {
 	int ret = 0;
-	u64 domain_id = state->label_domain->id;
 	struct sel_netif *netif;
 	struct sel_netif *new;
 	struct net_device *dev;
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	struct selinux_global_sid_handle *sid_handle = NULL;
-	struct selinux_global_sid_handle *cache_handle;
-#endif
-
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	if (!out_handle)
-		return -EINVAL;
-	*out_handle = NULL;
-#else
-	(void)out_handle;
-#endif
 
 	/* NOTE: we always use init's network namespace since we don't
 	 * currently support containers */
@@ -197,87 +201,61 @@ static int sel_netif_sid_slow(
 	}
 
 	spin_lock_bh(&sel_netif_lock);
-	netif = sel_netif_find(domain_id, snapshot, ns, ifindex);
+	netif = sel_netif_find(ns, ifindex);
 	if (netif != NULL) {
-		*sid = netif->nsec.sid;
-#ifdef CONFIG_SECURITY_SELINUX_NS
-		sid_handle = global_sid_handle_dup(netif->sid_handle);
-		if (IS_ERR(sid_handle)) {
-			ret = PTR_ERR(sid_handle);
-			sid_handle = NULL;
+		struct selinux_object_label_value value;
+
+		if (selinux_object_label_get(
+			    cred_selinux_state(cred), netif->nsec.object, &value)) {
+			ret = sel_netif_populate_labels(
+				cred, dev, netif->nsec.object);
+			if (ret)
+				goto out;
 		}
-#endif
+		*object = selinux_object_identity_get(netif->nsec.object);
 		goto out;
 	}
 
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	sid_handle = security_netif_sid_handle(state, dev->name, sid);
-	if (IS_ERR(sid_handle)) {
-		ret = PTR_ERR(sid_handle);
-		sid_handle = NULL;
-	} else if (!*sid || global_sid_handle_sid(sid_handle) != *sid) {
-		ret = -ESTALE;
-	}
-#else
-	ret = security_netif_sid(state, dev->name, sid);
-#endif
-	if (ret != 0)
-		goto out;
-	if (!selinux_policy_snapshot_valid(state, snapshot)) {
-		ret = -ESTALE;
-		goto out;
-	}
-
-	/* If this memory allocation fails still return 0. The SID
-	 * is valid, it just won't be added to the cache.
-	 */
 	new = kmalloc_obj(*new, GFP_ATOMIC);
-	if (new) {
-#ifdef CONFIG_SECURITY_SELINUX_NS
-		cache_handle = global_sid_handle_dup(sid_handle);
-		if (IS_ERR(cache_handle)) {
-			kfree(new);
-			new = NULL;
-		}
-#endif
+	if (!new) {
+		ret = -ENOMEM;
+		goto out;
 	}
-	if (new) {
-		new->nsec.ns = ns;
-		new->nsec.ifindex = ifindex;
-		new->nsec.sid = *sid;
-		selinux_policy_cache_key_init(&new->nsec.policy, domain_id,
-					      snapshot);
-#ifdef CONFIG_SECURITY_SELINUX_NS
-		new->sid_handle = cache_handle;
-#endif
-		sel_netif_insert(new);
+	new->nsec.object = selinux_object_identity_alloc(
+		init_selinux_state, GFP_ATOMIC);
+	if (IS_ERR(new->nsec.object)) {
+		ret = PTR_ERR(new->nsec.object);
+		kfree(new);
+		goto out;
 	}
+	ret = sel_netif_populate_labels(cred, dev, new->nsec.object);
+	if (ret) {
+		selinux_object_identity_put(new->nsec.object);
+		kfree(new);
+		goto out;
+	}
+
+	new->nsec.ns = ns;
+	new->nsec.ifindex = ifindex;
+	ret = sel_netif_insert(new);
+	if (ret) {
+		selinux_object_identity_put(new->nsec.object);
+		kfree(new);
+		goto out;
+	}
+	*object = selinux_object_identity_get(new->nsec.object);
 
 out:
 	spin_unlock_bh(&sel_netif_lock);
 	dev_put(dev);
-	if (!ret && !selinux_policy_snapshot_valid(state, snapshot))
-		ret = -ESTALE;
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	if (!ret && (!sid_handle || !*sid ||
-		     global_sid_handle_sid(sid_handle) != *sid))
-		ret = -ESTALE;
-	if (!ret) {
-		*out_handle = sid_handle;
-		sid_handle = NULL;
-	}
-	global_sid_handle_put(sid_handle);
-#endif
-	if (unlikely(ret && ret != -ESTALE))
+	if (unlikely(ret))
 		pr_warn("SELinux: failure in %s(), unable to determine network interface label (%d)\n",
 			__func__, ifindex);
 	return ret;
 }
 
 /**
- * sel_netif_sid_snapshot_handle - Lookup the SID of a network interface
- * @state: the SELinux state
- * @snapshot: immutable policy generation
+ * sel_netif_object - Lookup the stable identity of a network interface
  * @ns: the network namespace
  * @ifindex: the network interface
  * @sid: interface SID
@@ -290,130 +268,28 @@ out:
  * on failure.
  *
  */
-#ifdef CONFIG_SECURITY_SELINUX_NS
-struct selinux_global_sid_handle *
-sel_netif_sid_snapshot_handle(
-	struct selinux_state *state,
-	const struct selinux_policy_snapshot *snapshot, struct net *ns,
-	int ifindex, u32 *sid)
+int sel_netif_object(const struct cred *cred, struct net *ns, int ifindex,
+		     struct selinux_object_identity **object)
 {
-	struct selinux_global_sid_handle *handle;
 	struct sel_netif *netif;
-	bool valid;
-	int rc;
+	struct selinux_object_label_value value;
 
-	if (!state || !state->label_domain || !snapshot || !sid ||
-	    !snapshot->chain_epoch)
-		return ERR_PTR(-EINVAL);
-
-	rcu_read_lock();
-	netif = sel_netif_find(state->label_domain->id, snapshot, ns, ifindex);
-	if (likely(netif != NULL)) {
-		*sid = netif->nsec.sid;
-		handle = global_sid_handle_dup(netif->sid_handle);
-		valid = selinux_policy_snapshot_valid(state, snapshot);
-		rcu_read_unlock();
-		if (IS_ERR(handle))
-			return handle;
-		if (!valid || !*sid || global_sid_handle_sid(handle) != *sid) {
-			global_sid_handle_put(handle);
-			return ERR_PTR(-ESTALE);
-		}
-		return handle;
-	}
-	rcu_read_unlock();
-
-	rc = sel_netif_sid_slow(state, snapshot, ns, ifindex, sid, &handle);
-	return rc ? ERR_PTR(rc) : handle;
-}
-
-struct selinux_global_sid_handle *
-sel_netif_sid_handle(struct selinux_state *state, struct net *ns, int ifindex,
-		     u32 *sid)
-{
-	struct selinux_global_sid_handle *handle;
-	struct selinux_policy_snapshot snapshot;
-	unsigned int retry;
-	int rc;
-
-	for (retry = 0; retry < 3; retry++) {
-		rc = selinux_policy_snapshot_read(state, &snapshot);
-		if (rc == -EAGAIN || rc == -ESTALE)
-			continue;
-		if (rc)
-			return ERR_PTR(rc);
-		handle = sel_netif_sid_snapshot_handle(
-			state, &snapshot, ns, ifindex, sid);
-		if (!IS_ERR(handle) || PTR_ERR(handle) != -ESTALE)
-			return handle;
-	}
-	return ERR_PTR(-ESTALE);
-}
-#endif
-
-int sel_netif_sid_snapshot(
-	struct selinux_state *state,
-	const struct selinux_policy_snapshot *snapshot, struct net *ns,
-	int ifindex, u32 *sid)
-{
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	struct selinux_global_sid_handle *handle;
-
-	handle = sel_netif_sid_snapshot_handle(state, snapshot, ns, ifindex,
-						 sid);
-	if (IS_ERR(handle))
-		return PTR_ERR(handle);
-	global_sid_handle_put(handle);
-	return 0;
-#else
-	struct sel_netif *netif;
-	bool valid;
-
-	if (!state || !state->label_domain || !snapshot ||
-	    !snapshot->chain_epoch)
+	if (!cred || !object)
 		return -EINVAL;
+	*object = NULL;
+
 	rcu_read_lock();
-	netif = sel_netif_find(state->label_domain->id, snapshot, ns, ifindex);
-	if (likely(netif != NULL)) {
-		*sid = netif->nsec.sid;
-		valid = selinux_policy_snapshot_valid(state, snapshot);
+	netif = sel_netif_find(ns, ifindex);
+	if (likely(netif != NULL) &&
+	    !selinux_object_label_get(
+		    cred_selinux_state(cred), netif->nsec.object, &value)) {
+		*object = selinux_object_identity_get(netif->nsec.object);
 		rcu_read_unlock();
-		return valid ? 0 : -ESTALE;
+		return 0;
 	}
 	rcu_read_unlock();
-	return sel_netif_sid_slow(state, snapshot, ns, ifindex, sid, NULL);
-#endif
-}
 
-int sel_netif_sid(struct selinux_state *state, struct net *ns, int ifindex,
-		  u32 *sid)
-{
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	struct selinux_global_sid_handle *handle;
-
-	handle = sel_netif_sid_handle(state, ns, ifindex, sid);
-	if (IS_ERR(handle))
-		return PTR_ERR(handle);
-	global_sid_handle_put(handle);
-	return 0;
-#else
-	struct selinux_policy_snapshot snapshot;
-	unsigned int retry;
-	int rc;
-
-	for (retry = 0; retry < 3; retry++) {
-		rc = selinux_policy_snapshot_read(state, &snapshot);
-		if (rc == -EAGAIN || rc == -ESTALE)
-			continue;
-		if (rc)
-			return rc;
-		rc = sel_netif_sid_snapshot(state, &snapshot, ns, ifindex,
-					     sid);
-		if (rc != -ESTALE)
-			return rc;
-	}
-	return -ESTALE;
-#endif
+	return sel_netif_object_slow(cred, ns, ifindex, object);
 }
 
 /**
@@ -428,15 +304,15 @@ int sel_netif_sid(struct selinux_state *state, struct net *ns, int ifindex,
  */
 static void sel_netif_kill(const struct net *ns, int ifindex)
 {
-	struct sel_netif *netif, *tmp;
-	u32 idx = sel_netif_hashfn(ns, ifindex);
+	struct sel_netif *netif;
 
+	rcu_read_lock();
 	spin_lock_bh(&sel_netif_lock);
-	list_for_each_entry_safe(netif, tmp, &sel_netif_hash[idx], list)
-		if (net_eq(netif->nsec.ns, ns) &&
-		    netif->nsec.ifindex == ifindex)
-			sel_netif_destroy(netif);
+	netif = sel_netif_find(ns, ifindex);
+	if (netif)
+		sel_netif_destroy(netif);
 	spin_unlock_bh(&sel_netif_lock);
+	rcu_read_unlock();
 }
 
 /**
@@ -449,11 +325,11 @@ static void sel_netif_kill(const struct net *ns, int ifindex)
 void sel_netif_flush(void)
 {
 	int idx;
-	struct sel_netif *netif, *tmp;
+	struct sel_netif *netif;
 
 	spin_lock_bh(&sel_netif_lock);
 	for (idx = 0; idx < SEL_NETIF_HASH_SIZE; idx++)
-		list_for_each_entry_safe(netif, tmp, &sel_netif_hash[idx], list)
+		list_for_each_entry(netif, &sel_netif_hash[idx], list)
 			sel_netif_destroy(netif);
 	spin_unlock_bh(&sel_netif_lock);
 }
@@ -463,8 +339,7 @@ static int sel_netif_netdev_notifier_handler(struct notifier_block *this,
 {
 	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
 
-	if (event == NETDEV_DOWN || event == NETDEV_UNREGISTER ||
-	    event == NETDEV_CHANGENAME)
+	if (event == NETDEV_DOWN)
 		sel_netif_kill(dev_net(dev), dev->ifindex);
 
 	return NOTIFY_DONE;

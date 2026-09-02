@@ -270,11 +270,11 @@ static ssize_t evm_write_xattrs(struct file *file, const char __user *buf,
 	mutex_unlock(&xattr_list_mutex);
 
 	audit_log_format(ab, " res=0");
-	(void)audit_log_end_status(ab);
+	audit_log_end(ab);
 	return count;
 out:
 	audit_log_format(ab, " res=%d", (err < 0) ? err : 0);
-	(void)audit_log_end_status(ab);
+	audit_log_end(ab);
 	if (xattr) {
 		kfree(xattr->name);
 		kfree(xattr);

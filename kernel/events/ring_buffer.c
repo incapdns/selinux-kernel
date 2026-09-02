@@ -155,7 +155,6 @@ __perf_output_begin(struct perf_output_handle *handle,
 		    struct perf_event *event, unsigned int size,
 		    bool backward)
 {
-	struct perf_event_output_relation *output, *output_after;
 	struct perf_buffer *rb;
 	unsigned long tail, offset, head;
 	int have_lost, page_shift;
@@ -172,16 +171,8 @@ __perf_output_begin(struct perf_output_handle *handle,
 	if (event->parent)
 		event = event->parent;
 
-	output = rcu_dereference(event->output_relation);
 	rb = rcu_dereference(event->rb);
-	output_after = rcu_dereference(event->output_relation);
 	if (unlikely(!rb))
-		goto out;
-	if (unlikely(output != output_after ||
-		     (security_perf_event_relation_enabled() && !output) ||
-			     (output &&
-			      (output->rb != rb ||
-			       perf_event_output_relation_valid(output)))))
 		goto out;
 
 	if (unlikely(rb->paused)) {
@@ -266,6 +257,7 @@ __perf_output_begin(struct perf_output_handle *handle,
 		perf_output_put(handle, lost_event);
 		perf_event__output_id_sample(event, handle, data);
 	}
+
 	return 0;
 
 fail:
@@ -313,50 +305,8 @@ unsigned int perf_output_skip(struct perf_output_handle *handle,
 	return __output_skip(handle, NULL, len);
 }
 
-static void perf_output_abort_group_read(struct perf_output_handle *handle)
-{
-	static const u8 zeros[64];
-	struct {
-		struct perf_event_header header;
-		u64 lost;
-	} record = {
-		.header = {
-			.type = PERF_RECORD_LOST_SAMPLES,
-			.size = handle->guard_record_size,
-		},
-		.lost = 1,
-	};
-	unsigned int remaining = handle->guard_record_size;
-
-	/* Restore the cursor to the start of the group record and scrub it. */
-	handle->addr = handle->guard_addr;
-	handle->size = handle->guard_size;
-	handle->page = handle->guard_page;
-	if (WARN_ON_ONCE(remaining < sizeof(record))) {
-		while (remaining) {
-			unsigned int bytes = min_t(unsigned int, remaining,
-						   sizeof(zeros));
-
-			__output_copy(handle, zeros, bytes);
-			remaining -= bytes;
-		}
-		return;
-	}
-	__output_copy(handle, &record, sizeof(record));
-	remaining -= sizeof(record);
-	while (remaining) {
-		unsigned int bytes = min_t(unsigned int, remaining, sizeof(zeros));
-
-		__output_copy(handle, zeros, bytes);
-		remaining -= bytes;
-	}
-}
-
 void perf_output_end(struct perf_output_handle *handle)
 {
-	if (unlikely(handle->group_relation_guard) &&
-	    unlikely(perf_event_group_relations_valid(handle->guard_event)))
-		perf_output_abort_group_read(handle);
 	perf_output_put_handle(handle);
 	rcu_read_unlock();
 }

@@ -206,15 +206,13 @@ static inline int ovl_do_notify_change(struct ovl_fs *ofs,
 				       struct dentry *upperdentry,
 				       struct iattr *attr)
 {
-	return notify_change_mnt(ovl_upper_mnt_idmap(ofs), ovl_upper_mnt(ofs),
-				 upperdentry, attr, NULL);
+	return notify_change(ovl_upper_mnt_idmap(ofs), upperdentry, attr, NULL);
 }
 
 static inline int ovl_do_rmdir(struct ovl_fs *ofs,
 			       struct inode *dir, struct dentry *dentry)
 {
-	int err = vfs_rmdir_mnt(ovl_upper_mnt_idmap(ofs), ovl_upper_mnt(ofs),
-				 dir, dentry, NULL);
+	int err = vfs_rmdir(ovl_upper_mnt_idmap(ofs), dir, dentry, NULL);
 
 	pr_debug("rmdir(%pd2) = %i\n", dentry, err);
 	return err;
@@ -223,8 +221,7 @@ static inline int ovl_do_rmdir(struct ovl_fs *ofs,
 static inline int ovl_do_unlink(struct ovl_fs *ofs, struct inode *dir,
 				struct dentry *dentry)
 {
-	int err = vfs_unlink_mnt(ovl_upper_mnt_idmap(ofs), ovl_upper_mnt(ofs),
-				  dir, dentry, NULL);
+	int err = vfs_unlink(ovl_upper_mnt_idmap(ofs), dir, dentry, NULL);
 
 	pr_debug("unlink(%pd2) = %i\n", dentry, err);
 	return err;
@@ -233,9 +230,8 @@ static inline int ovl_do_unlink(struct ovl_fs *ofs, struct inode *dir,
 static inline int ovl_do_link(struct ovl_fs *ofs, struct dentry *old_dentry,
 			      struct inode *dir, struct dentry *new_dentry)
 {
-	int err = vfs_link_mnt(ovl_upper_mnt(ofs), old_dentry,
-			       ovl_upper_mnt_idmap(ofs), ovl_upper_mnt(ofs),
-			       dir, new_dentry, NULL);
+	int err = vfs_link(old_dentry, ovl_upper_mnt_idmap(ofs), dir,
+			   new_dentry, NULL);
 
 	pr_debug("link(%pd2, %pd2) = %i\n", old_dentry, new_dentry, err);
 	return err;
@@ -245,8 +241,7 @@ static inline int ovl_do_create(struct ovl_fs *ofs,
 				struct inode *dir, struct dentry *dentry,
 				umode_t mode)
 {
-	int err = vfs_create_mnt(ovl_upper_mnt_idmap(ofs), ovl_upper_mnt(ofs),
-				 dentry, mode, NULL);
+	int err = vfs_create(ovl_upper_mnt_idmap(ofs), dentry, mode, NULL);
 
 	pr_debug("create(%pd2, 0%o) = %i\n", dentry, mode, err);
 	return err;
@@ -259,8 +254,7 @@ static inline struct dentry *ovl_do_mkdir(struct ovl_fs *ofs,
 {
 	struct dentry *ret;
 
-	ret = vfs_mkdir_mnt(ovl_upper_mnt_idmap(ofs), ovl_upper_mnt(ofs), dir,
-			    dentry, mode, NULL);
+	ret = vfs_mkdir(ovl_upper_mnt_idmap(ofs), dir, dentry, mode, NULL);
 	pr_debug("mkdir(%pd2, 0%o) = %i\n", dentry, mode, PTR_ERR_OR_ZERO(ret));
 	return ret;
 }
@@ -269,8 +263,7 @@ static inline int ovl_do_mknod(struct ovl_fs *ofs,
 			       struct inode *dir, struct dentry *dentry,
 			       umode_t mode, dev_t dev)
 {
-	int err = vfs_mknod_mnt(ovl_upper_mnt_idmap(ofs), ovl_upper_mnt(ofs),
-				dir, dentry, mode, dev, NULL);
+	int err = vfs_mknod(ovl_upper_mnt_idmap(ofs), dir, dentry, mode, dev, NULL);
 
 	pr_debug("mknod(%pd2, 0%o, 0%o) = %i\n", dentry, mode, dev, err);
 	return err;
@@ -280,8 +273,7 @@ static inline int ovl_do_symlink(struct ovl_fs *ofs,
 				 struct inode *dir, struct dentry *dentry,
 				 const char *oldname)
 {
-	int err = vfs_symlink_mnt(ovl_upper_mnt_idmap(ofs), ovl_upper_mnt(ofs),
-				  dir, dentry, oldname, NULL);
+	int err = vfs_symlink(ovl_upper_mnt_idmap(ofs), dir, dentry, oldname, NULL);
 
 	pr_debug("symlink(\"%s\", %pd2) = %i\n", oldname, dentry, err);
 	return err;
@@ -294,8 +286,8 @@ static inline ssize_t ovl_do_getxattr(const struct path *path, const char *name,
 
 	WARN_ON(path->dentry->d_sb != path->mnt->mnt_sb);
 
-	err = vfs_getxattr_mnt(mnt_idmap(path->mnt), path->mnt,
-			       path->dentry, name, value, size);
+	err = vfs_getxattr(mnt_idmap(path->mnt), path->dentry,
+			       name, value, size);
 	len = (value && err > 0) ? err : 0;
 
 	pr_debug("getxattr(%pd2, \"%s\", \"%*pE\", %zu, 0) = %i\n",
@@ -328,9 +320,8 @@ static inline int ovl_do_setxattr(struct ovl_fs *ofs, struct dentry *dentry,
 				  const char *name, const void *value,
 				  size_t size, int flags)
 {
-	int err = vfs_setxattr_mnt(ovl_upper_mnt_idmap(ofs),
-				   ovl_upper_mnt(ofs), dentry, name, value,
-				   size, flags);
+	int err = vfs_setxattr(ovl_upper_mnt_idmap(ofs), dentry, name,
+			       value, size, flags);
 
 	pr_debug("setxattr(%pd2, \"%s\", \"%*pE\", %zu, %d) = %i\n",
 		 dentry, name, min((int)size, 48), value, size, flags, err);
@@ -347,8 +338,7 @@ static inline int ovl_setxattr(struct ovl_fs *ofs, struct dentry *dentry,
 static inline int ovl_do_removexattr(struct ovl_fs *ofs, struct dentry *dentry,
 				     const char *name)
 {
-	int err = vfs_removexattr_mnt(ovl_upper_mnt_idmap(ofs),
-				      ovl_upper_mnt(ofs), dentry, name);
+	int err = vfs_removexattr(ovl_upper_mnt_idmap(ofs), dentry, name);
 	pr_debug("removexattr(%pd2, \"%s\") = %i\n", dentry, name, err);
 	return err;
 }
@@ -362,15 +352,13 @@ static inline int ovl_removexattr(struct ovl_fs *ofs, struct dentry *dentry,
 static inline int ovl_do_set_acl(struct ovl_fs *ofs, struct dentry *dentry,
 				 const char *acl_name, struct posix_acl *acl)
 {
-	return vfs_set_acl_mnt(ovl_upper_mnt_idmap(ofs), ovl_upper_mnt(ofs),
-			       dentry, acl_name, acl);
+	return vfs_set_acl(ovl_upper_mnt_idmap(ofs), dentry, acl_name, acl);
 }
 
 static inline int ovl_do_remove_acl(struct ovl_fs *ofs, struct dentry *dentry,
 				    const char *acl_name)
 {
-	return vfs_remove_acl_mnt(ovl_upper_mnt_idmap(ofs), ovl_upper_mnt(ofs),
-				  dentry, acl_name);
+	return vfs_remove_acl(ovl_upper_mnt_idmap(ofs), dentry, acl_name);
 }
 
 static inline int ovl_do_rename_rd(struct renamedata *rd)
@@ -393,8 +381,6 @@ static inline int ovl_do_rename(struct ovl_fs *ofs, struct dentry *olddir,
 {
 	struct renamedata rd = {
 		.mnt_idmap	= ovl_upper_mnt_idmap(ofs),
-		.old_mnt	= ovl_upper_mnt(ofs),
-		.new_mnt	= ovl_upper_mnt(ofs),
 		.old_parent	= olddir,
 		.old_dentry	= olddentry,
 		.new_parent	= newdir,
@@ -408,8 +394,7 @@ static inline int ovl_do_rename(struct ovl_fs *ofs, struct dentry *olddir,
 static inline int ovl_do_whiteout(struct ovl_fs *ofs,
 				  struct inode *dir, struct dentry *dentry)
 {
-	int err = vfs_whiteout_mnt(ovl_upper_mnt_idmap(ofs),
-				   ovl_upper_mnt(ofs), dir, dentry);
+	int err = vfs_whiteout(ovl_upper_mnt_idmap(ofs), dir, dentry);
 	pr_debug("whiteout(%pd2) = %i\n", dentry, err);
 	return err;
 }
@@ -432,25 +417,24 @@ static inline struct dentry *ovl_lookup_upper_unlocked(struct ovl_fs *ofs,
 						       struct dentry *base,
 						       int len)
 {
-	return lookup_one_unlocked_mnt(ovl_upper_mnt_idmap(ofs),
-				       ovl_upper_mnt(ofs),
-				       &QSTR_LEN(name, len), base);
+	return lookup_one_unlocked(ovl_upper_mnt_idmap(ofs),
+				   &QSTR_LEN(name, len), base);
 }
 
 static inline struct dentry *ovl_start_creating_upper(struct ovl_fs *ofs,
 						      struct dentry *parent,
 						      struct qstr *name)
 {
-	return start_creating_mnt(ovl_upper_mnt_idmap(ofs), ovl_upper_mnt(ofs),
-				  parent, name);
+	return start_creating(ovl_upper_mnt_idmap(ofs),
+			      parent, name);
 }
 
 static inline struct dentry *ovl_start_removing_upper(struct ovl_fs *ofs,
 						      struct dentry *parent,
 						      struct qstr *name)
 {
-	return start_removing_mnt(ovl_upper_mnt_idmap(ofs), ovl_upper_mnt(ofs),
-				  parent, name);
+	return start_removing(ovl_upper_mnt_idmap(ofs),
+			      parent, name);
 }
 
 static inline bool ovl_open_flags_need_copy_up(int flags)

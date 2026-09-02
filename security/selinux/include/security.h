@@ -9,23 +9,21 @@
 #ifndef _SELINUX_SECURITY_H_
 #define _SELINUX_SECURITY_H_
 
-#include <crypto/sha2.h>
 #include <linux/compiler.h>
+#include <crypto/sha2.h>
+#include <linux/cred.h>
 #include <linux/dcache.h>
+#include <linux/list.h>
+#include <linux/lsm_hooks.h>
 #include <linux/magic.h>
 #include <linux/types.h>
 #include <linux/rcupdate.h>
 #include <linux/refcount.h>
-#include <linux/string.h>
 #include <linux/workqueue.h>
-#include <linux/cred.h>
-#include <linux/lsm_hooks.h>
 #include <linux/delay.h>
 #include <linux/printk.h>
 #include "flask.h"
 #include "policycap.h"
-
-struct selinux_copy_up_carrier;
 
 #define SECSID_NULL   0x00000000 /* unspecified SID */
 #define SECSID_WILD   0xffffffff /* wildcard SID */
@@ -67,10 +65,12 @@ struct selinux_copy_up_carrier;
 #define FSCONTEXT_MNT	0x02
 #define ROOTCONTEXT_MNT 0x04
 #define DEFCONTEXT_MNT	0x08
+#define SBLABEL_MNT	0x10
 /* Non-mount related flags */
 #define SE_SBINITIALIZED 0x0100
 #define SE_SBPROC	 0x0200
 #define SE_SBGENFS	 0x0400
+#define SE_SBGENFS_XATTR 0x0800
 #define SE_SBNATIVE	 0x1000
 
 #define CONTEXT_STR	"context"
@@ -78,7 +78,6 @@ struct selinux_copy_up_carrier;
 #define ROOTCONTEXT_STR "rootcontext"
 #define DEFCONTEXT_STR	"defcontext"
 #define SECLABEL_STR	"seclabel"
-#define SELINUXNS_FD_STR "selinuxns_fd"
 
 struct netlbl_lsm_secattr;
 
@@ -94,208 +93,65 @@ extern int selinux_enabled_boot;
 /* limitation of boundary depth  */
 #define POLICYDB_BOUNDS_MAXDEPTH 4
 
-struct selinux_avc;
-struct selinux_label_domain;
-struct selinux_label_ref;
-struct selinux_label_view;
-struct selinux_global_sid_handle;
 struct selinux_policy;
+struct selinux_avc;
 struct selinux_ns_control;
-struct selinux_netns_security;
-struct mm_struct;
-
-/*
- * Immutable policy metadata captured from the same RCU-published policy
- * object.  policy_cookie is compared only for identity; callers must not
- * dereference it.  A successful AVC check using this snapshot is valid only
- * when both the policy identity/generation and chain epoch still match.
- */
-struct selinux_policy_snapshot {
-	const struct selinux_policy *policy_cookie;
-	unsigned long policycaps;
-	u64 chain_epoch;
-	u32 seqno;
-	u8 effective_digest[SHA256_DIGEST_SIZE];
-	bool initialized;
-	bool active;
-};
-
-enum selinux_validatetrans_decision {
-	SELINUX_VALIDATETRANS_ALLOWED,
-	SELINUX_VALIDATETRANS_DENIED_PERMISSIVE,
-	SELINUX_VALIDATETRANS_DENIED_ENFORCING,
-};
-
-static inline bool selinux_validatetrans_denied(
-	enum selinux_validatetrans_decision decision)
-{
-	return decision != SELINUX_VALIDATETRANS_ALLOWED;
-}
-
-static inline int selinux_validatetrans_apply(
-	enum selinux_validatetrans_decision decision)
-{
-	switch (decision) {
-	case SELINUX_VALIDATETRANS_ALLOWED:
-	case SELINUX_VALIDATETRANS_DENIED_PERMISSIVE:
-		return 0;
-	case SELINUX_VALIDATETRANS_DENIED_ENFORCING:
-		return -EPERM;
-	default:
-		return -EINVAL;
-	}
-}
+struct selinux_object_label_table;
+struct selinux_resource_account;
+struct user_namespace;
 
 struct selinux_state {
 #ifdef CONFIG_SECURITY_SELINUX_DEVELOP
 	bool enforcing;
 #endif
 	bool initialized;
-	/* Dormant control-plane states cannot receive credentials. */
 	bool active;
+	bool policycap[__POLICYDB_CAP_MAX];
 
 	struct page *status_page;
 	struct mutex status_lock;
 
-	struct selinux_avc *avc;
 	struct selinux_policy __rcu *policy;
 	struct mutex policy_mutex;
-	/* Retained selinuxfs policy snapshots across every mount of this state. */
+	/* Retained selinuxfs policy snapshots across all mounts of this state. */
 	atomic64_t policy_snapshot_bytes;
+	u32 policy_seqno;
+	u8 policy_digest[SHA256_DIGEST_SIZE];
+
+	struct selinux_avc *avc;
+	struct user_namespace *owner_userns;
+	struct selinux_resource_account *resources;
+	struct selinux_object_label_table *object_labels;
+	struct selinux_ns_control *ns_control;
+
 	struct selinux_state *parent;
 	struct list_head children;
 	struct list_head sibling;
 	atomic64_t chain_epoch;
-	/* Number of policy/view publications active in this ancestry. */
 	atomic_t chain_updates;
-	struct selinux_label_domain *label_domain;
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	struct selinux_ns_control *ns_control;
-#endif
-
 	refcount_t count;
 	struct work_struct work;
-
-	u32 creator_sid; /* SID of namespace creator */
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	struct selinux_global_sid_handle *creator_sid_handle;
-#endif
-	unsigned short depth;
+	u64 id;
+	u16 depth;
 } __randomize_layout;
 
-int selinux_state_create(const struct cred *cred);
-#ifdef CONFIG_SECURITY_SELINUX_NS
-extern unsigned int selinux_maxns, selinux_maxnsdepth;
-#define SELINUX_MAX_NAMESPACES_LIMIT 65535U
-struct selinux_state *selinux_state_create_dormant(const struct cred *cred);
-int selinux_state_set_maxns(unsigned int value);
-int selinux_state_set_maxnsdepth(unsigned int value);
-#endif
-void __put_selinux_state(struct selinux_state *state);
-u64 selinux_chain_epoch_read(const struct selinux_state *state);
-void selinux_chain_epoch_bump(struct selinux_state *state);
-int selinux_chain_update_begin(struct selinux_state *state);
-void selinux_chain_update_end(struct selinux_state *state);
-int selinux_chain_update_prepare(struct selinux_state *state);
-void selinux_chain_update_abort(struct selinux_state *state);
-void selinux_chain_update_complete(struct selinux_state *state);
-bool selinux_chain_update_active(const struct selinux_state *state);
-int selinux_policy_snapshot_read(struct selinux_state *state,
-				 struct selinux_policy_snapshot *snapshot);
-bool selinux_policy_snapshot_valid(
-	struct selinux_state *state,
-	const struct selinux_policy_snapshot *snapshot);
-static inline bool selinux_policy_snapshot_has_cap(
-	const struct selinux_policy_snapshot *snapshot, unsigned int cap)
-{
-	return cap < __POLICYDB_CAP_MAX &&
-	       snapshot->policycaps & (1UL << cap);
-}
-
-static inline bool selinux_policy_snapshot_equal(
-	const struct selinux_policy_snapshot *a,
-	const struct selinux_policy_snapshot *b)
-{
-	return a->policy_cookie == b->policy_cookie &&
-	       a->policycaps == b->policycaps && a->seqno == b->seqno &&
-	       !memcmp(a->effective_digest, b->effective_digest,
-		       SHA256_DIGEST_SIZE) &&
-	       a->chain_epoch == b->chain_epoch &&
-	       a->initialized == b->initialized && a->active == b->active;
-}
-bool selinux_policycap_enabled(struct selinux_state *state, unsigned int cap);
-#ifdef CONFIG_SECURITY_SELINUX_NS
-int selinuxfs_mm_may_change(struct mm_struct *mm);
-#ifdef CONFIG_SECURITY_SELINUX_KUNIT_TEST
-bool selinuxfs_kunit_mm_tracking_ready(void);
-void *selinuxfs_kunit_mm_track(struct mm_struct *mm);
-void selinuxfs_kunit_mm_untrack(void *cookie);
-void selinuxfs_kunit_tracking_failure(bool active);
-#endif
-#endif
-
-void selinux_policy_free(struct selinux_policy *policy);
-void selinux_state_policy_free(struct selinux_state *state);
-
-struct selinux_resource_account;
 int selinux_avc_create(struct selinux_resource_account *resources,
 		       struct selinux_avc **avc);
 void selinux_avc_free(struct selinux_avc *avc);
-
-static inline void put_selinux_state(struct selinux_state *state)
-{
-	if (state && refcount_dec_and_test(&state->count))
-		__put_selinux_state(state);
-}
-
-static inline struct selinux_state *
-get_selinux_state(struct selinux_state *state)
-{
-	refcount_inc(&state->count);
-	return state;
-}
+void selinux_state_policy_free(struct selinux_state *state);
 
 extern struct selinux_state *init_selinux_state;
 
 struct cred_security_struct {
-	u32 osid; /* SID prior to last execve */
-	u32 sid; /* current SID */
-	u32 exec_sid; /* SID upon next execve */
-	u32 create_sid; /* SID for new files */
-	u32 keycreate_sid; /* SID for new keys */
-	u32 sockcreate_sid; /* SID for new sockets */
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	struct selinux_global_sid_handle *osid_handle;
-	struct selinux_global_sid_handle *sid_handle;
-	struct selinux_global_sid_handle *exec_sid_handle;
-	struct selinux_global_sid_handle *create_sid_handle;
-	struct selinux_global_sid_handle *keycreate_sid_handle;
-	struct selinux_global_sid_handle *sockcreate_sid_handle;
-	/* Synchronous overlayfs transaction state; never inherited by new creds. */
-	struct selinux_copy_up_carrier *copy_up;
-#endif
-	struct selinux_state *state; /* selinux namespace */
-	const struct cred *parent_cred; /* cred in parent ns */
+	u32 osid;
+	u32 sid;
+	u32 exec_sid;
+	u32 create_sid;
+	u32 keycreate_sid;
+	u32 sockcreate_sid;
+	struct selinux_state *state;
+	const struct cred *parent_cred;
 } __randomize_layout;
-
-#ifdef CONFIG_SECURITY_SELINUX_NS
-enum selinux_cred_sid_slot {
-	SELINUX_CRED_OSID,
-	SELINUX_CRED_SID,
-	SELINUX_CRED_EXEC_SID,
-	SELINUX_CRED_CREATE_SID,
-	SELINUX_CRED_KEYCREATE_SID,
-	SELINUX_CRED_SOCKCREATE_SID,
-	SELINUX_CRED_SID_SLOTS,
-};
-
-/* Consume @handle and publish its SID together with durable ownership. */
-int selinux_cred_sid_take_handle(
-	struct cred_security_struct *crsec, enum selinux_cred_sid_slot slot,
-	struct selinux_global_sid_handle *handle);
-int selinux_cred_sid_set(struct cred_security_struct *crsec,
-			 enum selinux_cred_sid_slot slot, u32 sid);
-#endif
 
 extern struct lsm_blob_sizes selinux_blob_sizes;
 
@@ -304,19 +160,51 @@ static inline struct cred_security_struct *selinux_cred(const struct cred *cred)
 	return cred->security + selinux_blob_sizes.lbs_cred;
 }
 
-/*
- * get the subjective security ID of the current task
- */
-static inline u32 current_sid(void)
-{
-	const struct cred_security_struct *crsec = selinux_cred(current_cred());
+#define current_selinux_state (selinux_cred(current_cred())->state)
+#define cred_selinux_state(cred) (selinux_cred(cred)->state)
 
-	return crsec->sid;
+static inline u32 current_sid_disabled(void)
+{
+	return selinux_cred(current_cred())->sid;
 }
 
-#define current_selinux_state (selinux_cred(current_cred())->state)
+static inline struct selinux_state *get_selinux_state(
+	struct selinux_state *state)
+{
+	if (state)
+		refcount_inc(&state->count);
+	return state;
+}
 
-#define cred_selinux_state(cred) (selinux_cred(cred)->state)
+void __put_selinux_state(struct selinux_state *state);
+
+static inline void put_selinux_state(struct selinux_state *state)
+{
+	if (state && refcount_dec_and_test(&state->count))
+		__put_selinux_state(state);
+}
+
+int selinux_state_init_initial(const struct cred *cred, bool enforcing);
+struct selinux_state *selinux_state_create_dormant(const struct cred *cred);
+u64 selinux_chain_epoch_read(const struct selinux_state *state);
+void selinux_chain_epoch_bump(struct selinux_state *state);
+int selinux_chain_update_begin(struct selinux_state *state);
+void selinux_chain_update_end(struct selinux_state *state);
+int selinux_chain_update_prepare(struct selinux_state *state);
+void selinux_chain_update_abort(struct selinux_state *state);
+void selinux_chain_update_complete(struct selinux_state *state);
+bool selinux_chain_update_active(const struct selinux_state *state);
+
+extern unsigned int selinux_maxns;
+extern unsigned int selinux_maxnsdepth;
+#define SELINUX_MAX_NAMESPACES_LIMIT 65535U
+int selinux_state_set_maxns(unsigned int value);
+int selinux_state_set_maxnsdepth(unsigned int value);
+int selinux_state_policy_mutation_allowed(
+	struct selinux_state *target,
+	const struct cred *cred,
+	u32 permission,
+	bool allow_dormant_parent);
 
 static inline bool selinux_initialized(const struct selinux_state *state)
 {
@@ -330,21 +218,6 @@ static inline void selinux_mark_initialized(struct selinux_state *state)
 	smp_store_release(&state->initialized, true);
 }
 
-#ifdef CONFIG_SECURITY_SELINUX_NS
-static inline bool
-selinux_cred_chain_uninitialized(const struct cred *cred)
-{
-	while (cred) {
-		const struct cred_security_struct *crsec = selinux_cred(cred);
-
-		if (selinux_initialized(crsec->state))
-			return false;
-		cred = crsec->parent_cred;
-	}
-	return true;
-}
-#endif
-
 static inline bool selinux_state_active(const struct selinux_state *state)
 {
 	return smp_load_acquire(&state->active);
@@ -356,7 +229,7 @@ static inline void selinux_state_mark_active(struct selinux_state *state)
 }
 
 #ifdef CONFIG_SECURITY_SELINUX_DEVELOP
-static inline bool enforcing_enabled(struct selinux_state *state)
+static inline bool enforcing_enabled(const struct selinux_state *state)
 {
 	return READ_ONCE(state->enforcing);
 }
@@ -366,7 +239,7 @@ static inline void enforcing_set(struct selinux_state *state, bool value)
 	WRITE_ONCE(state->enforcing, value);
 }
 #else
-static inline bool enforcing_enabled(struct selinux_state *state)
+static inline bool enforcing_enabled(const struct selinux_state *state)
 {
 	return true;
 }
@@ -382,94 +255,84 @@ static inline bool checkreqprot_get(const struct selinux_state *state)
 	return 0;
 }
 
-static inline bool selinux_policycap_netpeer(struct selinux_state *state)
+static inline bool selinux_policycap_netpeer(const struct selinux_state *state)
 {
-	return selinux_policycap_enabled(state, POLICYDB_CAP_NETPEER);
+	return READ_ONCE(state->policycap[POLICYDB_CAP_NETPEER]);
 }
 
-static inline bool selinux_policycap_openperm(struct selinux_state *state)
+static inline bool selinux_policycap_openperm(const struct selinux_state *state)
 {
-	return selinux_policycap_enabled(state, POLICYDB_CAP_OPENPERM);
+	return READ_ONCE(state->policycap[POLICYDB_CAP_OPENPERM]);
 }
 
-static inline bool selinux_policycap_extsockclass(struct selinux_state *state)
+static inline bool selinux_policycap_extsockclass(const struct selinux_state *state)
 {
-	return selinux_policycap_enabled(state, POLICYDB_CAP_EXTSOCKCLASS);
+	return READ_ONCE(state->policycap[POLICYDB_CAP_EXTSOCKCLASS]);
 }
 
-static inline bool selinux_policycap_alwaysnetwork(struct selinux_state *state)
+static inline bool selinux_policycap_alwaysnetwork(const struct selinux_state *state)
 {
-	return selinux_policycap_enabled(state, POLICYDB_CAP_ALWAYSNETWORK);
+	return READ_ONCE(state->policycap[POLICYDB_CAP_ALWAYSNETWORK]);
 }
 
-static inline bool
-selinux_policycap_cgroupseclabel(struct selinux_state *state)
+static inline bool selinux_policycap_cgroupseclabel(const struct selinux_state *state)
 {
-	return selinux_policycap_enabled(state,
-					 POLICYDB_CAP_CGROUPSECLABEL);
+	return READ_ONCE(state->policycap[POLICYDB_CAP_CGROUPSECLABEL]);
 }
 
 static inline bool selinux_policycap_nnp_nosuid_transition(
-	const struct selinux_policy_snapshot *snapshot)
+	const struct selinux_state *state)
 {
-	return selinux_policy_snapshot_has_cap(
-		snapshot, POLICYDB_CAP_NNP_NOSUID_TRANSITION);
+	return READ_ONCE(
+		state->policycap[POLICYDB_CAP_NNP_NOSUID_TRANSITION]);
 }
 
-static inline
-bool selinux_policycap_genfs_seclabel_symlinks(struct selinux_state *state)
+static inline bool selinux_policycap_genfs_seclabel_symlinks(
+	const struct selinux_state *state)
 {
-	return selinux_policycap_enabled(state,
-					 POLICYDB_CAP_GENFS_SECLABEL_SYMLINKS);
+	return READ_ONCE(
+		state->policycap[POLICYDB_CAP_GENFS_SECLABEL_SYMLINKS]);
 }
 
 static inline bool selinux_policycap_ioctl_skip_cloexec(
-	const struct selinux_policy_snapshot *snapshot)
+	const struct selinux_state *state)
 {
-	return selinux_policy_snapshot_has_cap(
-		snapshot, POLICYDB_CAP_IOCTL_SKIP_CLOEXEC);
+	return READ_ONCE(
+		state->policycap[POLICYDB_CAP_IOCTL_SKIP_CLOEXEC]);
 }
 
 static inline bool selinux_policycap_userspace_initial_context(
-	const struct selinux_policy_snapshot *snapshot)
+	const struct selinux_state *state)
 {
-	return selinux_policy_snapshot_has_cap(
-		snapshot, POLICYDB_CAP_USERSPACE_INITIAL_CONTEXT);
+	return READ_ONCE(
+		state->policycap[POLICYDB_CAP_USERSPACE_INITIAL_CONTEXT]);
 }
 
 static inline bool selinux_policycap_netlink_xperm(
-	const struct selinux_policy_snapshot *snapshot)
+	const struct selinux_state *state)
 {
-	return selinux_policy_snapshot_has_cap(snapshot,
-					 POLICYDB_CAP_NETLINK_XPERM);
+	return READ_ONCE(
+		state->policycap[POLICYDB_CAP_NETLINK_XPERM]);
 }
 
-static inline bool
-selinux_policycap_functionfs_seclabel(struct selinux_state *state)
+static inline bool selinux_policycap_functionfs_seclabel(
+	const struct selinux_state *state)
 {
-	return selinux_policycap_enabled(state,
-					 POLICYDB_CAP_FUNCTIONFS_SECLABEL);
+	return READ_ONCE(
+		state->policycap[POLICYDB_CAP_FUNCTIONFS_SECLABEL]);
 }
 
 static inline bool selinux_policycap_memfd_class(
-	const struct selinux_policy_snapshot *snapshot)
+	const struct selinux_state *state)
 {
-	return selinux_policy_snapshot_has_cap(snapshot,
-					 POLICYDB_CAP_MEMFD_CLASS);
+	return READ_ONCE(state->policycap[POLICYDB_CAP_MEMFD_CLASS]);
 }
 
 static inline bool selinux_policycap_bpf_token_perms(
-	const struct selinux_policy_snapshot *snapshot)
+	const struct selinux_state *state)
 {
-	return selinux_policy_snapshot_has_cap(snapshot,
-					 POLICYDB_CAP_BPF_TOKEN_PERMS);
-}
-
-static inline bool selinux_policycap_bpf_object_perms(
-	const struct selinux_policy_snapshot *snapshot)
-{
-	return selinux_policy_snapshot_has_cap(snapshot,
-					 POLICYDB_CAP_BPF_OBJECT_PERMS);
+	return READ_ONCE(
+		state->policycap[POLICYDB_CAP_BPF_TOKEN_PERMS]);
 }
 
 struct selinux_policy_convert_data;
@@ -482,15 +345,14 @@ struct selinux_load_state {
 int security_mls_enabled(struct selinux_state *state);
 int security_load_policy(struct selinux_state *state, void *data, size_t len,
 			 struct selinux_load_state *load_state);
-int selinux_policy_commit(struct selinux_state *state,
-				struct selinux_load_state *load_state);
+void selinux_policy_commit(struct selinux_state *state,
+			   struct selinux_load_state *load_state);
 void selinux_policy_cancel(struct selinux_state *state,
 			   struct selinux_load_state *load_state);
+int security_read_policy(struct selinux_state *state, void **data, size_t *len);
 int security_policy_size(struct selinux_state *state, size_t *len);
-int security_read_policy(struct selinux_state *state, void **data, size_t *len,
-			 size_t max_len);
-int security_read_state_kernel(struct selinux_state *state, void **data,
-			       size_t *len);
+int security_read_state_kernel(struct selinux_state *state,
+			       void **data, size_t *len);
 int security_policycap_supported(struct selinux_state *state,
 				 unsigned int req_cap);
 
@@ -533,34 +395,46 @@ struct extended_perms {
 #define AVD_FLAGS_PERMISSIVE 0x0001
 #define AVD_FLAGS_NEVERAUDIT  0x0002
 
-#ifdef CONFIG_SECURITY_SELINUX_NS
-
-void security_compute_av(struct selinux_state *state, u32 ssid, u32 tsid,
-			 u16 tclass, struct av_decision *avd,
+void security_compute_av(struct selinux_state *state,
+			 u32 ssid, u32 tsid, u16 tclass,
+			 struct av_decision *avd,
 			 struct extended_perms *xperms);
 
-void security_compute_xperms_decision(struct selinux_state *state, u32 ssid,
-				      u32 tsid, u16 tclass, u8 driver,
-				      u8 base_perm,
+void security_compute_xperms_decision(struct selinux_state *state,
+				      u32 ssid, u32 tsid, u16 tclass,
+				      u8 driver, u8 base_perm,
 				      struct extended_perms_decision *xpermd);
 
-int security_transition_sid(struct selinux_state *state, u32 ssid, u32 tsid,
-			    u16 tclass, const struct qstr *qstr, u32 *out_sid);
+void security_compute_av_user(struct selinux_state *state,
+			      u32 ssid, u32 tsid, u16 tclass,
+			      struct av_decision *avd);
+
+int security_transition_sid(struct selinux_state *state,
+			    u32 ssid, u32 tsid, u16 tclass,
+			    const struct qstr *qstr, u32 *out_sid);
+
+int security_transition_sid_user(struct selinux_state *state,
+				 u32 ssid, u32 tsid, u16 tclass,
+				 const char *objname, u32 *out_sid);
+
+int security_member_sid(struct selinux_state *state,
+			u32 ssid, u32 tsid, u16 tclass, u32 *out_sid);
+
+int security_change_sid(struct selinux_state *state,
+			u32 ssid, u32 tsid, u16 tclass, u32 *out_sid);
 
 int security_sid_to_context(struct selinux_state *state, u32 sid,
-			    const char **scontext, u32 *scontext_len);
-
-int security_sid_to_context_valid(struct selinux_state *state, u32 sid,
-				  const char **scontext, u32 *scontext_len);
+			    char **scontext, u32 *scontext_len);
 
 int security_sid_to_context_force(struct selinux_state *state, u32 sid,
-				  const char **scontext, u32 *scontext_len);
+				  char **scontext, u32 *scontext_len);
 
 int security_sid_to_context_inval(struct selinux_state *state, u32 sid,
-				  const char **scontext, u32 *scontext_len);
+				  char **scontext, u32 *scontext_len);
 
-int security_context_to_sid(struct selinux_state *state, const char *scontext,
-			    u32 scontext_len, u32 *out_sid, gfp_t gfp);
+int security_context_to_sid(struct selinux_state *state,
+			    const char *scontext, u32 scontext_len,
+			    u32 *out_sid, gfp_t gfp);
 
 int security_context_str_to_sid(struct selinux_state *state,
 				const char *scontext, u32 *out_sid, gfp_t gfp);
@@ -573,201 +447,38 @@ int security_context_to_sid_force(struct selinux_state *state,
 				  const char *scontext, u32 scontext_len,
 				  u32 *sid);
 
-int security_port_sid(struct selinux_state *state, u8 protocol, u16 port,
-		      u32 *out_sid);
+int security_port_sid(struct selinux_state *state,
+		      u8 protocol, u16 port, u32 *out_sid);
 
-int security_ib_pkey_sid(struct selinux_state *state, u64 subnet_prefix,
-			 u16 pkey_num, u32 *out_sid);
+int security_ib_pkey_sid(struct selinux_state *state,
+			 u64 subnet_prefix, u16 pkey_num, u32 *out_sid);
 
-int security_ib_endport_sid(struct selinux_state *state, const char *dev_name,
-			    u8 port_num, u32 *out_sid);
+int security_ib_endport_sid(struct selinux_state *state,
+			   const char *dev_name, u8 port_num, u32 *out_sid);
 
-int security_netif_sid(struct selinux_state *state, const char *name,
-		       u32 *if_sid);
+int security_netif_sid(struct selinux_state *state,
+		       const char *name, u32 *if_sid);
 
-int security_node_sid(struct selinux_state *state, u16 domain, const void *addr,
-		      u32 addrlen, u32 *out_sid);
+int security_node_sid(struct selinux_state *state, u16 domain,
+		      const void *addr, u32 addrlen, u32 *out_sid);
 
-int security_validate_transition(struct selinux_state *state, u32 oldsid,
-				 u32 newsid, u32 tasksid, u16 tclass);
-int security_validate_transition_snapshot_noaudit(
-	struct selinux_state *state,
-	const struct selinux_policy_snapshot *snapshot, u32 oldsid, u32 newsid,
-	u32 tasksid, u16 tclass,
-	enum selinux_validatetrans_decision *decision);
+int security_validate_transition(struct selinux_state *state,
+				 u32 oldsid, u32 newsid, u32 tasksid,
+				 u16 tclass);
 
-int security_bounded_transition(struct selinux_state *state, u32 old_sid,
-				u32 new_sid);
+int security_validate_transition_user(struct selinux_state *state,
+				      u32 oldsid, u32 newsid, u32 tasksid,
+				      u16 tclass);
 
-int security_sid_mls_copy(struct selinux_state *state, u32 sid, u32 mls_sid,
-			  u32 *new_sid);
+int security_bounded_transition(struct selinux_state *state,
+				u32 old_sid, u32 new_sid);
 
-int security_net_peersid_resolve(struct selinux_state *state, u32 nlbl_sid,
-				 u32 nlbl_type, u32 xfrm_sid, u32 *peer_sid);
+int security_sid_mls_copy(struct selinux_state *state,
+			  u32 sid, u32 mls_sid, u32 *new_sid);
 
-#else
-
-#include "selinux_ss.h"
-
-static inline void security_compute_av(struct selinux_state *state, u32 ssid,
-				       u32 tsid, u16 tclass,
-				       struct av_decision *avd,
-				       struct extended_perms *xperms)
-{
-	selinux_ss_compute_av(state, ssid, tsid, tclass, avd, xperms);
-}
-
-static inline void
-security_compute_xperms_decision(struct selinux_state *state, u32 ssid,
-				 u32 tsid, u16 tclass, u8 driver, u8 base_perm,
-				 struct extended_perms_decision *xpermd)
-{
-	selinux_ss_compute_xperms_decision(state, ssid, tsid, tclass, driver,
-					   base_perm, xpermd);
-}
-
-static inline int security_transition_sid(struct selinux_state *state, u32 ssid,
-					  u32 tsid, u16 tclass,
-					  const struct qstr *qstr, u32 *out_sid)
-{
-	return selinux_ss_transition_sid(state, ssid, tsid, tclass, qstr,
-					 out_sid);
-}
-
-static inline int security_sid_to_context(struct selinux_state *state, u32 sid,
-					  const char **scontext, u32 *scontext_len)
-{
-	return selinux_ss_sid_to_context(state, sid, scontext, scontext_len);
-}
-
-static inline int security_sid_to_context_valid(struct selinux_state *state,
-						u32 sid, const char **scontext,
-						u32 *scontext_len)
-{
-	return selinux_ss_sid_to_context(state, sid, scontext, scontext_len);
-}
-
-static inline int security_sid_to_context_force(struct selinux_state *state,
-						u32 sid, const char **scontext,
-						u32 *scontext_len)
-{
-	return selinux_ss_sid_to_context_force(state, sid, scontext,
-					       scontext_len);
-}
-
-static inline int security_sid_to_context_inval(struct selinux_state *state,
-						u32 sid, const char **scontext,
-						u32 *scontext_len)
-{
-	return selinux_ss_sid_to_context_inval(state, sid, scontext,
-					       scontext_len);
-}
-
-static inline int security_context_to_sid(struct selinux_state *state,
-					  const char *scontext,
-					  u32 scontext_len, u32 *out_sid,
-					  gfp_t gfp)
-{
-	return selinux_ss_context_to_sid(state, scontext, scontext_len, out_sid,
-					 gfp);
-}
-
-static inline int security_context_str_to_sid(struct selinux_state *state,
-					      const char *scontext,
-					      u32 *out_sid, gfp_t gfp)
-{
-	return selinux_ss_context_str_to_sid(state, scontext, out_sid, gfp);
-}
-
-static inline int security_context_to_sid_default(struct selinux_state *state,
-						  const char *scontext,
-						  u32 scontext_len,
-						  u32 *out_sid, u32 def_sid,
-						  gfp_t gfp_flags)
-{
-	return selinux_ss_context_to_sid_default(state, scontext, scontext_len,
-						 out_sid, def_sid, gfp_flags);
-}
-
-static inline int security_context_to_sid_force(struct selinux_state *state,
-						const char *scontext,
-						u32 scontext_len, u32 *sid)
-{
-	return selinux_ss_context_to_sid_force(state, scontext, scontext_len,
-					       sid, GFP_KERNEL);
-}
-
-static inline int security_port_sid(struct selinux_state *state, u8 protocol,
-				    u16 port, u32 *out_sid)
-{
-	return selinux_ss_port_sid(state, protocol, port, out_sid);
-}
-
-static inline int security_ib_pkey_sid(struct selinux_state *state,
-				       u64 subnet_prefix, u16 pkey_num,
-				       u32 *out_sid)
-{
-	return selinux_ss_ib_pkey_sid(state, subnet_prefix, pkey_num, out_sid);
-}
-
-static inline int security_ib_endport_sid(struct selinux_state *state,
-					  const char *dev_name, u8 port_num,
-					  u32 *out_sid)
-{
-	return selinux_ss_ib_endport_sid(state, dev_name, port_num, out_sid);
-}
-
-static inline int security_netif_sid(struct selinux_state *state,
-				     const char *name, u32 *if_sid)
-{
-	return selinux_ss_netif_sid(state, name, if_sid);
-}
-
-static inline int security_node_sid(struct selinux_state *state, u16 domain,
-				    const void *addr, u32 addrlen, u32 *out_sid)
-{
-	return selinux_ss_node_sid(state, domain, addr, addrlen, out_sid);
-}
-
-static inline int security_validate_transition(struct selinux_state *state,
-					       u32 oldsid, u32 newsid,
-					       u32 tasksid, u16 tclass)
-{
-	return selinux_ss_validate_transition(state, oldsid, newsid, tasksid,
-					      tclass);
-}
-
-static inline int security_validate_transition_snapshot_noaudit(
-	struct selinux_state *state,
-	const struct selinux_policy_snapshot *snapshot, u32 oldsid, u32 newsid,
-	u32 tasksid, u16 tclass,
-	enum selinux_validatetrans_decision *decision)
-{
-	return selinux_ss_validate_transition_snapshot_noaudit(
-		state, snapshot, oldsid, newsid, tasksid, tclass, decision);
-}
-
-static inline int security_bounded_transition(struct selinux_state *state,
-					      u32 old_sid, u32 new_sid)
-{
-	return selinux_ss_bounded_transition(state, old_sid, new_sid);
-}
-
-static inline int security_sid_mls_copy(struct selinux_state *state, u32 sid,
-					u32 mls_sid, u32 *new_sid)
-{
-	return selinux_ss_sid_mls_copy(state, sid, mls_sid, new_sid);
-}
-
-static inline int security_net_peersid_resolve(struct selinux_state *state,
-					       u32 nlbl_sid, u32 nlbl_type,
-					       u32 xfrm_sid, u32 *peer_sid)
-{
-	return selinux_ss_net_peersid_resolve(state, nlbl_sid, nlbl_type,
-					      xfrm_sid, peer_sid);
-}
-
-#endif /* CONFIG_SECURITY_SELINUX_NS */
+int security_net_peersid_resolve(struct selinux_state *state,
+				 u32 nlbl_sid, u32 nlbl_type, u32 xfrm_sid,
+				 u32 *peer_sid);
 
 int security_get_classes(struct selinux_policy *policy, char ***classes,
 			 u32 *nclasses);
@@ -785,110 +496,34 @@ int security_get_allow_unknown(struct selinux_state *state);
 #define SECURITY_FS_USE_NATIVE	 7 /* use native label support */
 #define SECURITY_FS_USE_MAX	 7 /* Highest SECURITY_FS_USE_XXX */
 
-#ifdef CONFIG_SECURITY_SELINUX_NS
-int security_fs_use(struct selinux_state *state, const char *fstype,
-		    unsigned short *behavior, u32 *sid);
+int security_fs_use(struct selinux_state *state, struct super_block *sb,
+		    u16 *behavior, u32 *sid);
 
-int security_genfs_sid(struct selinux_state *state, const char *fstype,
-		       const char *path, u16 sclass, u32 *sid);
+int security_genfs_sid(struct selinux_state *state,
+		       const char *fstype, const char *path, u16 sclass,
+		       u32 *sid);
 
-int selinux_policy_genfs_sid(struct selinux_state *state,
-			     struct selinux_policy *policy,
-			     const char *fstype, const char *path,
-			     u16 sclass, u32 *sid);
-#else
-static inline int security_fs_use(struct selinux_state *state,
-				  const char *fstype, unsigned short *behavior,
-				  u32 *sid)
-{
-	return selinux_ss_fs_use(state, fstype, behavior, sid);
-}
-
-static inline int security_genfs_sid(struct selinux_state *state,
-				     const char *fstype, const char *path,
-				     u16 sclass, u32 *sid)
-{
-	return selinux_ss_genfs_sid(state, fstype, path, sclass, sid);
-}
-
-static inline int selinux_policy_genfs_sid(struct selinux_state *state,
-					   struct selinux_policy *policy,
-					   const char *fstype,
-					   const char *path, u16 sclass,
-					   u32 *sid)
-{
-	(void)state;
-	return selinux_ss_policy_genfs_sid(policy, fstype, path, sclass, sid);
-}
-#endif
+int selinux_policy_genfs_sid(struct selinux_policy *policy, const char *fstype,
+			     const char *path, u16 sclass, u32 *sid);
 
 #ifdef CONFIG_NETLABEL
-#ifdef CONFIG_SECURITY_SELINUX_NS
 int security_netlbl_secattr_to_sid(struct selinux_state *state,
 				   struct netlbl_lsm_secattr *secattr,
 				   u32 *sid);
-int security_netlbl_secattr_to_sid_view(
-	struct selinux_state *state, const struct selinux_label_view *view,
-	struct netlbl_lsm_secattr *secattr, u32 *sid);
 
 int security_netlbl_sid_to_secattr(struct selinux_state *state, u32 sid,
 				   struct netlbl_lsm_secattr *secattr);
-#else /* CONFIG_SECURITY_SELINUX_NS */
-#include <net/netlabel.h>
-
+#else
 static inline int
 security_netlbl_secattr_to_sid(struct selinux_state *state,
-			       struct netlbl_lsm_secattr *secattr, u32 *sid)
-{
-	if (secattr->flags & NETLBL_SECATTR_SECID) {
-		*sid = secattr->attr.secid;
-		return 0;
-	}
-
-	return selinux_ss_netlbl_secattr_to_sid(state, secattr, sid);
-}
-
-static inline int security_netlbl_secattr_to_sid_view(
-	struct selinux_state *state, const struct selinux_label_view *view,
-	struct netlbl_lsm_secattr *secattr, u32 *sid)
-{
-	return security_netlbl_secattr_to_sid(state, secattr, sid);
-}
-
-static inline int
-security_netlbl_sid_to_secattr(struct selinux_state *state, u32 sid,
-			       struct netlbl_lsm_secattr *secattr)
-{
-	int rc;
-
-	rc = selinux_ss_netlbl_sid_to_secattr(state, sid, secattr);
-	if (rc)
-		return rc;
-
-	secattr->attr.secid = sid;
-	secattr->flags |= NETLBL_SECATTR_SECID;
-	return 0;
-}
-
-#endif /* CONFIG_SECURITY_SELINUX_NS */
-#else /* CONFIG_NETLABEL */
-static inline int
-security_netlbl_secattr_to_sid(struct selinux_state *state,
-			       struct netlbl_lsm_secattr *secattr, u32 *sid)
-{
-	return -EIDRM;
-}
-
-static inline int security_netlbl_secattr_to_sid_view(
-	struct selinux_state *state, const struct selinux_label_view *view,
-	struct netlbl_lsm_secattr *secattr, u32 *sid)
+			      struct netlbl_lsm_secattr *secattr, u32 *sid)
 {
 	return -EIDRM;
 }
 
 static inline int
 security_netlbl_sid_to_secattr(struct selinux_state *state, u32 sid,
-			       struct netlbl_lsm_secattr *secattr)
+			      struct netlbl_lsm_secattr *secattr)
 {
 	return -ENOENT;
 }
@@ -913,32 +548,22 @@ struct selinux_kernel_status {
 	 */
 } __packed;
 
-extern void selinux_status_update_setenforce(struct selinux_state *state,
-					     bool enforcing);
-extern void selinux_status_update_policyload(struct selinux_state *state,
-					     u32 seqno);
-extern void selinux_complete_init(void);
+extern void selinux_status_update_setenforce(
+	struct selinux_state *state,
+	bool enforcing);
+extern void selinux_status_update_policyload(
+	struct selinux_state *state,
+	u32 seqno);
+extern void selinux_complete_init(struct selinux_state *state);
 extern struct path selinux_null;
 extern void selnl_notify_setenforce(int val);
 extern void selnl_notify_policyload(u32 seqno);
-extern int selinux_nlmsg_lookup(
-	const struct selinux_policy_snapshot *snapshot,
-	u16 sclass, u16 nlmsg_type, u32 *perm);
+extern int selinux_nlmsg_lookup(struct selinux_state *state, u16 sclass,
+			       u16 nlmsg_type, u32 *perm);
 
 extern void avtab_cache_init(void);
 extern void ebitmap_cache_init(void);
 extern void hashtab_cache_init(void);
 extern int security_sidtab_hash_stats(struct selinux_state *state, char *page);
-
-#if defined(CONFIG_SECURITY_SELINUX_NS) && \
-	defined(CONFIG_SECURITY_SELINUX_KUNIT_TEST)
-int selinux_kunit_inode_xattr_sid_for_view(
-	const struct selinux_label_view *view, bool mount_supplied,
-	const struct selinux_label_domain *observer_domain,
-	struct selinux_label_ref *label, u32 source_sid, u32 *observer_sid);
-bool selinux_kunit_secmark_netns_view_valid(
-	const struct selinux_netns_security *netsec,
-	const struct user_namespace *owner_userns);
-#endif
 
 #endif /* _SELINUX_SECURITY_H_ */

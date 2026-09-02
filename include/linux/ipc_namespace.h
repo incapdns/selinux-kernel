@@ -15,13 +15,6 @@
 
 struct user_namespace;
 
-enum ipc_ids_index {
-	IPC_SEM_IDS,
-	IPC_MSG_IDS,
-	IPC_SHM_IDS,
-	IPC_IDS_COUNT,
-};
-
 struct ipc_ids {
 	int in_use;
 	unsigned short seq;
@@ -36,7 +29,7 @@ struct ipc_ids {
 };
 
 struct ipc_namespace {
-	struct ipc_ids	ids[IPC_IDS_COUNT];
+	struct ipc_ids	ids[3];
 
 	int		sem_ctls[4];
 	int		used_sems;
@@ -83,9 +76,6 @@ struct ipc_namespace {
 	struct ucounts *ucounts;
 
 	struct llist_node mnt_llist;
-
-	/* Composite LSM state for this IPC namespace. */
-	void *security;
 
 	struct ns_common ns;
 } __randomize_layout;

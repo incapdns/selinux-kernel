@@ -213,13 +213,6 @@ int netlbl_unlhsh_add(struct net *net,
 		      u32 addr_len,
 		      u32 secid,
 		      struct netlbl_audit *audit_info);
-int netlbl_unlhsh_add_ref(struct net *net,
-			  const char *dev_name,
-			  const void *addr,
-			  const void *mask,
-			  u32 addr_len,
-			  struct lsm_prop_ref *prop_ref,
-			  struct netlbl_audit *audit_info);
 int netlbl_unlhsh_remove(struct net *net,
 			 const char *dev_name,
 			 const void *addr,

@@ -10,8 +10,6 @@
 #include <linux/list.h>
 #include "mount.h"
 
-struct security_mnt_topology;
-
 #define IS_MNT_SHARED(m) ((m)->mnt_t_flags & T_SHARED)
 #define IS_MNT_SLAVE(m) ((m)->mnt_master)
 #define IS_MNT_NEW(m) (!(m)->mnt_ns)
@@ -46,12 +44,7 @@ static inline bool peers(const struct mount *m1, const struct mount *m2)
 void change_mnt_propagation(struct mount *, int);
 void bulk_make_private(struct list_head *);
 int propagate_mnt(struct mount *, struct mountpoint *, struct mount *,
-		struct hlist_head *, struct security_mnt_topology *);
-int mnt_topology_add_tree(struct security_mnt_topology *topology,
-			  struct mount *source, struct mount *target);
-int mnt_topology_apply_tree(struct security_mnt_topology *topology,
-			    struct mount *source, struct mount *target);
-void mnt_topology_discard_tree(struct mount *mnt);
+		struct hlist_head *);
 void propagate_umount(struct list_head *);
 int propagate_mount_busy(struct mount *, int);
 void propagate_mount_unlock(struct mount *);

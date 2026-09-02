@@ -47,28 +47,6 @@ struct aa_label *aa_secid_to_label(u32 secid)
 	return xa_load(&aa_secids, secid);
 }
 
-/**
- * aa_secid_to_label_ref - resolve a secid and retain its exact label
- * @secid: AppArmor secid to resolve
- *
- * The xarray itself does not pin labels.  Take the label reference while the
- * xarray lock excludes aa_free_secid(), so a durable caller never races label
- * teardown after resolving a numeric compatibility handle.
- *
- * Returns: a counted label, or NULL when @secid is not live
- */
-struct aa_label *aa_secid_to_label_ref(u32 secid)
-{
-	struct aa_label *label;
-	unsigned long flags;
-
-	xa_lock_irqsave(&aa_secids, flags);
-	label = __aa_get_label(xa_load(&aa_secids, secid));
-	xa_unlock_irqrestore(&aa_secids, flags);
-
-	return label;
-}
-
 static int apparmor_label_to_secctx(struct aa_label *label,
 				    struct lsm_context *cp)
 {
@@ -101,16 +79,12 @@ static int apparmor_label_to_secctx(struct aa_label *label,
 
 int apparmor_secid_to_secctx(u32 secid, struct lsm_context *cp)
 {
-	struct aa_label *label = aa_secid_to_label_ref(secid);
-	int ret;
+	struct aa_label *label = aa_secid_to_label(secid);
 
-	ret = apparmor_label_to_secctx(label, cp);
-	aa_put_label(label);
-	return ret;
+	return apparmor_label_to_secctx(label, cp);
 }
 
-int apparmor_lsmprop_to_secctx(const struct lsm_prop *prop,
-			      struct lsm_context *cp)
+int apparmor_lsmprop_to_secctx(struct lsm_prop *prop, struct lsm_context *cp)
 {
 	struct aa_label *label;
 

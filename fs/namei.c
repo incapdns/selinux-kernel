@@ -614,9 +614,8 @@ static int sb_permission(struct super_block *sb, struct inode *inode, int mask)
 }
 
 /**
- * inode_permission_mnt - Check for access rights to a given inode
+ * inode_permission - Check for access rights to a given inode
  * @idmap:	idmap of the mount the inode was found from
- * @mnt:	mount selecting the LSM label view
  * @inode:	Inode to check permission on
  * @mask:	Right to check for (%MAY_READ, %MAY_WRITE, %MAY_EXEC)
  *
@@ -626,8 +625,8 @@ static int sb_permission(struct super_block *sb, struct inode *inode, int mask)
  *
  * When checking for MAY_APPEND, MAY_WRITE must also be set in @mask.
  */
-int inode_permission_mnt(struct mnt_idmap *idmap, const struct vfsmount *mnt,
-			 struct inode *inode, int mask)
+int inode_permission(struct mnt_idmap *idmap,
+		     struct inode *inode, int mask)
 {
 	int retval;
 
@@ -659,14 +658,7 @@ int inode_permission_mnt(struct mnt_idmap *idmap, const struct vfsmount *mnt,
 	if (unlikely(retval))
 		return retval;
 
-	return security_inode_permission(mnt, inode, mask);
-}
-EXPORT_SYMBOL(inode_permission_mnt);
-
-int inode_permission(struct mnt_idmap *idmap, struct inode *inode,
-			      int mask)
-{
-	return inode_permission_mnt(idmap, NULL, inode, mask);
+	return security_inode_permission(inode, mask);
 }
 EXPORT_SYMBOL(inode_permission);
 
@@ -688,8 +680,7 @@ EXPORT_SYMBOL(inode_permission);
  * on IOP_FASTPERM can still get the optimization if they set IOP_FASTPERM_MAY_EXEC
  * on their directory inodes.
  */
-static __always_inline int lookup_inode_permission_may_exec(
-	struct mnt_idmap *idmap, const struct vfsmount *mnt,
+static __always_inline int lookup_inode_permission_may_exec(struct mnt_idmap *idmap,
 	struct inode *inode, int mask)
 {
 	/* Lookup already checked this to return -ENOTDIR */
@@ -699,12 +690,12 @@ static __always_inline int lookup_inode_permission_may_exec(
 	mask |= MAY_EXEC;
 
 	if (unlikely(!(inode->i_opflags & (IOP_FASTPERM | IOP_FASTPERM_MAY_EXEC))))
-		return inode_permission_mnt(idmap, mnt, inode, mask);
+		return inode_permission(idmap, inode, mask);
 
 	if (unlikely(((inode->i_mode & 0111) != 0111) || !no_acl_inode(inode)))
-		return inode_permission_mnt(idmap, mnt, inode, mask);
+		return inode_permission(idmap, inode, mask);
 
-	return security_inode_permission(mnt, inode, mask);
+	return security_inode_permission(inode, mask);
 }
 
 /**
@@ -1313,7 +1304,6 @@ static inline int may_follow_link(struct nameidata *nd, const struct inode *inod
 /**
  * safe_hardlink_source - Check for safe hardlink conditions
  * @idmap: idmap of the mount the inode was found from
- * @mnt: mount through which the source inode was found
  * @inode: the source inode to hardlink from
  *
  * Return false if at least one of the following conditions:
@@ -1325,7 +1315,6 @@ static inline int may_follow_link(struct nameidata *nd, const struct inode *inod
  * Otherwise returns true.
  */
 static bool safe_hardlink_source(struct mnt_idmap *idmap,
-				 const struct vfsmount *mnt,
 				 struct inode *inode)
 {
 	umode_t mode = inode->i_mode;
@@ -1343,7 +1332,7 @@ static bool safe_hardlink_source(struct mnt_idmap *idmap,
 		return false;
 
 	/* Hardlinking to unreadable or unwritable sources is dangerous. */
-	if (inode_permission_mnt(idmap, mnt, inode, MAY_READ | MAY_WRITE))
+	if (inode_permission(idmap, inode, MAY_READ | MAY_WRITE))
 		return false;
 
 	return true;
@@ -1383,7 +1372,7 @@ int may_linkat(struct mnt_idmap *idmap, const struct path *link)
 	/* Source inode owner (or CAP_FOWNER) can hardlink all they like,
 	 * otherwise, it must be a safe source.
 	 */
-	if (safe_hardlink_source(idmap, link->mnt, inode) ||
+	if (safe_hardlink_source(idmap, inode) ||
 	    inode_owner_or_capable(idmap, inode))
 		return 0;
 
@@ -1969,8 +1958,7 @@ static inline int may_lookup(struct mnt_idmap *idmap,
 	int err, mask;
 
 	mask = nd->flags & LOOKUP_RCU ? MAY_NOT_BLOCK : 0;
-	err = lookup_inode_permission_may_exec(idmap, nd->path.mnt, nd->inode,
-					       mask);
+	err = lookup_inode_permission_may_exec(idmap, nd->inode, mask);
 	if (likely(!err))
 		return 0;
 
@@ -1985,8 +1973,7 @@ static inline int may_lookup(struct mnt_idmap *idmap,
 	if (err != -ECHILD)	// hard error
 		return err;
 
-	return lookup_inode_permission_may_exec(idmap, nd->path.mnt, nd->inode,
-					       0);
+	return lookup_inode_permission_may_exec(idmap, nd->inode, 0);
 }
 
 static int reserve_stack(struct nameidata *nd, struct path *link)
@@ -2063,8 +2050,8 @@ static noinline const char *pick_link(struct nameidata *nd, struct path *link,
 		cond_resched();
 	}
 
-	error = security_inode_follow_link_mnt(link->mnt, link->dentry, inode,
-					       nd->flags & LOOKUP_RCU);
+	error = security_inode_follow_link(link->dentry, inode,
+					   nd->flags & LOOKUP_RCU);
 	if (unlikely(error))
 		return ERR_PTR(error);
 
@@ -3125,15 +3112,13 @@ int lookup_noperm_common(struct qstr *qname, struct dentry *base)
 }
 
 static int lookup_one_common(struct mnt_idmap *idmap,
-			     const struct vfsmount *mnt,
 			     struct qstr *qname, struct dentry *base)
 {
 	int err;
-
 	err = lookup_noperm_common(qname, base);
 	if (err < 0)
 		return err;
-	return inode_permission_mnt(idmap, mnt, base->d_inode, MAY_EXEC);
+	return inode_permission(idmap, base->d_inode, MAY_EXEC);
 }
 
 /**
@@ -3196,9 +3181,8 @@ struct dentry *lookup_noperm(struct qstr *name, struct dentry *base)
 EXPORT_SYMBOL(lookup_noperm);
 
 /**
- * lookup_one_mnt - lookup single pathname component
+ * lookup_one - lookup single pathname component
  * @idmap:	idmap of the mount the lookup is performed from
- * @mnt:	mount through which the lookup is performed
  * @name:	qstr holding pathname component to lookup
  * @base:	base directory to lookup from
  *
@@ -3206,36 +3190,26 @@ EXPORT_SYMBOL(lookup_noperm);
  *
  * The caller must hold base->i_rwsem.
  */
-struct dentry *lookup_one_mnt(struct mnt_idmap *idmap,
-			      const struct vfsmount *mnt, struct qstr *name,
-			      struct dentry *base)
+struct dentry *lookup_one(struct mnt_idmap *idmap, struct qstr *name,
+			  struct dentry *base)
 {
 	struct dentry *dentry;
 	int err;
 
 	WARN_ON_ONCE(!inode_is_locked(base->d_inode));
 
-	err = lookup_one_common(idmap, mnt, name, base);
+	err = lookup_one_common(idmap, name, base);
 	if (err)
 		return ERR_PTR(err);
 
 	dentry = lookup_dcache(name, base, 0);
 	return dentry ? dentry : __lookup_slow(name, base, 0);
 }
-EXPORT_SYMBOL(lookup_one_mnt);
-
-/* Legacy inode-only interface; namespaced LSMs fail closed if ambiguous. */
-struct dentry *lookup_one(struct mnt_idmap *idmap, struct qstr *name,
-			  struct dentry *base)
-{
-	return lookup_one_mnt(idmap, NULL, name, base);
-}
 EXPORT_SYMBOL(lookup_one);
 
 /**
- * lookup_one_unlocked_mnt - lookup single pathname component
+ * lookup_one_unlocked - lookup single pathname component
  * @idmap:	idmap of the mount the lookup is performed from
- * @mnt:	mount through which the lookup is performed
  * @name:	qstr olding pathname component to lookup
  * @base:	base directory to lookup from
  *
@@ -3249,14 +3223,13 @@ EXPORT_SYMBOL(lookup_one);
  *	    - ERR_PTR(-ENOENT) if parent has been removed, or
  *	    - ERR_PTR(-EACCES) if parent directory is not searchable.
  */
-struct dentry *lookup_one_unlocked_mnt(struct mnt_idmap *idmap,
-				       const struct vfsmount *mnt,
-				       struct qstr *name, struct dentry *base)
+struct dentry *lookup_one_unlocked(struct mnt_idmap *idmap, struct qstr *name,
+				   struct dentry *base)
 {
 	int err;
 	struct dentry *ret;
 
-	err = lookup_one_common(idmap, mnt, name, base);
+	err = lookup_one_common(idmap, name, base);
 	if (err)
 		return ERR_PTR(err);
 
@@ -3265,21 +3238,11 @@ struct dentry *lookup_one_unlocked_mnt(struct mnt_idmap *idmap,
 		ret = lookup_slow(name, base, 0);
 	return ret;
 }
-EXPORT_SYMBOL(lookup_one_unlocked_mnt);
-
-/* Legacy inode-only interface; namespaced LSMs fail closed if ambiguous. */
-struct dentry *lookup_one_unlocked(struct mnt_idmap *idmap,
-				    struct qstr *name,
-				   struct dentry *base)
-{
-	return lookup_one_unlocked_mnt(idmap, NULL, name, base);
-}
 EXPORT_SYMBOL(lookup_one_unlocked);
 
 /**
- * lookup_one_positive_killable_mnt - lookup single pathname component
+ * lookup_one_positive_killable - lookup single pathname component
  * @idmap:	idmap of the mount the lookup is performed from
- * @mnt:	mount through which the lookup is performed
  * @name:	qstr olding pathname component to lookup
  * @base:	base directory to lookup from
  *
@@ -3300,15 +3263,14 @@ EXPORT_SYMBOL(lookup_one_unlocked);
  *	   - same errors as lookup_one_unlocked() or
  *	   - ERR_PTR(-EINTR) if a fatal signal is pending.
  */
-struct dentry *lookup_one_positive_killable_mnt(struct mnt_idmap *idmap,
-						const struct vfsmount *mnt,
-						struct qstr *name,
-						struct dentry *base)
+struct dentry *lookup_one_positive_killable(struct mnt_idmap *idmap,
+					    struct qstr *name,
+					    struct dentry *base)
 {
 	int err;
 	struct dentry *ret;
 
-	err = lookup_one_common(idmap, mnt, name, base);
+	err = lookup_one_common(idmap, name, base);
 	if (err)
 		return ERR_PTR(err);
 
@@ -3321,21 +3283,11 @@ struct dentry *lookup_one_positive_killable_mnt(struct mnt_idmap *idmap,
 	}
 	return ret;
 }
-EXPORT_SYMBOL(lookup_one_positive_killable_mnt);
-
-/* Legacy inode-only interface; namespaced LSMs fail closed if ambiguous. */
-struct dentry *lookup_one_positive_killable(struct mnt_idmap *idmap,
-					    struct qstr *name,
-					    struct dentry *base)
-{
-	return lookup_one_positive_killable_mnt(idmap, NULL, name, base);
-}
 EXPORT_SYMBOL(lookup_one_positive_killable);
 
 /**
- * lookup_one_positive_unlocked_mnt - lookup single pathname component
+ * lookup_one_positive_unlocked - lookup single pathname component
  * @idmap:	idmap of the mount the lookup is performed from
- * @mnt:	mount through which the lookup is performed
  * @name:	qstr holding pathname component to lookup
  * @base:	base directory to lookup from
  *
@@ -3354,29 +3306,17 @@ EXPORT_SYMBOL(lookup_one_positive_killable);
  *	   - ERR_PTR(-ENOENT) if the name could not be found, or
  *	   - same errors as lookup_one_unlocked().
  */
-struct dentry *lookup_one_positive_unlocked_mnt(struct mnt_idmap *idmap,
-						const struct vfsmount *mnt,
-						struct qstr *name,
-						struct dentry *base)
+struct dentry *lookup_one_positive_unlocked(struct mnt_idmap *idmap,
+					    struct qstr *name,
+					    struct dentry *base)
 {
-	struct dentry *ret;
-
-	ret = lookup_one_unlocked_mnt(idmap, mnt, name, base);
+	struct dentry *ret = lookup_one_unlocked(idmap, name, base);
 
 	if (!IS_ERR(ret) && d_flags_negative(smp_load_acquire(&ret->d_flags))) {
 		dput(ret);
 		ret = ERR_PTR(-ENOENT);
 	}
 	return ret;
-}
-EXPORT_SYMBOL(lookup_one_positive_unlocked_mnt);
-
-/* Legacy inode-only interface; namespaced LSMs fail closed if ambiguous. */
-struct dentry *lookup_one_positive_unlocked(struct mnt_idmap *idmap,
-					    struct qstr *name,
-					    struct dentry *base)
-{
-	return lookup_one_positive_unlocked_mnt(idmap, NULL, name, base);
 }
 EXPORT_SYMBOL(lookup_one_positive_unlocked);
 
@@ -3441,9 +3381,8 @@ struct dentry *lookup_noperm_positive_unlocked(struct qstr *name,
 EXPORT_SYMBOL(lookup_noperm_positive_unlocked);
 
 /**
- * start_creating_mnt - prepare to create a given name with permission checking
+ * start_creating - prepare to create a given name with permission checking
  * @idmap:  idmap of the mount
- * @mnt:     mount through which creation is requested
  * @parent: directory in which to prepare to create the name
  * @name:   the name to be created
  *
@@ -3457,31 +3396,20 @@ EXPORT_SYMBOL(lookup_noperm_positive_unlocked);
  *
  * Returns: a negative or positive dentry, or an error.
  */
-struct dentry *start_creating_mnt(struct mnt_idmap *idmap,
-				  const struct vfsmount *mnt,
-				  struct dentry *parent, struct qstr *name)
+struct dentry *start_creating(struct mnt_idmap *idmap, struct dentry *parent,
+			      struct qstr *name)
 {
-	int err = lookup_one_common(idmap, mnt, name, parent);
+	int err = lookup_one_common(idmap, name, parent);
 
 	if (err)
 		return ERR_PTR(err);
 	return start_dirop(parent, name, LOOKUP_CREATE);
 }
-EXPORT_SYMBOL(start_creating_mnt);
-
-/* Legacy inode-only interface; namespaced LSMs fail closed if ambiguous. */
-struct dentry *start_creating(struct mnt_idmap *idmap,
-			       struct dentry *parent,
-			      struct qstr *name)
-{
-	return start_creating_mnt(idmap, NULL, parent, name);
-}
 EXPORT_SYMBOL(start_creating);
 
 /**
- * start_removing_mnt - prepare to remove a given name with permission checking
+ * start_removing - prepare to remove a given name with permission checking
  * @idmap:  idmap of the mount
- * @mnt:     mount through which removal is requested
  * @parent: directory in which to find the name
  * @name:   the name to be removed
  *
@@ -3495,31 +3423,20 @@ EXPORT_SYMBOL(start_creating);
  *
  * Returns: a positive dentry, or an error.
  */
-struct dentry *start_removing_mnt(struct mnt_idmap *idmap,
-				  const struct vfsmount *mnt,
-				  struct dentry *parent, struct qstr *name)
+struct dentry *start_removing(struct mnt_idmap *idmap, struct dentry *parent,
+			      struct qstr *name)
 {
-	int err = lookup_one_common(idmap, mnt, name, parent);
+	int err = lookup_one_common(idmap, name, parent);
 
 	if (err)
 		return ERR_PTR(err);
 	return start_dirop(parent, name, 0);
 }
-EXPORT_SYMBOL(start_removing_mnt);
-
-/* Legacy inode-only interface; namespaced LSMs fail closed if ambiguous. */
-struct dentry *start_removing(struct mnt_idmap *idmap,
-			       struct dentry *parent,
-			      struct qstr *name)
-{
-	return start_removing_mnt(idmap, NULL, parent, name);
-}
 EXPORT_SYMBOL(start_removing);
 
 /**
- * start_creating_killable_mnt - prepare to create with permission checking
+ * start_creating_killable - prepare to create a given name with permission checking
  * @idmap:  idmap of the mount
- * @mnt:     mount through which creation is requested
  * @parent: directory in which to prepare to create the name
  * @name:   the name to be created
  *
@@ -3534,32 +3451,21 @@ EXPORT_SYMBOL(start_removing);
  *
  * Returns: a negative or positive dentry, or an error.
  */
-struct dentry *start_creating_killable_mnt(struct mnt_idmap *idmap,
-					   const struct vfsmount *mnt,
-					   struct dentry *parent,
-					   struct qstr *name)
+struct dentry *start_creating_killable(struct mnt_idmap *idmap,
+				       struct dentry *parent,
+				       struct qstr *name)
 {
-	int err = lookup_one_common(idmap, mnt, name, parent);
+	int err = lookup_one_common(idmap, name, parent);
 
 	if (err)
 		return ERR_PTR(err);
 	return __start_dirop(parent, name, LOOKUP_CREATE, TASK_KILLABLE);
 }
-EXPORT_SYMBOL(start_creating_killable_mnt);
-
-/* Legacy inode-only interface; namespaced LSMs fail closed if ambiguous. */
-struct dentry *start_creating_killable(struct mnt_idmap *idmap,
-				       struct dentry *parent,
-				       struct qstr *name)
-{
-	return start_creating_killable_mnt(idmap, NULL, parent, name);
-}
 EXPORT_SYMBOL(start_creating_killable);
 
 /**
- * start_removing_killable_mnt - prepare to remove with permission checking
+ * start_removing_killable - prepare to remove a given name with permission checking
  * @idmap:  idmap of the mount
- * @mnt:     mount through which removal is requested
  * @parent: directory in which to find the name
  * @name:   the name to be removed
  *
@@ -3576,25 +3482,15 @@ EXPORT_SYMBOL(start_creating_killable);
  *
  * Returns: a positive dentry, or an error.
  */
-struct dentry *start_removing_killable_mnt(struct mnt_idmap *idmap,
-					   const struct vfsmount *mnt,
-					   struct dentry *parent,
-					   struct qstr *name)
-{
-	int err = lookup_one_common(idmap, mnt, name, parent);
-
-	if (err)
-		return ERR_PTR(err);
-	return __start_dirop(parent, name, 0, TASK_KILLABLE);
-}
-EXPORT_SYMBOL(start_removing_killable_mnt);
-
-/* Legacy inode-only interface; namespaced LSMs fail closed if ambiguous. */
 struct dentry *start_removing_killable(struct mnt_idmap *idmap,
 				       struct dentry *parent,
 				       struct qstr *name)
 {
-	return start_removing_killable_mnt(idmap, NULL, parent, name);
+	int err = lookup_one_common(idmap, name, parent);
+
+	if (err)
+		return ERR_PTR(err);
+	return __start_dirop(parent, name, 0, TASK_KILLABLE);
 }
 EXPORT_SYMBOL(start_removing_killable);
 
@@ -3779,9 +3675,8 @@ EXPORT_SYMBOL(__check_sticky);
  * 11. We don't allow removal of NFS sillyrenamed files; it's handled by
  *     nfs_async_unlink().
  */
-int may_delete_dentry_mnt(struct mnt_idmap *idmap,
-			  const struct vfsmount *mnt, struct inode *dir,
-			  struct dentry *victim, bool isdir)
+int may_delete_dentry(struct mnt_idmap *idmap, struct inode *dir,
+		      struct dentry *victim, bool isdir)
 {
 	struct inode *inode = d_backing_inode(victim);
 	int error;
@@ -3799,7 +3694,7 @@ int may_delete_dentry_mnt(struct mnt_idmap *idmap,
 
 	audit_inode_child(dir, victim, AUDIT_TYPE_CHILD_DELETE);
 
-	error = inode_permission_mnt(idmap, mnt, dir, MAY_WRITE | MAY_EXEC);
+	error = inode_permission(idmap, dir, MAY_WRITE | MAY_EXEC);
 	if (error)
 		return error;
 	if (IS_APPEND(dir))
@@ -3822,14 +3717,6 @@ int may_delete_dentry_mnt(struct mnt_idmap *idmap,
 		return -EBUSY;
 	return 0;
 }
-EXPORT_SYMBOL(may_delete_dentry_mnt);
-
-/* Legacy inode-only interface; namespaced LSMs fail closed if ambiguous. */
-int may_delete_dentry(struct mnt_idmap *idmap, struct inode *dir,
-		      struct dentry *victim, bool isdir)
-{
-	return may_delete_dentry_mnt(idmap, NULL, dir, victim, isdir);
-}
 EXPORT_SYMBOL(may_delete_dentry);
 
 /*	Check whether we can create an object with dentry child in directory
@@ -3841,9 +3728,8 @@ EXPORT_SYMBOL(may_delete_dentry);
  *  4. We should have write and exec permissions on dir
  *  5. We can't do it if dir is immutable (done in permission())
  */
-int may_create_dentry_mnt(struct mnt_idmap *idmap,
-			  const struct vfsmount *mnt, struct inode *dir,
-			  struct dentry *child)
+int may_create_dentry(struct mnt_idmap *idmap,
+		      struct inode *dir, struct dentry *child)
 {
 	audit_inode_child(dir, child, AUDIT_TYPE_CHILD_CREATE);
 	if (child->d_inode)
@@ -3853,15 +3739,7 @@ int may_create_dentry_mnt(struct mnt_idmap *idmap,
 	if (!fsuidgid_has_mapping(dir->i_sb, idmap))
 		return -EOVERFLOW;
 
-	return inode_permission_mnt(idmap, mnt, dir, MAY_WRITE | MAY_EXEC);
-}
-EXPORT_SYMBOL(may_create_dentry_mnt);
-
-/* Legacy inode-only interface; namespaced LSMs fail closed if ambiguous. */
-int may_create_dentry(struct mnt_idmap *idmap,
-		      struct inode *dir, struct dentry *child)
-{
-	return may_create_dentry_mnt(idmap, NULL, dir, child);
+	return inode_permission(idmap, dir, MAY_WRITE | MAY_EXEC);
 }
 EXPORT_SYMBOL(may_create_dentry);
 
@@ -4068,12 +3946,10 @@ int start_renaming(struct renamedata *rd, int lookup_flags,
 {
 	int err;
 
-	err = lookup_one_common(rd->mnt_idmap, rd->old_mnt, old_last,
-				rd->old_parent);
+	err = lookup_one_common(rd->mnt_idmap, old_last, rd->old_parent);
 	if (err)
 		return err;
-	err = lookup_one_common(rd->mnt_idmap, rd->new_mnt, new_last,
-				rd->new_parent);
+	err = lookup_one_common(rd->mnt_idmap, new_last, rd->new_parent);
 	if (err)
 		return err;
 	return __start_renaming(rd, lookup_flags, old_last, new_last);
@@ -4167,8 +4043,7 @@ int start_renaming_dentry(struct renamedata *rd, int lookup_flags,
 {
 	int err;
 
-	err = lookup_one_common(rd->mnt_idmap, rd->new_mnt, new_last,
-				rd->new_parent);
+	err = lookup_one_common(rd->mnt_idmap, new_last, rd->new_parent);
 	if (err)
 		return err;
 	return __start_renaming_dentry(rd, lookup_flags, old_dentry, new_last);
@@ -4290,9 +4165,8 @@ static inline umode_t vfs_prepare_mode(struct mnt_idmap *idmap,
 }
 
 /**
- * vfs_create_mnt - create new file
+ * vfs_create - create new file
  * @idmap:	idmap of the mount the inode was found from
- * @mnt:	mount selecting the LSM label view
  * @dentry:	dentry of the child file
  * @mode:	mode of the child file
  * @di:		returns parent inode, if the inode is delegated.
@@ -4305,15 +4179,13 @@ static inline umode_t vfs_prepare_mode(struct mnt_idmap *idmap,
  * On non-idmapped mounts or if permission checking is to be performed on the
  * raw inode simply pass @nop_mnt_idmap.
  */
-int vfs_create_mnt(struct mnt_idmap *idmap, const struct vfsmount *mnt,
-		   struct dentry *dentry, umode_t mode,
-		   struct delegated_inode *di)
+int vfs_create(struct mnt_idmap *idmap, struct dentry *dentry, umode_t mode,
+	       struct delegated_inode *di)
 {
-	struct security_inode_create_plan *plan;
 	struct inode *dir = d_inode(dentry->d_parent);
 	int error;
 
-	error = may_create_dentry_mnt(idmap, mnt, dir, dentry);
+	error = may_create_dentry(idmap, dir, dentry);
 	if (error)
 		return error;
 
@@ -4321,75 +4193,37 @@ int vfs_create_mnt(struct mnt_idmap *idmap, const struct vfsmount *mnt,
 		return -EACCES;	/* shouldn't it be ENOSYS? */
 
 	mode = vfs_prepare_mode(idmap, dir, mode, S_IALLUGO, S_IFREG);
-	plan = security_inode_create_plan_prepare(
-		mnt, dir, dentry, mode, SECURITY_INODE_CREATE,
-		dir->i_op->security_create_plan_ops);
-	if (IS_ERR(plan))
-		return PTR_ERR(plan);
-	error = security_inode_create_mnt(mnt, dir, dentry, mode);
+	error = security_inode_create(dir, dentry, mode);
 	if (error)
-		goto out_plan;
+		return error;
 	error = try_break_deleg(dir, LEASE_BREAK_DIR_CREATE, di);
 	if (error)
-		goto out_plan;
+		return error;
 	error = dir->i_op->create(idmap, dir, dentry, mode, true);
-	error = security_inode_create_plan_finish(
-		plan, error, error ? NULL : d_inode(dentry));
 	if (!error)
 		fsnotify_create(dir, dentry);
 	return error;
-
-out_plan:
-	return security_inode_create_plan_finish(plan, error, NULL);
-}
-EXPORT_SYMBOL(vfs_create_mnt);
-
-int vfs_create(struct mnt_idmap *idmap, struct dentry *dentry,
-			umode_t mode,
-	       struct delegated_inode *di)
-{
-	return vfs_create_mnt(idmap, NULL, dentry, mode, di);
 }
 EXPORT_SYMBOL(vfs_create);
 
-int vfs_mkobj_mnt(const struct vfsmount *mnt, struct dentry *dentry,
-		  umode_t mode, const struct vfs_mkobj_ops *ops, void *arg)
+int vfs_mkobj(struct dentry *dentry, umode_t mode,
+		int (*f)(struct dentry *, umode_t, void *),
+		void *arg)
 {
-	struct security_inode_create_plan *plan;
 	struct inode *dir = dentry->d_parent->d_inode;
-	int error = may_create_dentry_mnt(&nop_mnt_idmap, mnt, dir, dentry);
-
+	int error = may_create_dentry(&nop_mnt_idmap, dir, dentry);
 	if (error)
 		return error;
-	if (!ops || !ops->create)
-		return -EINVAL;
 
 	mode &= S_IALLUGO;
 	mode |= S_IFREG;
-	plan = security_inode_create_plan_prepare(
-		mnt, dir, dentry, mode, SECURITY_INODE_MKOBJ,
-		ops->security_create_plan_ops);
-	if (IS_ERR(plan))
-		return PTR_ERR(plan);
-	error = security_inode_create_mnt(mnt, dir, dentry, mode);
+	error = security_inode_create(dir, dentry, mode);
 	if (error)
-		goto out_plan;
-	error = ops->create(dentry, mode, arg);
-	error = security_inode_create_plan_finish(
-		plan, error, error ? NULL : d_inode(dentry));
+		return error;
+	error = f(dentry, mode, arg);
 	if (!error)
 		fsnotify_create(dir, dentry);
 	return error;
-
-out_plan:
-	return security_inode_create_plan_finish(plan, error, NULL);
-}
-EXPORT_SYMBOL(vfs_mkobj_mnt);
-
-int vfs_mkobj(struct dentry *dentry, umode_t mode,
-		const struct vfs_mkobj_ops *ops, void *arg)
-{
-	return vfs_mkobj_mnt(NULL, dentry, mode, ops, arg);
 }
 EXPORT_SYMBOL(vfs_mkobj);
 
@@ -4437,8 +4271,7 @@ static int may_open(struct mnt_idmap *idmap, const struct path *path,
 		VFS_BUG_ON_INODE(!IS_ANON_FILE(inode), inode);
 	}
 
-	error = inode_permission_mnt(idmap, path->mnt, inode,
-				     MAY_OPEN | acc_mode);
+	error = inode_permission(idmap, inode, MAY_OPEN | acc_mode);
 	if (error)
 		return error;
 
@@ -4469,7 +4302,7 @@ static int handle_truncate(struct mnt_idmap *idmap, struct file *filp)
 
 	error = security_file_truncate(filp);
 	if (!error) {
-		error = do_truncate_mnt(idmap, path->mnt, path->dentry, 0,
+		error = do_truncate(idmap, path->dentry, 0,
 				    ATTR_MTIME|ATTR_CTIME|ATTR_OPEN,
 				    filp);
 	}
@@ -4486,35 +4319,21 @@ static inline int open_to_namei_flags(int flag)
 
 static int may_o_create(struct mnt_idmap *idmap,
 			const struct path *dir, struct dentry *dentry,
-			umode_t mode, enum security_inode_create_kind kind,
-			struct security_inode_create_plan **planp)
+			umode_t mode)
 {
-	struct security_inode_create_plan *plan;
 	int error = security_path_mknod(dir, dentry, mode, 0);
-
-	*planp = NULL;
 	if (error)
 		return error;
 
 	if (!fsuidgid_has_mapping(dir->dentry->d_sb, idmap))
 		return -EOVERFLOW;
 
-	error = inode_permission_mnt(idmap, dir->mnt, dir->dentry->d_inode,
-				     MAY_WRITE | MAY_EXEC);
+	error = inode_permission(idmap, dir->dentry->d_inode,
+				 MAY_WRITE | MAY_EXEC);
 	if (error)
 		return error;
 
-	plan = security_inode_create_plan_prepare(
-		dir->mnt, dir->dentry->d_inode, dentry, mode, kind,
-		dir->dentry->d_inode->i_op->security_create_plan_ops);
-	if (IS_ERR(plan))
-		return PTR_ERR(plan);
-	error = security_inode_create_mnt(
-		dir->mnt, dir->dentry->d_inode, dentry, mode);
-	if (error)
-		return security_inode_create_plan_finish(plan, error, NULL);
-	*planp = plan;
-	return 0;
+	return security_inode_create(dir->dentry->d_inode, dentry, mode);
 }
 
 /*
@@ -4589,7 +4408,6 @@ static struct dentry *lookup_open(struct nameidata *nd, struct file *file,
 	struct mnt_idmap *idmap;
 	struct dentry *dir = nd->path.dentry;
 	struct inode *dir_inode = dir->d_inode;
-	struct security_inode_create_plan *plan = NULL;
 	int open_flag = op->open_flag;
 	struct dentry *dentry;
 	int error, create_error = 0;
@@ -4643,12 +4461,8 @@ static struct dentry *lookup_open(struct nameidata *nd, struct file *file,
 			open_flag &= ~O_TRUNC;
 		mode = vfs_prepare_mode(idmap, dir->d_inode, mode, mode, mode);
 		if (likely(got_write))
-			create_error = may_o_create(
-				idmap, &nd->path, dentry, mode,
-				dir_inode->i_op->atomic_open ?
-					SECURITY_INODE_ATOMIC_OPEN :
-					SECURITY_INODE_CREATE,
-				&plan);
+			create_error = may_o_create(idmap, &nd->path,
+						    dentry, mode);
 		else
 			create_error = -EROFS;
 	}
@@ -4658,24 +4472,6 @@ static struct dentry *lookup_open(struct nameidata *nd, struct file *file,
 		if (nd->flags & LOOKUP_DIRECTORY)
 			open_flag |= O_DIRECTORY;
 		dentry = atomic_open(&nd->path, dentry, file, open_flag, mode);
-		if (plan) {
-			int plan_result, finish_result;
-
-			if (IS_ERR(dentry))
-				plan_result = PTR_ERR(dentry);
-			else if (file->f_mode & FMODE_CREATED)
-				plan_result = 0;
-			else
-				plan_result = -ECANCELED;
-			finish_result = security_inode_create_plan_finish(
-				plan, plan_result,
-				plan_result ? NULL : file_inode(file));
-			if (finish_result != plan_result) {
-				if (!IS_ERR(dentry))
-					dput(dentry);
-				dentry = ERR_PTR(finish_result);
-			}
-		}
 		if (unlikely(create_error) && dentry == ERR_PTR(-ENOENT))
 			dentry = ERR_PTR(create_error);
 		return dentry;
@@ -4713,32 +4509,14 @@ static struct dentry *lookup_open(struct nameidata *nd, struct file *file,
 						mode, open_flag & O_EXCL);
 		if (error)
 			goto out_dput;
-		error = security_inode_create_plan_finish(
-			plan, 0, d_inode(dentry));
-		plan = NULL;
-		if (error)
-			goto out_dput;
 	}
 	if (unlikely(create_error) && !dentry->d_inode) {
 		error = create_error;
 		goto out_dput;
 	}
-	if (plan) {
-		int plan_result;
-
-		plan_result = security_inode_create_plan_finish(
-			plan, -ECANCELED, NULL);
-		plan = NULL;
-		if (plan_result != -ECANCELED) {
-			error = plan_result;
-			goto out_dput;
-		}
-	}
 	return dentry;
 
 out_dput:
-	if (plan)
-		error = security_inode_create_plan_finish(plan, error, NULL);
 	dput(dentry);
 	return ERR_PTR(error);
 }
@@ -4952,7 +4730,6 @@ int vfs_tmpfile(struct mnt_idmap *idmap,
 		const struct path *parentpath,
 		struct file *file, umode_t mode)
 {
-	struct security_inode_create_plan *plan;
 	struct dentry *child;
 	struct inode *dir = d_inode(parentpath->dentry);
 	struct inode *inode;
@@ -4964,8 +4741,7 @@ int vfs_tmpfile(struct mnt_idmap *idmap,
 		return -EOVERFLOW;
 
 	/* we want directory to be writable */
-	error = inode_permission_mnt(idmap, parentpath->mnt, dir,
-				     MAY_WRITE | MAY_EXEC);
+	error = inode_permission(idmap, dir, MAY_WRITE | MAY_EXEC);
 	if (error)
 		return error;
 	if (!dir->i_op->tmpfile)
@@ -4976,17 +4752,7 @@ int vfs_tmpfile(struct mnt_idmap *idmap,
 	file->__f_path.mnt = parentpath->mnt;
 	file->__f_path.dentry = child;
 	mode = vfs_prepare_mode(idmap, dir, mode, mode, mode);
-	plan = security_inode_create_plan_prepare(
-		parentpath->mnt, dir, child, mode, SECURITY_INODE_TMPFILE,
-		dir->i_op->security_create_plan_ops);
-	if (IS_ERR(plan)) {
-		error = PTR_ERR(plan);
-		goto out_child;
-	}
 	error = dir->i_op->tmpfile(idmap, dir, file, mode);
-	error = security_inode_create_plan_finish(
-		plan, error, error ? NULL : file_inode(file));
-out_child:
 	dput(child);
 	if (file->f_mode & FMODE_OPENED)
 		fsnotify_open(file);
@@ -5266,7 +5032,6 @@ struct file *dentry_create(struct path *path, int flags, umode_t mode,
 	struct dentry *orig_dentry = dentry;
 	struct dentry *dir = dentry->d_parent;
 	struct inode *dir_inode = d_inode(dir);
-	struct security_inode_create_plan *plan = NULL;
 	struct mnt_idmap *idmap;
 	int error, create_error;
 
@@ -5280,8 +5045,7 @@ struct file *dentry_create(struct path *path, int flags, umode_t mode,
 		path->dentry = dir;
 		mode = vfs_prepare_mode(idmap, dir_inode, mode, S_IALLUGO, S_IFREG);
 
-		create_error = may_o_create(idmap, path, dentry, mode,
-					    SECURITY_INODE_ATOMIC_OPEN, &plan);
+		create_error = may_o_create(idmap, path, dentry, mode);
 		if (create_error)
 			flags &= ~O_CREAT;
 
@@ -5289,21 +5053,6 @@ struct file *dentry_create(struct path *path, int flags, umode_t mode,
 		dget(orig_dentry);
 		dentry = atomic_open(path, dentry, file, flags, mode);
 		error = PTR_ERR_OR_ZERO(dentry);
-		if (plan) {
-			int plan_result, finish_result;
-
-			if (error)
-				plan_result = error;
-			else if (file->f_mode & FMODE_CREATED)
-				plan_result = 0;
-			else
-				plan_result = -ECANCELED;
-			finish_result = security_inode_create_plan_finish(
-				plan, plan_result,
-				plan_result ? NULL : file_inode(file));
-			if (finish_result != plan_result)
-				error = finish_result;
-		}
 
 		if (IS_ERR(dentry))
 			/* keep the original */
@@ -5325,8 +5074,7 @@ struct file *dentry_create(struct path *path, int flags, umode_t mode,
 		path->dentry = dentry;
 
 	} else {
-		error = vfs_create_mnt(mnt_idmap(path->mnt), path->mnt,
-				       path->dentry, mode, NULL);
+		error = vfs_create(mnt_idmap(path->mnt), path->dentry, mode, NULL);
 		if (!error)
 			error = vfs_open(path, file);
 	}
@@ -5338,9 +5086,8 @@ struct file *dentry_create(struct path *path, int flags, umode_t mode,
 EXPORT_SYMBOL(dentry_create);
 
 /**
- * vfs_mknod_mnt - create device node or file
+ * vfs_mknod - create device node or file
  * @idmap:		idmap of the mount the inode was found from
- * @mnt:		mount selecting the LSM label view
  * @dir:		inode of the parent directory
  * @dentry:		dentry of the child device node
  * @mode:		mode of the child device node
@@ -5355,14 +5102,12 @@ EXPORT_SYMBOL(dentry_create);
  * On non-idmapped mounts or if permission checking is to be performed on the
  * raw inode simply pass @nop_mnt_idmap.
  */
-int vfs_mknod_mnt(struct mnt_idmap *idmap, const struct vfsmount *mnt,
-	      struct inode *dir,
+int vfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
 	      struct dentry *dentry, umode_t mode, dev_t dev,
 	      struct delegated_inode *delegated_inode)
 {
-	struct security_inode_create_plan *plan;
 	bool is_whiteout = S_ISCHR(mode) && dev == WHITEOUT_DEV;
-	int error = may_create_dentry_mnt(idmap, mnt, dir, dentry);
+	int error = may_create_dentry(idmap, dir, dentry);
 
 	if (error)
 		return error;
@@ -5379,37 +5124,18 @@ int vfs_mknod_mnt(struct mnt_idmap *idmap, const struct vfsmount *mnt,
 	if (error)
 		return error;
 
-	plan = security_inode_create_plan_prepare(
-		mnt, dir, dentry, mode, SECURITY_INODE_MKNOD,
-		dir->i_op->security_create_plan_ops);
-	if (IS_ERR(plan))
-		return PTR_ERR(plan);
-	error = security_inode_mknod_mnt(mnt, dir, dentry, mode, dev);
+	error = security_inode_mknod(dir, dentry, mode, dev);
 	if (error)
-		goto out_plan;
+		return error;
 
 	error = try_break_deleg(dir, LEASE_BREAK_DIR_CREATE, delegated_inode);
 	if (error)
-		goto out_plan;
+		return error;
 
 	error = dir->i_op->mknod(idmap, dir, dentry, mode, dev);
-	error = security_inode_create_plan_finish(
-		plan, error, error ? NULL : d_inode(dentry));
 	if (!error)
 		fsnotify_create(dir, dentry);
 	return error;
-
-out_plan:
-	return security_inode_create_plan_finish(plan, error, NULL);
-}
-EXPORT_SYMBOL(vfs_mknod_mnt);
-
-int vfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
-	      struct dentry *dentry, umode_t mode, dev_t dev,
-	      struct delegated_inode *delegated_inode)
-{
-	return vfs_mknod_mnt(idmap, NULL, dir, dentry, mode, dev,
-			     delegated_inode);
 }
 EXPORT_SYMBOL(vfs_mknod);
 
@@ -5456,18 +5182,16 @@ retry:
 	idmap = mnt_idmap(path.mnt);
 	switch (mode & S_IFMT) {
 		case 0: case S_IFREG:
-			error = vfs_create_mnt(idmap, path.mnt, dentry, mode, &di);
+			error = vfs_create(idmap, dentry, mode, &di);
 			if (!error)
 				security_path_post_mknod(idmap, dentry);
 			break;
 		case S_IFCHR: case S_IFBLK:
-			error = vfs_mknod_mnt(idmap, path.mnt,
-					      path.dentry->d_inode,
+			error = vfs_mknod(idmap, path.dentry->d_inode,
 					  dentry, mode, new_decode_dev(dev), &di);
 			break;
 		case S_IFIFO: case S_IFSOCK:
-			error = vfs_mknod_mnt(idmap, path.mnt,
-					      path.dentry->d_inode,
+			error = vfs_mknod(idmap, path.dentry->d_inode,
 					  dentry, mode, 0, &di);
 			break;
 	}
@@ -5499,9 +5223,8 @@ SYSCALL_DEFINE3(mknod, const char __user *, filename, umode_t, mode, unsigned, d
 }
 
 /**
- * vfs_mkdir_mnt - create directory returning correct dentry if possible
+ * vfs_mkdir - create directory returning correct dentry if possible
  * @idmap:		idmap of the mount the inode was found from
- * @mnt:		mount selecting the LSM label view
  * @dir:		inode of the parent directory
  * @dentry:		dentry of the child directory
  * @mode:		mode of the child directory
@@ -5521,17 +5244,15 @@ SYSCALL_DEFINE3(mknod, const char __user *, filename, umode_t, mode, unsigned, d
  *
  * In case of an error the dentry is dput() and an ERR_PTR() is returned.
  */
-struct dentry *vfs_mkdir_mnt(struct mnt_idmap *idmap,
-			     const struct vfsmount *mnt, struct inode *dir,
+struct dentry *vfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 			 struct dentry *dentry, umode_t mode,
 			 struct delegated_inode *delegated_inode)
 {
-	struct security_inode_create_plan *plan;
 	int error;
 	unsigned max_links = dir->i_sb->s_max_links;
 	struct dentry *de;
 
-	error = may_create_dentry_mnt(idmap, mnt, dir, dentry);
+	error = may_create_dentry(idmap, dir, dentry);
 	if (error)
 		goto err;
 
@@ -5540,52 +5261,32 @@ struct dentry *vfs_mkdir_mnt(struct mnt_idmap *idmap,
 		goto err;
 
 	mode = vfs_prepare_mode(idmap, dir, mode, S_IRWXUGO | S_ISVTX, 0);
-	plan = security_inode_create_plan_prepare(
-		mnt, dir, dentry, mode | S_IFDIR, SECURITY_INODE_MKDIR,
-		dir->i_op->security_create_plan_ops);
-	if (IS_ERR(plan)) {
-		error = PTR_ERR(plan);
-		goto err;
-	}
-	error = security_inode_mkdir_mnt(mnt, dir, dentry, mode);
+	error = security_inode_mkdir(dir, dentry, mode);
 	if (error)
-		goto out_plan;
+		goto err;
 
 	error = -EMLINK;
 	if (max_links && dir->i_nlink >= max_links)
-		goto out_plan;
+		goto err;
 
 	error = try_break_deleg(dir, LEASE_BREAK_DIR_CREATE, delegated_inode);
 	if (error)
-		goto out_plan;
+		goto err;
 
 	de = dir->i_op->mkdir(idmap, dir, dentry, mode);
 	error = PTR_ERR(de);
 	if (IS_ERR(de))
-		goto out_plan;
+		goto err;
 	if (de) {
 		dput(dentry);
 		dentry = de;
 	}
-	error = security_inode_create_plan_finish(plan, 0, d_inode(dentry));
-	if (error)
-		goto err;
 	fsnotify_mkdir(dir, dentry);
 	return dentry;
 
-out_plan:
-	error = security_inode_create_plan_finish(plan, error, NULL);
 err:
 	end_creating(dentry);
 	return ERR_PTR(error);
-}
-EXPORT_SYMBOL(vfs_mkdir_mnt);
-
-struct dentry *vfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
-			 struct dentry *dentry, umode_t mode,
-			 struct delegated_inode *delegated_inode)
-{
-	return vfs_mkdir_mnt(idmap, NULL, dir, dentry, mode, delegated_inode);
 }
 EXPORT_SYMBOL(vfs_mkdir);
 
@@ -5605,8 +5306,7 @@ retry:
 	error = security_path_mkdir(&path, dentry,
 			mode_strip_umask(path.dentry->d_inode, mode));
 	if (!error) {
-		dentry = vfs_mkdir_mnt(mnt_idmap(path.mnt), path.mnt,
-				       path.dentry->d_inode,
+		dentry = vfs_mkdir(mnt_idmap(path.mnt), path.dentry->d_inode,
 				   dentry, mode, &delegated_inode);
 		if (IS_ERR(dentry))
 			error = PTR_ERR(dentry);
@@ -5637,9 +5337,8 @@ SYSCALL_DEFINE2(mkdir, const char __user *, pathname, umode_t, mode)
 }
 
 /**
- * vfs_rmdir_mnt - remove directory
+ * vfs_rmdir - remove directory
  * @idmap:		idmap of the mount the inode was found from
- * @mnt:		mount selecting the LSM label view
  * @dir:		inode of the parent directory
  * @dentry:		dentry of the child directory
  * @delegated_inode:	returns parent inode, if it's delegated.
@@ -5652,11 +5351,10 @@ SYSCALL_DEFINE2(mkdir, const char __user *, pathname, umode_t, mode)
  * On non-idmapped mounts or if permission checking is to be performed on the
  * raw inode simply pass @nop_mnt_idmap.
  */
-int vfs_rmdir_mnt(struct mnt_idmap *idmap, const struct vfsmount *mnt,
-	      struct inode *dir,
+int vfs_rmdir(struct mnt_idmap *idmap, struct inode *dir,
 	      struct dentry *dentry, struct delegated_inode *delegated_inode)
 {
-	int error = may_delete_dentry_mnt(idmap, mnt, dir, dentry, true);
+	int error = may_delete_dentry(idmap, dir, dentry, true);
 
 	if (error)
 		return error;
@@ -5672,7 +5370,7 @@ int vfs_rmdir_mnt(struct mnt_idmap *idmap, const struct vfsmount *mnt,
 	    (dentry->d_inode->i_flags & S_KERNEL_FILE))
 		goto out;
 
-	error = security_inode_rmdir_mnt(mnt, dir, dentry);
+	error = security_inode_rmdir(dir, dentry);
 	if (error)
 		goto out;
 
@@ -5695,13 +5393,6 @@ out:
 	if (!error)
 		d_delete_notify(dir, dentry);
 	return error;
-}
-EXPORT_SYMBOL(vfs_rmdir_mnt);
-
-int vfs_rmdir(struct mnt_idmap *idmap, struct inode *dir,
-	      struct dentry *dentry, struct delegated_inode *delegated_inode)
-{
-	return vfs_rmdir_mnt(idmap, NULL, dir, dentry, delegated_inode);
 }
 EXPORT_SYMBOL(vfs_rmdir);
 
@@ -5744,8 +5435,7 @@ retry:
 	error = security_path_rmdir(&path, dentry);
 	if (error)
 		goto exit4;
-	error = vfs_rmdir_mnt(mnt_idmap(path.mnt), path.mnt,
-			      path.dentry->d_inode,
+	error = vfs_rmdir(mnt_idmap(path.mnt), path.dentry->d_inode,
 			  dentry, &delegated_inode);
 exit4:
 	end_dirop(dentry);
@@ -5772,9 +5462,8 @@ SYSCALL_DEFINE1(rmdir, const char __user *, pathname)
 }
 
 /**
- * vfs_unlink_mnt - unlink a filesystem object
+ * vfs_unlink - unlink a filesystem object
  * @idmap:	idmap of the mount the inode was found from
- * @mnt:	mount selecting the LSM label view
  * @dir:	parent directory
  * @dentry:	victim
  * @delegated_inode: returns victim inode, if the inode is delegated.
@@ -5797,12 +5486,11 @@ SYSCALL_DEFINE1(rmdir, const char __user *, pathname)
  * On non-idmapped mounts or if permission checking is to be performed on the
  * raw inode simply pass @nop_mnt_idmap.
  */
-int vfs_unlink_mnt(struct mnt_idmap *idmap, const struct vfsmount *mnt,
-	       struct inode *dir,
+int vfs_unlink(struct mnt_idmap *idmap, struct inode *dir,
 	       struct dentry *dentry, struct delegated_inode *delegated_inode)
 {
 	struct inode *target = dentry->d_inode;
-	int error = may_delete_dentry_mnt(idmap, mnt, dir, dentry, false);
+	int error = may_delete_dentry(idmap, dir, dentry, false);
 
 	if (error)
 		return error;
@@ -5816,7 +5504,7 @@ int vfs_unlink_mnt(struct mnt_idmap *idmap, const struct vfsmount *mnt,
 	else if (is_local_mountpoint(dentry))
 		error = -EBUSY;
 	else {
-		error = security_inode_unlink_mnt(mnt, dir, dentry);
+		error = security_inode_unlink(dir, dentry);
 		if (!error) {
 			error = try_break_deleg(dir, LEASE_BREAK_DIR_DELETE, delegated_inode);
 			if (error)
@@ -5843,13 +5531,6 @@ out:
 	}
 
 	return error;
-}
-EXPORT_SYMBOL(vfs_unlink_mnt);
-
-int vfs_unlink(struct mnt_idmap *idmap, struct inode *dir,
-	       struct dentry *dentry, struct delegated_inode *delegated_inode)
-{
-	return vfs_unlink_mnt(idmap, NULL, dir, dentry, delegated_inode);
 }
 EXPORT_SYMBOL(vfs_unlink);
 
@@ -5901,8 +5582,7 @@ retry_deleg:
 	error = security_path_unlink(&path, dentry);
 	if (error)
 		goto exit_end_dirop;
-	error = vfs_unlink_mnt(mnt_idmap(path.mnt), path.mnt,
-			       path.dentry->d_inode,
+	error = vfs_unlink(mnt_idmap(path.mnt), path.dentry->d_inode,
 			   dentry, &delegated_inode);
 exit_end_dirop:
 	end_dirop(dentry);
@@ -5941,9 +5621,8 @@ SYSCALL_DEFINE1(unlink, const char __user *, pathname)
 }
 
 /**
- * vfs_symlink_mnt - create symlink
+ * vfs_symlink - create symlink
  * @idmap:	idmap of the mount the inode was found from
- * @mnt:	mount selecting the LSM label view
  * @dir:	inode of the parent directory
  * @dentry:	dentry of the child symlink file
  * @oldname:	name of the file to link to
@@ -5957,52 +5636,31 @@ SYSCALL_DEFINE1(unlink, const char __user *, pathname)
  * On non-idmapped mounts or if permission checking is to be performed on the
  * raw inode simply pass @nop_mnt_idmap.
  */
-int vfs_symlink_mnt(struct mnt_idmap *idmap, const struct vfsmount *mnt,
-		struct inode *dir,
+int vfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 		struct dentry *dentry, const char *oldname,
 		struct delegated_inode *delegated_inode)
 {
-	struct security_inode_create_plan *plan;
 	int error;
 
-	error = may_create_dentry_mnt(idmap, mnt, dir, dentry);
+	error = may_create_dentry(idmap, dir, dentry);
 	if (error)
 		return error;
 
 	if (!dir->i_op->symlink)
 		return -EPERM;
 
-	plan = security_inode_create_plan_prepare(
-		mnt, dir, dentry, S_IFLNK | 0777,
-		SECURITY_INODE_SYMLINK, dir->i_op->security_create_plan_ops);
-	if (IS_ERR(plan))
-		return PTR_ERR(plan);
-	error = security_inode_symlink_mnt(mnt, dir, dentry, oldname);
+	error = security_inode_symlink(dir, dentry, oldname);
 	if (error)
-		goto out_plan;
+		return error;
 
 	error = try_break_deleg(dir, LEASE_BREAK_DIR_CREATE, delegated_inode);
 	if (error)
-		goto out_plan;
+		return error;
 
 	error = dir->i_op->symlink(idmap, dir, dentry, oldname);
-	error = security_inode_create_plan_finish(
-		plan, error, error ? NULL : d_inode(dentry));
 	if (!error)
 		fsnotify_create(dir, dentry);
 	return error;
-
-out_plan:
-	return security_inode_create_plan_finish(plan, error, NULL);
-}
-EXPORT_SYMBOL(vfs_symlink_mnt);
-
-int vfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
-		struct dentry *dentry, const char *oldname,
-		struct delegated_inode *delegated_inode)
-{
-	return vfs_symlink_mnt(idmap, NULL, dir, dentry, oldname,
-			       delegated_inode);
 }
 EXPORT_SYMBOL(vfs_symlink);
 
@@ -6024,8 +5682,7 @@ retry:
 
 	error = security_path_symlink(&path, dentry, from->name);
 	if (!error)
-		error = vfs_symlink_mnt(mnt_idmap(path.mnt), path.mnt,
-					path.dentry->d_inode,
+		error = vfs_symlink(mnt_idmap(path.mnt), path.dentry->d_inode,
 				    dentry, from->name, &delegated_inode);
 	end_creating_path(&path, dentry);
 	if (is_delegated(&delegated_inode)) {
@@ -6056,11 +5713,9 @@ SYSCALL_DEFINE2(symlink, const char __user *, oldname, const char __user *, newn
 }
 
 /**
- * vfs_link_mnt - create a new link
- * @old_mnt:	mount through which the source is accessed
+ * vfs_link - create a new link
  * @old_dentry:	object to be linked
  * @idmap:	idmap of the mount
- * @new_mnt:	mount through which the destination is accessed
  * @dir:	new parent
  * @new_dentry:	where to create the new link
  * @delegated_inode: returns inode needing a delegation break
@@ -6083,10 +5738,9 @@ SYSCALL_DEFINE2(symlink, const char __user *, oldname, const char __user *, newn
  * On non-idmapped mounts or if permission checking is to be performed on the
  * raw inode simply pass @nop_mnt_idmap.
  */
-int vfs_link_mnt(const struct vfsmount *old_mnt, struct dentry *old_dentry,
-		 struct mnt_idmap *idmap, const struct vfsmount *new_mnt,
-		 struct inode *dir, struct dentry *new_dentry,
-		 struct delegated_inode *delegated_inode)
+int vfs_link(struct dentry *old_dentry, struct mnt_idmap *idmap,
+	     struct inode *dir, struct dentry *new_dentry,
+	     struct delegated_inode *delegated_inode)
 {
 	struct inode *inode = old_dentry->d_inode;
 	unsigned max_links = dir->i_sb->s_max_links;
@@ -6095,7 +5749,7 @@ int vfs_link_mnt(const struct vfsmount *old_mnt, struct dentry *old_dentry,
 	if (!inode)
 		return -ENOENT;
 
-	error = may_create_dentry_mnt(idmap, new_mnt, dir, new_dentry);
+	error = may_create_dentry(idmap, dir, new_dentry);
 	if (error)
 		return error;
 
@@ -6119,8 +5773,7 @@ int vfs_link_mnt(const struct vfsmount *old_mnt, struct dentry *old_dentry,
 	if (S_ISDIR(inode->i_mode))
 		return -EPERM;
 
-	error = security_inode_link_mnt(old_mnt, old_dentry, new_mnt, dir,
-				       new_dentry);
+	error = security_inode_link(old_dentry, dir, new_dentry);
 	if (error)
 		return error;
 
@@ -6147,15 +5800,6 @@ int vfs_link_mnt(const struct vfsmount *old_mnt, struct dentry *old_dentry,
 	if (!error)
 		fsnotify_link(dir, inode, new_dentry);
 	return error;
-}
-EXPORT_SYMBOL(vfs_link_mnt);
-
-int vfs_link(struct dentry *old_dentry, struct mnt_idmap *idmap,
-	     struct inode *dir, struct dentry *new_dentry,
-	     struct delegated_inode *delegated_inode)
-{
-	return vfs_link_mnt(NULL, old_dentry, idmap, NULL, dir, new_dentry,
-			    delegated_inode);
 }
 EXPORT_SYMBOL(vfs_link);
 
@@ -6212,9 +5856,8 @@ retry:
 	error = security_path_link(old_path.dentry, &new_path, new_dentry);
 	if (error)
 		goto out_dput;
-	error = vfs_link_mnt(old_path.mnt, old_path.dentry, idmap,
-			     new_path.mnt, new_path.dentry->d_inode,
-			     new_dentry, &delegated_inode);
+	error = vfs_link(old_path.dentry, idmap, new_path.dentry->d_inode,
+			 new_dentry, &delegated_inode);
 out_dput:
 	end_creating_path(&new_path, new_dentry);
 	if (is_delegated(&delegated_inode)) {
@@ -6315,25 +5958,21 @@ int vfs_rename(struct renamedata *rd)
 	if (source == target)
 		return 0;
 
-	error = may_delete_dentry_mnt(rd->mnt_idmap, rd->old_mnt, old_dir,
-				      old_dentry, is_dir);
+	error = may_delete_dentry(rd->mnt_idmap, old_dir, old_dentry, is_dir);
 	if (error)
 		return error;
 
 	if (!target) {
-		error = may_create_dentry_mnt(rd->mnt_idmap, rd->new_mnt,
-					new_dir, new_dentry);
+		error = may_create_dentry(rd->mnt_idmap, new_dir, new_dentry);
 	} else {
 		new_is_dir = d_is_dir(new_dentry);
 
 		if (!(flags & RENAME_EXCHANGE))
-			error = may_delete_dentry_mnt(rd->mnt_idmap, rd->new_mnt,
-						      new_dir, new_dentry,
-						      is_dir);
+			error = may_delete_dentry(rd->mnt_idmap, new_dir,
+						  new_dentry, is_dir);
 		else
-			error = may_delete_dentry_mnt(rd->mnt_idmap, rd->new_mnt,
-						      new_dir, new_dentry,
-						      new_is_dir);
+			error = may_delete_dentry(rd->mnt_idmap, new_dir,
+						  new_dentry, new_is_dir);
 	}
 	if (error)
 		return error;
@@ -6347,22 +5986,21 @@ int vfs_rename(struct renamedata *rd)
 	 */
 	if (new_dir != old_dir) {
 		if (is_dir) {
-			error = inode_permission_mnt(rd->mnt_idmap, rd->old_mnt,
-						     source, MAY_WRITE);
+			error = inode_permission(rd->mnt_idmap, source,
+						 MAY_WRITE);
 			if (error)
 				return error;
 		}
 		if ((flags & RENAME_EXCHANGE) && new_is_dir) {
-			error = inode_permission_mnt(rd->mnt_idmap, rd->new_mnt,
-						     target, MAY_WRITE);
+			error = inode_permission(rd->mnt_idmap, target,
+						 MAY_WRITE);
 			if (error)
 				return error;
 		}
 	}
 
-	error = security_inode_rename_mnt(rd->old_mnt, old_dir, old_dentry,
-					  rd->new_mnt, new_dir, new_dentry,
-					  flags);
+	error = security_inode_rename(old_dir, old_dentry, new_dir, new_dentry,
+				      flags);
 	if (error)
 		return error;
 
@@ -6522,8 +6160,6 @@ retry:
 retry_deleg:
 	rd.old_parent	   = old_path.dentry;
 	rd.mnt_idmap	   = mnt_idmap(old_path.mnt);
-	rd.old_mnt	   = old_path.mnt;
-	rd.new_mnt	   = new_path.mnt;
 	rd.new_parent	   = new_path.dentry;
 	rd.delegated_inode = &delegated_inode;
 	rd.flags	   = flags;
@@ -6657,8 +6293,7 @@ int vfs_readlink(struct dentry *dentry, char __user *buffer, int buflen)
 EXPORT_SYMBOL(vfs_readlink);
 
 /**
- * vfs_get_link_mnt - get symlink body
- * @mnt: mount selecting the LSM label view
+ * vfs_get_link - get symlink body
  * @dentry: dentry on which to get symbolic link
  * @done: caller needs to free returned data with this
  *
@@ -6668,25 +6303,17 @@ EXPORT_SYMBOL(vfs_readlink);
  *
  * Does not work on "special" symlinks like /proc/$$/fd/N
  */
-const char *vfs_get_link_mnt(const struct vfsmount *mnt,
-			     struct dentry *dentry, struct delayed_call *done)
+const char *vfs_get_link(struct dentry *dentry, struct delayed_call *done)
 {
 	const char *res = ERR_PTR(-EINVAL);
 	struct inode *inode = d_inode(dentry);
 
 	if (d_is_symlink(dentry)) {
-		res = ERR_PTR(security_inode_readlink_mnt(mnt, dentry));
+		res = ERR_PTR(security_inode_readlink(dentry));
 		if (!res)
 			res = inode->i_op->get_link(dentry, inode, done);
 	}
 	return res;
-}
-EXPORT_SYMBOL(vfs_get_link_mnt);
-
-const char *vfs_get_link(struct dentry *dentry,
-				  struct delayed_call *done)
-{
-	return vfs_get_link_mnt(NULL, dentry, done);
 }
 EXPORT_SYMBOL(vfs_get_link);
 

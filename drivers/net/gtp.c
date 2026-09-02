@@ -374,11 +374,7 @@ static struct rt6_info *ip6_route_output_gtp(struct net *net,
 	fl6->saddr		= *saddr;
 	fl6->flowi6_proto	= sk->sk_protocol;
 
-	{
-		struct xfrm_flow_origin origin = xfrm_flow_origin_sock(sk);
-
-		dst = ip6_dst_lookup_flow_origin(net, sk, fl6, NULL, &origin);
-	}
+	dst = ip6_dst_lookup_flow(net, sk, fl6, NULL);
 	if (IS_ERR(dst))
 		return ERR_PTR(-ENETUNREACH);
 

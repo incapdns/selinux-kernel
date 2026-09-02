@@ -504,7 +504,7 @@ int netns_bpf_link_create(const union bpf_attr *attr, struct bpf_prog *prog)
 	net_link->net = net;
 	net_link->netns_type = netns_type;
 
-	err = bpf_link_prime(&net_link->link, &link_primer, NULL, NULL);
+	err = bpf_link_prime(&net_link->link, &link_primer);
 	if (err) {
 		kfree(net_link);
 		goto out_put_net;

@@ -29,7 +29,7 @@ static unsigned int smack_ip_output(void *priv,
 	if (sk) {
 		ssp = smack_sock(sk);
 		skp = ssp->smk_out;
-		skb_set_secmark(skb, skp->smk_secid, NULL);
+		skb->secmark = skp->smk_secid;
 	}
 
 	return NF_ACCEPT;

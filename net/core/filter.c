@@ -2283,12 +2283,7 @@ static int __bpf_redirect_neigh_v6(struct sk_buff *skb, struct net_device *dev,
 			.saddr	      = ip6h->saddr,
 		};
 
-		{
-			struct xfrm_flow_origin origin = xfrm_flow_origin_skb(skb);
-
-			dst = ip6_dst_lookup_flow_origin(net, NULL, &fl6, NULL,
-							  &origin);
-		}
+		dst = ip6_dst_lookup_flow(net, NULL, &fl6, NULL);
 		if (IS_ERR(dst))
 			goto out_drop;
 
@@ -2397,11 +2392,7 @@ static int __bpf_redirect_neigh_v4(struct sk_buff *skb, struct net_device *dev,
 		};
 		struct rtable *rt;
 
-		{
-			struct xfrm_flow_origin origin = xfrm_flow_origin_skb(skb);
-
-			rt = ip_route_output_flow_origin(net, &fl4, NULL, &origin);
-		}
+		rt = ip_route_output_flow(net, &fl4, NULL);
 		if (IS_ERR(rt))
 			goto out_drop;
 		if (rt->rt_type != RTN_UNICAST && rt->rt_type != RTN_LOCAL) {

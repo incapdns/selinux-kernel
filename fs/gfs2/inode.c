@@ -2112,13 +2112,7 @@ static int gfs2_setattr(struct mnt_idmap *idmap,
 	if (error)
 		goto out;
 
-	/*
-	 * This filesystem-internal revalidation has no struct path: the VFS
-	 * notify_change_mnt() entry point already authorized the operation with
-	 * the real mount view before invoking ->setattr().  Keep the raw-object
-	 * nature explicit instead of fabricating a mount from the dentry.
-	 */
-	error = may_setattr_mnt(&nop_mnt_idmap, NULL, inode, attr->ia_valid);
+	error = may_setattr(&nop_mnt_idmap, inode, attr->ia_valid);
 	if (error)
 		goto error;
 

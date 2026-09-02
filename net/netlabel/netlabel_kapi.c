@@ -213,48 +213,6 @@ int netlbl_cfg_unlbl_static_add(struct net *net,
 				u32 secid,
 				struct netlbl_audit *audit_info)
 {
-	struct lsm_prop_ref *prop_ref;
-	u32 source_secid;
-	int rc;
-
-	rc = security_secid_to_lsmprop_ref(
-		secid, LSM_ID_UNDEF, GFP_KERNEL, &prop_ref);
-	if (rc)
-		return rc;
-	if (security_lsm_prop_ref_provider_count(prop_ref) != 1)
-		rc = -ENOTUNIQ;
-	else if (!security_lsm_prop_ref_source_secid(prop_ref, &source_secid) ||
-		 source_secid != secid)
-		rc = -ESTALE;
-	else
-		rc = netlbl_cfg_unlbl_static_add_ref(
-			net, dev_name, addr, mask, family, prop_ref, audit_info);
-	security_lsm_prop_ref_put(prop_ref);
-	return rc;
-}
-
-/**
- * netlbl_cfg_unlbl_static_add_ref - Adds a strong static label
- * @net: network namespace
- * @dev_name: interface name
- * @addr: IP address in network byte order (struct in[6]_addr)
- * @mask: address mask in network byte order (struct in[6]_addr)
- * @family: address family
- * @prop_ref: strong LSM property reference for the entry
- * @audit_info: NetLabel audit information
- *
- * Adds a NetLabel static label backed by @prop_ref.  The unlabeled table takes
- * its own reference on success; ownership of the caller's reference is
- * unchanged.  Returns zero on success, negative values on failure.
- */
-int netlbl_cfg_unlbl_static_add_ref(struct net *net,
-				    const char *dev_name,
-				    const void *addr,
-				    const void *mask,
-				    u16 family,
-				    struct lsm_prop_ref *prop_ref,
-				    struct netlbl_audit *audit_info)
-{
 	u32 addr_len;
 
 	switch (family) {
@@ -270,8 +228,9 @@ int netlbl_cfg_unlbl_static_add_ref(struct net *net,
 		return -EPFNOSUPPORT;
 	}
 
-	return netlbl_unlhsh_add_ref(net, dev_name, addr, mask, addr_len,
-				    prop_ref, audit_info);
+	return netlbl_unlhsh_add(net,
+				 dev_name, addr, mask, addr_len,
+				 secid, audit_info);
 }
 
 /**

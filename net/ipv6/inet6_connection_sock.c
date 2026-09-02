@@ -22,7 +22,6 @@
 #include <net/ip6_route.h>
 #include <net/sock.h>
 #include <net/inet6_connection_sock.h>
-#include <net/xfrm.h>
 #include <net/sock_reuseport.h>
 
 struct dst_entry *inet6_csk_route_req(const struct sock *sk,
@@ -52,10 +51,7 @@ struct dst_entry *inet6_csk_route_req(const struct sock *sk,
 	ip6_ecmp_set_mp_hash(sock_net(sk), fl6, tcp_rsk(req)->txhash);
 
 	if (!dst) {
-		struct xfrm_flow_origin origin = xfrm_flow_origin_request(req);
-
-		dst = ip6_dst_lookup_flow_origin(sock_net(sk), sk, fl6, final_p,
-						 &origin);
+		dst = ip6_dst_lookup_flow(sock_net(sk), sk, fl6, final_p);
 		if (IS_ERR(dst))
 			return NULL;
 	}
@@ -90,12 +86,7 @@ struct dst_entry *inet6_csk_route_socket(struct sock *sk,
 	final_p = fl6_update_dst(fl6, rcu_dereference(np->opt), &np->final);
 	rcu_read_unlock();
 
-	{
-		struct xfrm_flow_origin origin = xfrm_flow_origin_sock(sk);
-
-		dst = ip6_dst_lookup_flow_origin(sock_net(sk), sk, fl6,
-						 final_p, &origin);
-	}
+	dst = ip6_dst_lookup_flow(sock_net(sk), sk, fl6, final_p);
 
 	if (!IS_ERR(dst))
 		ip6_dst_store(sk, dst, false, false);

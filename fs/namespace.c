@@ -724,7 +724,6 @@ int sb_prepare_remount_readonly(struct super_block *sb)
 
 static void free_vfsmnt(struct mount *mnt)
 {
-	security_mnt_free(&mnt->mnt);
 	mnt_idmap_put(mnt_idmap(&mnt->mnt));
 	kfree_const(mnt->mnt_devname);
 #ifdef CONFIG_SMP
@@ -1177,7 +1176,6 @@ static void setup_mnt(struct mount *m, struct dentry *root)
 struct vfsmount *vfs_create_mount(struct fs_context *fc)
 {
 	struct mount *mnt;
-	int err;
 
 	if (!fc->root)
 		return ERR_PTR(-EINVAL);
@@ -1190,11 +1188,6 @@ struct vfsmount *vfs_create_mount(struct fs_context *fc)
 		mnt->mnt.mnt_flags = MNT_INTERNAL;
 
 	setup_mnt(mnt, fc->root);
-	err = security_mnt_alloc(&mnt->mnt, NULL, fc);
-	if (err) {
-		mntput(&mnt->mnt);
-		return ERR_PTR(err);
-	}
 
 	return &mnt->mnt;
 }
@@ -1254,7 +1247,6 @@ static struct mount *clone_mnt(struct mount *old, struct dentry *root,
 {
 	struct mount *mnt;
 	int err;
-	bool allocated_group_id = false;
 
 	mnt = alloc_vfsmnt(old->mnt_devname);
 	if (!mnt)
@@ -1272,7 +1264,6 @@ static struct mount *clone_mnt(struct mount *old, struct dentry *root,
 		err = mnt_alloc_group_id(mnt);
 		if (err)
 			goto out_free;
-		allocated_group_id = true;
 	}
 
 	if (mnt->mnt_group_id)
@@ -1281,9 +1272,6 @@ static struct mount *clone_mnt(struct mount *old, struct dentry *root,
 	mnt->mnt.mnt_idmap = mnt_idmap_get(mnt_idmap(&old->mnt));
 
 	setup_mnt(mnt, root);
-	err = security_mnt_alloc(&mnt->mnt, &old->mnt, NULL);
-	if (err)
-		goto out_cleanup;
 
 	if (flag & CL_PRIVATE)	// we are done with it
 		return mnt;
@@ -1299,12 +1287,6 @@ static struct mount *clone_mnt(struct mount *old, struct dentry *root,
 		mnt->mnt_master = old->mnt_master;
 	}
 	return mnt;
-
- out_cleanup:
-	if (allocated_group_id)
-		mnt_release_group_id(mnt);
-	mntput(&mnt->mnt);
-	return ERR_PTR(err);
 
  out_free:
 	mnt_free_id(mnt);
@@ -2509,71 +2491,6 @@ int count_mounts(struct mnt_namespace *ns, struct mount *mnt)
 	return 0;
 }
 
-int mnt_topology_add_tree(struct security_mnt_topology *topology,
-			  struct mount *source, struct mount *target)
-{
-	struct mount *mnt;
-	int err;
-
-	for (mnt = source; mnt; mnt = next_mnt(mnt, source)) {
-		err = security_mnt_topology_add(topology, &mnt->mnt,
-						&target->mnt);
-		if (err)
-			return err;
-	}
-	return 0;
-}
-
-int mnt_topology_apply_tree(struct security_mnt_topology *topology,
-			    struct mount *source, struct mount *target)
-{
-	struct mount *mnt;
-	int err;
-
-	for (mnt = source; mnt; mnt = next_mnt(mnt, source)) {
-		/*
-		 * LSM topology derivation changes the view selected by this mount.
-		 * It is valid only for a freshly cloned tree, before any mount in
-		 * the tree is published in a mount namespace.  Pure moves preserve
-		 * their existing views and never reach this helper.
-		 */
-		if (WARN_ON_ONCE(mnt->mnt_ns))
-			return -EBUSY;
-		err = security_mnt_topology_apply(topology, &mnt->mnt,
-						  &target->mnt);
-		if (err)
-			return err;
-	}
-	return 0;
-}
-
-void mnt_topology_discard_tree(struct mount *mnt)
-{
-	lock_mount_hash();
-	umount_tree(mnt, UMOUNT_SYNC);
-	unlock_mount_hash();
-}
-
-static int
-mnt_topology_add_overmount(struct security_mnt_topology *topology,
-			   struct mount *target_mnt, struct mount *parent,
-			   struct dentry *mountpoint)
-{
-	struct path path = {
-		.mnt = &parent->mnt,
-		.dentry = mountpoint,
-	};
-	struct vfsmount *covered = lookup_mnt(&path);
-	int err = 0;
-
-	if (covered) {
-		err = mnt_topology_add_tree(topology, real_mount(covered),
-					    topmost_overmount(target_mnt));
-		mntput(covered);
-	}
-	return err;
-}
-
 enum mnt_tree_flags_t {
 	MNT_TREE_BENEATH = BIT(0),
 	MNT_TREE_PROPAGATION = BIT(1),
@@ -2656,12 +2573,9 @@ static int attach_recursive_mnt(struct mount *source_mnt,
 	struct mountpoint *shorter = NULL;
 	struct mount *child, *p;
 	struct mount *top;
-	struct mount *overmount_target;
 	struct hlist_node *n;
-	struct security_mnt_topology *topology;
 	int err = 0;
 	bool moving = mnt_has_parent(source_mnt);
-	bool derive_alias = !moving && !source_mnt->mnt_ns;
 
 	/*
 	 * Preallocate a mountpoint in case the new mounts need to be
@@ -2674,45 +2588,20 @@ static int attach_recursive_mnt(struct mount *source_mnt,
 	err = get_mountpoint(top->mnt.mnt_root, &root);
 	if (err)
 		return err;
-	topology = security_mnt_topology_alloc();
-	if (IS_ERR(topology)) {
-		err = PTR_ERR(topology);
-		goto out;
-	}
-	err = mnt_topology_add_tree(topology, source_mnt, dest_mnt);
-	if (err)
-		goto out_topology;
 
 	/* Is there space to add these mounts to the mount namespace? */
 	if (!moving) {
 		err = count_mounts(ns, source_mnt);
 		if (err)
-			goto out_topology;
+			goto out;
 	}
 
 	if (IS_MNT_SHARED(dest_mnt)) {
 		err = invent_group_ids(source_mnt, true);
 		if (err)
-			goto out_topology;
-		err = propagate_mnt(dest_mnt, dest_mp, source_mnt, &tree_list,
-				    topology);
+			goto out;
+		err = propagate_mnt(dest_mnt, dest_mp, source_mnt, &tree_list);
 	}
-	if (!err) {
-		overmount_target = derive_alias ? dest_mnt : source_mnt;
-		err = mnt_topology_add_overmount(topology, overmount_target,
-						 dest_mnt, dest_mp->m_dentry);
-	}
-	if (!err) {
-		hlist_for_each_entry(child, &tree_list, mnt_hash) {
-			err = mnt_topology_add_overmount(topology, child,
-							 child->mnt_parent,
-							 child->mnt_mountpoint);
-			if (err)
-				break;
-		}
-	}
-	if (!err && derive_alias)
-		err = mnt_topology_apply_tree(topology, source_mnt, dest_mnt);
 	lock_mount_hash();
 	if (err)
 		goto out_cleanup_ids;
@@ -2780,7 +2669,6 @@ static int attach_recursive_mnt(struct mount *source_mnt,
 	}
 	unpin_mountpoint(&root);
 	unlock_mount_hash();
-	security_mnt_topology_free(topology);
 
 	return 0;
 
@@ -2792,8 +2680,6 @@ static int attach_recursive_mnt(struct mount *source_mnt,
 	}
 	unlock_mount_hash();
 	cleanup_group_ids(source_mnt, NULL);
- out_topology:
-	security_mnt_topology_free(topology);
  out:
 	ns->pending_mounts = 0;
 
@@ -3217,10 +3103,8 @@ static struct mnt_namespace *create_new_namespace(struct path *path,
 	struct user_namespace *user_ns = current_user_ns();
 	struct mnt_namespace *new_ns;
 	struct mount *new_ns_root, *old_ns_root;
-	struct security_mnt_topology *topology;
 	struct path to_path;
 	struct mount *mnt;
-	int err;
 	unsigned int copy_flags = 0;
 	bool locked = false, recurse = flags & MOUNT_COPY_RECURSIVE;
 
@@ -3268,26 +3152,6 @@ static struct mnt_namespace *create_new_namespace(struct path *path,
 		mnt = clone_mnt(real_mount(path->mnt), path->dentry, copy_flags);
 	else
 		mnt = __do_loopback(path, recurse, copy_flags);
-	if (!IS_ERR(mnt)) {
-		topology = security_mnt_topology_alloc();
-		if (IS_ERR(topology)) {
-			err = PTR_ERR(topology);
-		} else {
-			err = mnt_topology_add_tree(topology, mnt, new_ns_root);
-			if (!err)
-				err = mnt_topology_apply_tree(topology, mnt,
-							      new_ns_root);
-			security_mnt_topology_free(topology);
-		}
-		if (err) {
-			scoped_guard(mount_writer) {
-				umount_tree(mnt, 0);
-				emptied_ns = new_ns;
-				umount_tree(new_ns_root, 0);
-			}
-			return ERR_PTR(err);
-		}
-	}
 	scoped_guard(mount_writer) {
 		if (IS_ERR(mnt)) {
 			emptied_ns = new_ns;
@@ -3905,7 +3769,7 @@ static int do_new_mount_fc(struct fs_context *fc, const struct path *mountpoint,
 		return PTR_ERR(mnt);
 
 	sb = fc->root->d_sb;
-	error = security_sb_kern_mount(sb, fc);
+	error = security_sb_kern_mount(sb);
 	if (unlikely(error))
 		return error;
 
@@ -4808,7 +4672,6 @@ int path_pivot_root(struct path *new, struct path *old)
 {
 	struct path root __free(path_put) = {};
 	struct mount *new_mnt, *root_mnt, *old_mnt, *root_parent, *ex_parent;
-	struct security_mnt_topology *topology;
 	int error;
 
 	if (!may_mount())
@@ -4855,16 +4718,6 @@ int path_pivot_root(struct path *new, struct path *old)
 	/* make certain new is below the root */
 	if (!is_path_reachable(new_mnt, new->dentry, &root))
 		return -EINVAL;
-	topology = security_mnt_topology_alloc();
-	if (IS_ERR(topology))
-		return PTR_ERR(topology);
-	error = mnt_topology_add_tree(topology, new_mnt, root_parent);
-	if (!error)
-		error = mnt_topology_add_tree(topology, root_mnt, old_mnt);
-	if (error) {
-		security_mnt_topology_free(topology);
-		return error;
-	}
 	lock_mount_hash();
 	umount_mnt(new_mnt);
 	if (root_mnt->mnt.mnt_flags & MNT_LOCKED) {
@@ -4880,7 +4733,6 @@ int path_pivot_root(struct path *new, struct path *old)
 	/* A moved mount should not expire automatically */
 	list_del_init(&new_mnt->mnt_expire);
 	unlock_mount_hash();
-	security_mnt_topology_free(topology);
 	mnt_notify_add(root_mnt);
 	mnt_notify_add(new_mnt);
 	chroot_fs_refs(&root, new);
@@ -5917,7 +5769,7 @@ static int do_statmount(struct kstatmount *s, u64 mnt_id, u64 mnt_ns_id,
 		}
 	}
 
-	err = security_sb_statfs(s->mnt->mnt_root, s->mnt);
+	err = security_sb_statfs(s->mnt->mnt_root);
 	if (err)
 		return err;
 
@@ -6205,7 +6057,7 @@ static ssize_t do_listmount(struct klistmount *kls, bool reverse)
 	    !ns_capable_noaudit(ns->user_ns, CAP_SYS_ADMIN))
 		return -EPERM;
 
-	ret = security_sb_statfs(orig.dentry, orig.mnt);
+	ret = security_sb_statfs(orig.dentry);
 	if (ret)
 		return ret;
 

@@ -47,7 +47,6 @@ struct scm_cookie {
 	struct scm_creds	creds;		/* Skb credentials	*/
 #ifdef CONFIG_SECURITY_NETWORK
 	u32			secid;		/* Passed security ID 	*/
-	struct lsm_scm_security *security;	/* Immutable LSM state */
 #endif
 };
 
@@ -58,20 +57,13 @@ void __scm_destroy(struct scm_cookie *scm);
 struct scm_fp_list *scm_fp_dup(struct scm_fp_list *fpl);
 
 #ifdef CONFIG_SECURITY_NETWORK
-static __inline__ int unix_get_peersec_dgram(struct socket *sock,
-					      struct scm_cookie *scm)
+static __inline__ void unix_get_peersec_dgram(struct socket *sock, struct scm_cookie *scm)
 {
 	security_socket_getpeersec_dgram(sock, NULL, &scm->secid);
-	if (!sock->ops || sock->ops->family != PF_UNIX)
-		return 0;
-	return security_scm_alloc(sock, GFP_KERNEL, &scm->security);
 }
 #else
-static __inline__ int unix_get_peersec_dgram(struct socket *sock,
-					      struct scm_cookie *scm)
-{
-	return 0;
-}
+static __inline__ void unix_get_peersec_dgram(struct socket *sock, struct scm_cookie *scm)
+{ }
 #endif /* CONFIG_SECURITY_NETWORK */
 
 static __inline__ void scm_set_cred(struct scm_cookie *scm,
@@ -89,18 +81,9 @@ static __inline__ void scm_destroy_cred(struct scm_cookie *scm)
 	scm->pid = NULL;
 }
 
-static __inline__ void scm_destroy_secdata(struct scm_cookie *scm)
-{
-#ifdef CONFIG_SECURITY_NETWORK
-	security_scm_put(scm->security);
-	scm->security = NULL;
-#endif
-}
-
 static __inline__ void scm_destroy(struct scm_cookie *scm)
 {
 	scm_destroy_cred(scm);
-	scm_destroy_secdata(scm);
 	if (scm->fp)
 		__scm_destroy(scm);
 }
@@ -108,18 +91,12 @@ static __inline__ void scm_destroy(struct scm_cookie *scm)
 static __inline__ int scm_send(struct socket *sock, struct msghdr *msg,
 			       struct scm_cookie *scm, bool forcecreds)
 {
-	int err;
-
 	memset(scm, 0, sizeof(*scm));
 	scm->creds.uid = INVALID_UID;
 	scm->creds.gid = INVALID_GID;
 	if (forcecreds)
 		scm_set_cred(scm, task_tgid(current), current_uid(), current_gid());
-	err = unix_get_peersec_dgram(sock, scm);
-	if (err) {
-		scm_destroy(scm);
-		return err;
-	}
+	unix_get_peersec_dgram(sock, scm);
 	if (msg->msg_controllen <= 0)
 		return 0;
 	return __scm_send(sock, msg, scm);

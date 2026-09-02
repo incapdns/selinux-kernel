@@ -637,12 +637,7 @@ static int l2tp_ip6_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 
 	fl6.flowlabel = ip6_make_flowinfo(ipc6.tclass, fl6.flowlabel);
 
-	{
-		struct xfrm_flow_origin origin = xfrm_flow_origin_sock(sk);
-
-		dst = ip6_dst_lookup_flow_origin(sock_net(sk), sk, &fl6,
-						 final_p, &origin);
-	}
+	dst = ip6_dst_lookup_flow(sock_net(sk), sk, &fl6, final_p);
 	if (IS_ERR(dst)) {
 		err = PTR_ERR(dst);
 		goto out;

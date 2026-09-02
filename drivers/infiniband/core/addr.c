@@ -413,12 +413,7 @@ static int addr6_resolve(struct sockaddr *src_sock,
 	fl6.saddr = src_in->sin6_addr;
 	fl6.flowi6_oif = addr->bound_dev_if;
 
-	{
-		struct xfrm_flow_origin origin = xfrm_flow_origin_none();
-
-		dst = ip6_dst_lookup_flow_origin(addr->net, NULL, &fl6, NULL,
-						 &origin);
-	}
+	dst = ip6_dst_lookup_flow(addr->net, NULL, &fl6, NULL);
 	if (IS_ERR(dst))
 		return PTR_ERR(dst);
 

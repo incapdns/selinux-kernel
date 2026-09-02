@@ -137,7 +137,6 @@ static struct file *__anon_inode_getfile(const char *name,
 {
 	struct inode *inode;
 	struct file *file;
-	int error;
 
 	if (fops->owner && !try_module_get(fops->owner))
 		return ERR_PTR(-ENOENT);
@@ -170,13 +169,6 @@ static struct file *__anon_inode_getfile(const char *name,
 	file->f_mapping = inode->i_mapping;
 
 	file->private_data = priv;
-	if (make_inode) {
-		error = security_file_init_security_anon(file);
-		if (error) {
-			fput(file);
-			return ERR_PTR(error);
-		}
-	}
 
 	return file;
 

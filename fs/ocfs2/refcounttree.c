@@ -4328,28 +4328,24 @@ out:
  */
 
 /* copied from may_create in VFS. */
-static inline int ocfs2_may_create(const struct vfsmount *mnt,
-				   struct inode *dir, struct dentry *child)
+static inline int ocfs2_may_create(struct inode *dir, struct dentry *child)
 {
 	if (d_really_is_positive(child))
 		return -EEXIST;
 	if (IS_DEADDIR(dir))
 		return -ENOENT;
-	return inode_permission_mnt(&nop_mnt_idmap, mnt, dir,
-				    MAY_WRITE | MAY_EXEC);
+	return inode_permission(&nop_mnt_idmap, dir, MAY_WRITE | MAY_EXEC);
 }
 
 /**
  * ocfs2_vfs_reflink - Create a reference-counted link
  *
- * @mnt:                 mount through which the operation was requested
  * @old_dentry:        source dentry + inode
  * @dir:       directory to create the target
  * @new_dentry:        target dentry
  * @preserve:  if true, preserve all file attributes
  */
-static int ocfs2_vfs_reflink(const struct vfsmount *mnt,
-			     struct dentry *old_dentry, struct inode *dir,
+static int ocfs2_vfs_reflink(struct dentry *old_dentry, struct inode *dir,
 			     struct dentry *new_dentry, bool preserve)
 {
 	struct inode *inode = d_inode(old_dentry);
@@ -4358,7 +4354,7 @@ static int ocfs2_vfs_reflink(const struct vfsmount *mnt,
 	if (!inode)
 		return -ENOENT;
 
-	error = ocfs2_may_create(mnt, dir, new_dentry);
+	error = ocfs2_may_create(dir, new_dentry);
 	if (error)
 		return error;
 
@@ -4392,8 +4388,7 @@ static int ocfs2_vfs_reflink(const struct vfsmount *mnt,
 	 * file.
 	 */
 	if (!preserve) {
-		error = inode_permission_mnt(&nop_mnt_idmap, mnt, inode,
-					     MAY_READ);
+		error = inode_permission(&nop_mnt_idmap, inode, MAY_READ);
 		if (error)
 			return error;
 	}
@@ -4441,7 +4436,7 @@ int ocfs2_reflink_ioctl(struct inode *inode,
 		goto out_dput;
 	}
 
-	error = ocfs2_vfs_reflink(old_path.mnt, old_path.dentry,
+	error = ocfs2_vfs_reflink(old_path.dentry,
 				  d_inode(new_path.dentry),
 				  new_dentry, preserve);
 out_dput:

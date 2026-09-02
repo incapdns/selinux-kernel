@@ -297,22 +297,12 @@ static void nft_ct_set_eval(const struct nft_expr *expr,
 		break;
 #endif
 #ifdef CONFIG_NF_CONNTRACK_SECMARK
-	case NFT_CT_SECMARK: {
-#ifdef CONFIG_SECURITY_SELINUX_NS
-		bool changed = READ_ONCE(ct->secmark) != value;
-
-		/* An arbitrary write never inherits an older rule's authority. */
-		nf_conn_secmark_set(ct, value, NULL);
-		if (changed)
-			nf_conntrack_event_cache(IPCT_SECMARK, ct);
-#else
-		if (READ_ONCE(ct->secmark) != value) {
+	case NFT_CT_SECMARK:
+		if (ct->secmark != value) {
 			ct->secmark = value;
 			nf_conntrack_event_cache(IPCT_SECMARK, ct);
 		}
-#endif
 		break;
-	}
 #endif
 #ifdef CONFIG_NF_CONNTRACK_LABELS
 	case NFT_CT_LABELS:

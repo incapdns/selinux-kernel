@@ -85,8 +85,7 @@ int ima_must_appraise(struct mnt_idmap *idmap, struct inode *inode,
 				NULL, NULL, NULL);
 }
 
-static int ima_fix_xattr(const struct vfsmount *mnt, struct dentry *dentry,
-			 struct ima_iint_cache *iint)
+static int ima_fix_xattr(struct dentry *dentry, struct ima_iint_cache *iint)
 {
 	int rc, offset;
 	u8 algo = iint->ima_hash->algo;
@@ -104,11 +103,10 @@ static int ima_fix_xattr(const struct vfsmount *mnt, struct dentry *dentry,
 		iint->ima_hash->xattr.ng.type = IMA_XATTR_DIGEST_NG;
 		iint->ima_hash->xattr.ng.algo = algo;
 	}
-	rc = __vfs_setxattr_noperm_mnt(
-		&nop_mnt_idmap, mnt, dentry, XATTR_NAME_IMA,
-		&iint->ima_hash->xattr.data[offset],
-		(sizeof(iint->ima_hash->xattr) - offset) + iint->ima_hash->length,
-		0);
+	rc = __vfs_setxattr_noperm(&nop_mnt_idmap, dentry, XATTR_NAME_IMA,
+				   &iint->ima_hash->xattr.data[offset],
+				   (sizeof(iint->ima_hash->xattr) - offset) +
+				   iint->ima_hash->length, 0);
 	return rc;
 }
 
@@ -230,14 +228,13 @@ enum hash_algo ima_get_hash_algo(const struct evm_ima_xattr_data *xattr_value,
 	return ima_hash_algo;
 }
 
-int ima_read_xattr(const struct vfsmount *mnt, struct dentry *dentry,
+int ima_read_xattr(struct dentry *dentry,
 		   struct evm_ima_xattr_data **xattr_value, int xattr_len)
 {
 	int ret;
 
-	ret = vfs_getxattr_alloc_mnt(&nop_mnt_idmap, mnt, dentry,
-				     XATTR_NAME_IMA, (char **)xattr_value,
-				     xattr_len, GFP_NOFS);
+	ret = vfs_getxattr_alloc(&nop_mnt_idmap, dentry, XATTR_NAME_IMA,
+				 (char **)xattr_value, xattr_len, GFP_NOFS);
 	if (ret == -EOPNOTSUPP)
 		ret = 0;
 	return ret;
@@ -515,8 +512,7 @@ int ima_appraise_measurement(enum ima_hooks func, struct ima_iint_cache *iint,
 		goto out;
 	}
 
-	status = evm_verifyxattr(file->f_path.mnt, dentry, XATTR_NAME_IMA,
-				 xattr_value,
+	status = evm_verifyxattr(dentry, XATTR_NAME_IMA, xattr_value,
 				 rc < 0 ? 0 : rc);
 	switch (status) {
 	case INTEGRITY_PASS:
@@ -574,11 +570,10 @@ out:
 		if ((ima_appraise & IMA_APPRAISE_FIX) && !try_modsig &&
 		    (!xattr_value ||
 		     xattr_value->type != EVM_IMA_XATTR_DIGSIG)) {
-			if (!ima_fix_xattr(file->f_path.mnt, dentry, iint))
+			if (!ima_fix_xattr(dentry, iint))
 				status = INTEGRITY_PASS;
 		} else if (status == INTEGRITY_NOLABEL) {
-			if (!evm_fix_hmac(file->f_path.mnt, dentry,
-					  XATTR_NAME_IMA,
+			if (!evm_fix_hmac(dentry, XATTR_NAME_IMA,
 					  (const char *)xattr_value,
 					  xattr_len))
 				status = INTEGRITY_PASS;
@@ -624,14 +619,13 @@ void ima_update_xattr(struct ima_iint_cache *iint, struct file *file)
 		return;
 
 	inode_lock(file_inode(file));
-	ima_fix_xattr(file->f_path.mnt, dentry, iint);
+	ima_fix_xattr(dentry, iint);
 	inode_unlock(file_inode(file));
 }
 
 /**
  * ima_inode_post_setattr - reflect file metadata changes
  * @idmap:  idmap of the mount the inode was found from
- * @mnt: mount selecting the LSM label view
  * @dentry: pointer to the affected dentry
  * @ia_valid: for the UID and GID status
  *
@@ -641,7 +635,6 @@ void ima_update_xattr(struct ima_iint_cache *iint, struct file *file)
  * to lock the inode's i_mutex.
  */
 static void ima_inode_post_setattr(struct mnt_idmap *idmap,
-				   const struct vfsmount *mnt,
 				   struct dentry *dentry, int ia_valid)
 {
 	struct inode *inode = d_backing_inode(dentry);
@@ -764,8 +757,7 @@ static int validate_hash_algo(struct dentry *dentry,
 	return -EACCES;
 }
 
-static int ima_inode_setxattr(struct mnt_idmap *idmap,
-			      const struct vfsmount *mnt, struct dentry *dentry,
+static int ima_inode_setxattr(struct mnt_idmap *idmap, struct dentry *dentry,
 			      const char *xattr_name, const void *xattr_value,
 			      size_t xattr_value_len, int flags)
 {
@@ -798,8 +790,7 @@ static int ima_inode_setxattr(struct mnt_idmap *idmap,
 	return result;
 }
 
-static int ima_inode_set_acl(struct mnt_idmap *idmap,
-			     const struct vfsmount *mnt, struct dentry *dentry,
+static int ima_inode_set_acl(struct mnt_idmap *idmap, struct dentry *dentry,
 			     const char *acl_name, struct posix_acl *kacl)
 {
 	if (evm_revalidate_status(acl_name))
@@ -808,9 +799,7 @@ static int ima_inode_set_acl(struct mnt_idmap *idmap,
 	return 0;
 }
 
-static int ima_inode_removexattr(struct mnt_idmap *idmap,
-				 const struct vfsmount *mnt,
-				 struct dentry *dentry,
+static int ima_inode_removexattr(struct mnt_idmap *idmap, struct dentry *dentry,
 				 const char *xattr_name)
 {
 	int result, digsig = -1;
@@ -826,11 +815,10 @@ static int ima_inode_removexattr(struct mnt_idmap *idmap,
 	return result;
 }
 
-static int ima_inode_remove_acl(struct mnt_idmap *idmap,
-				const struct vfsmount *mnt,
-				struct dentry *dentry, const char *acl_name)
+static int ima_inode_remove_acl(struct mnt_idmap *idmap, struct dentry *dentry,
+				const char *acl_name)
 {
-	return ima_inode_set_acl(idmap, mnt, dentry, acl_name, NULL);
+	return ima_inode_set_acl(idmap, dentry, acl_name, NULL);
 }
 
 static struct security_hook_list ima_appraise_hooks[] __ro_after_init = {

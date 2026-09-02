@@ -24,7 +24,6 @@
 #include <linux/key.h>
 #include <linux/namei.h>
 #include <linux/file.h>
-#include <linux/security.h>
 
 #include <net/bpf_sk_storage.h>
 
@@ -583,10 +582,6 @@ get_map_perf_counter(struct bpf_map *map, u64 flags,
 	ee = READ_ONCE(array->ptrs[index]);
 	if (!ee)
 		return -ENOENT;
-	if (unlikely((security_perf_event_relation_enabled() &&
-		      !ee->read_relation) ||
-		     security_perf_event_relation_valid(ee->read_relation)))
-		return -EACCES;
 
 	return perf_event_read_local(ee->event, value, enabled, running);
 }
@@ -665,10 +660,6 @@ __bpf_perf_event_output(struct pt_regs *regs, struct bpf_map *map,
 	ee = READ_ONCE(array->ptrs[index]);
 	if (!ee)
 		return -ENOENT;
-	if (unlikely((security_perf_event_relation_enabled() &&
-		      !ee->write_relation) ||
-		     security_perf_event_relation_valid(ee->write_relation)))
-		return -EACCES;
 
 	event = ee->event;
 	if (unlikely(event->attr.type != PERF_TYPE_SOFTWARE ||
@@ -1959,8 +1950,7 @@ static DEFINE_MUTEX(bpf_event_mutex);
 
 int perf_event_attach_bpf_prog(struct perf_event *event,
 			       struct bpf_prog *prog,
-			       u64 bpf_cookie,
-			       struct perf_event_relation *relation)
+			       u64 bpf_cookie)
 {
 	struct bpf_prog_array *old_array;
 	struct bpf_prog_array *new_array;
@@ -1979,10 +1969,6 @@ int perf_event_attach_bpf_prog(struct perf_event *event,
 
 	if (event->prog)
 		goto unlock;
-	if (security_perf_event_relation_enabled() && !relation) {
-		ret = -EACCES;
-		goto unlock;
-	}
 
 	old_array = bpf_event_rcu_dereference(event->tp_event->prog_array);
 	if (old_array &&
@@ -1991,17 +1977,12 @@ int perf_event_attach_bpf_prog(struct perf_event *event,
 		goto unlock;
 	}
 
-	ret = bpf_prog_array_copy_with_perf_relation(
-		old_array, NULL, prog, bpf_cookie, relation, &new_array);
+	ret = bpf_prog_array_copy(old_array, NULL, prog, bpf_cookie, &new_array);
 	if (ret < 0)
 		goto unlock;
 
 	/* set the new array to event->tp_event and set event->prog */
-	rcu_assign_pointer(event->bpf_relation,
-			   security_perf_event_relation_get(relation));
-	/* The event bookkeeping must never name a program without its guard. */
-	smp_wmb();
-	WRITE_ONCE(event->prog, prog);
+	event->prog = prog;
 	event->bpf_cookie = bpf_cookie;
 	rcu_assign_pointer(event->tp_event->prog_array, new_array);
 	bpf_prog_array_free_sleepable(old_array);
@@ -2016,8 +1997,6 @@ void perf_event_detach_bpf_prog(struct perf_event *event)
 	struct bpf_prog_array *old_array;
 	struct bpf_prog_array *new_array;
 	struct bpf_prog *prog = NULL;
-	struct perf_event_relation *relation = NULL;
-	struct perf_event_relation *array_relation = NULL;
 	int ret;
 
 	mutex_lock(&bpf_event_mutex);
@@ -2031,9 +2010,7 @@ void perf_event_detach_bpf_prog(struct perf_event *event)
 
 	ret = bpf_prog_array_copy(old_array, event->prog, NULL, 0, &new_array);
 	if (ret < 0) {
-		array_relation =
-			bpf_prog_array_delete_safe_with_perf_relation(
-				old_array, event->prog);
+		bpf_prog_array_delete_safe(old_array, event->prog);
 	} else {
 		rcu_assign_pointer(event->tp_event->prog_array, new_array);
 		bpf_prog_array_free_sleepable(old_array);
@@ -2041,11 +2018,7 @@ void perf_event_detach_bpf_prog(struct perf_event *event)
 
 put:
 	prog = event->prog;
-	WRITE_ONCE(event->prog, NULL);
-	/* Tasks-trace readers must lose the program before its carrier. */
-	smp_wmb();
-	relation = rcu_replace_pointer(event->bpf_relation, NULL,
-				       lockdep_is_held(&bpf_event_mutex));
+	event->prog = NULL;
 
 unlock:
 	mutex_unlock(&bpf_event_mutex);
@@ -2058,8 +2031,6 @@ unlock:
 		 */
 		synchronize_rcu_tasks_trace();
 
-		security_perf_event_relation_put(relation);
-		security_perf_event_relation_put(array_relation);
 		bpf_prog_put(prog);
 	}
 }
@@ -2910,7 +2881,7 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 	bpf_link_init(&link->link, BPF_LINK_TYPE_KPROBE_MULTI,
 		      &bpf_kprobe_multi_link_lops, prog, attr->link_create.attach_type);
 
-	err = bpf_link_prime(&link->link, &link_primer, NULL, NULL);
+	err = bpf_link_prime(&link->link, &link_primer);
 	if (err)
 		goto error;
 
@@ -3410,7 +3381,7 @@ int bpf_uprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 		}
 	}
 
-	err = bpf_link_prime(&link->link, &link_primer, NULL, NULL);
+	err = bpf_link_prime(&link->link, &link_primer);
 	if (err)
 		goto error_unregister;
 
@@ -3875,7 +3846,7 @@ int bpf_tracing_multi_attach(struct bpf_prog *prog, const union bpf_attr *attr)
 	bpf_link_init(&link->link, BPF_LINK_TYPE_TRACING_MULTI,
 		      &bpf_tracing_multi_link_lops, prog, prog->expected_attach_type);
 
-	err = bpf_link_prime(&link->link, &link_primer, NULL, NULL);
+	err = bpf_link_prime(&link->link, &link_primer);
 	if (err)
 		goto error;
 

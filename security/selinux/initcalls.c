@@ -6,23 +6,9 @@
 #include <linux/init.h>
 
 #include "initcalls.h"
-#include "netns.h"
 
 /**
- * selinux_initcall_core - Install per-net SELinux anchors before Netlink
- *
- * Netlink registers its per-net socket initializers at core_initcall time.
- * Register the SELinux anchor first so kernel sockets created while a new
- * network namespace is being constructed can bind to that namespace's exact
- * immutable label view.
- */
-int __init selinux_initcall_core(void)
-{
-	return selinux_netns_init();
-}
-
-/**
- * selinux_initcall - Perform the remaining SELinux initcalls
+ * selinux_initcall - Perform the SELinux initcalls
  *
  * Used as a device initcall in the SELinux LSM definition.
  */

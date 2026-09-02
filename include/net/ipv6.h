@@ -15,7 +15,6 @@
 #include <linux/refcount.h>
 #include <linux/jump_label_ratelimit.h>
 #include <net/if_inet6.h>
-#include <net/xfrm_origin.h>
 #include <net/flow.h>
 #include <net/flow_dissector.h>
 #include <net/inet_dscp.h>
@@ -1061,30 +1060,12 @@ static inline struct sk_buff *ip6_finish_skb(struct sock *sk)
 int ip6_dst_lookup(struct net *net, struct sock *sk, struct dst_entry **dst,
 		   struct flowi6 *fl6);
 #if IS_ENABLED(CONFIG_IPV6)
-struct dst_entry *ip6_dst_lookup_flow(
-				      struct net *net, const struct sock *sk,
-				      struct flowi6 *fl6,
+struct dst_entry *ip6_dst_lookup_flow(struct net *net, const struct sock *sk, struct flowi6 *fl6,
 				      const struct in6_addr *final_dst);
-struct dst_entry *ip6_dst_lookup_flow_origin(
-				      struct net *net, const struct sock *sk,
-				      struct flowi6 *fl6,
-				      const struct in6_addr *final_dst,
-				      const struct xfrm_flow_origin *origin);
 #else
-static inline struct dst_entry *ip6_dst_lookup_flow(
-						    struct net *net,
-						    const struct sock *sk,
+static inline struct dst_entry *ip6_dst_lookup_flow(struct net *net, const struct sock *sk,
 						    struct flowi6 *fl6,
 						    const struct in6_addr *final_dst)
-{
-	return ERR_PTR(-EAFNOSUPPORT);
-}
-static inline struct dst_entry *ip6_dst_lookup_flow_origin(
-					      struct net *net,
-					      const struct sock *sk,
-					      struct flowi6 *fl6,
-					      const struct in6_addr *final_dst,
-					      const struct xfrm_flow_origin *origin)
 {
 	return ERR_PTR(-EAFNOSUPPORT);
 }

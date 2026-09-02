@@ -31,9 +31,11 @@
 #include <net/ipv6.h>
 
 #include "initcalls.h"
-#include "global_sidtab.h"
 #include "netnode.h"
 #include "objsec.h"
+#include "namespace.h"
+#include "object_label.h"
+#include "security.h"
 
 #define SEL_NETNODE_HASH_SIZE       256
 #define SEL_NETNODE_HASH_BKT_LIMIT   16
@@ -45,9 +47,6 @@ struct sel_netnode_bkt {
 
 struct sel_netnode {
 	struct netnode_security_struct nsec;
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	struct selinux_global_sid_handle *sid_handle;
-#endif
 
 	struct list_head list;
 	struct rcu_head rcu;
@@ -66,10 +65,58 @@ static void sel_netnode_free(struct rcu_head *rcu)
 {
 	struct sel_netnode *node = container_of(rcu, struct sel_netnode, rcu);
 
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	global_sid_handle_put(node->sid_handle);
-#endif
+	selinux_object_identity_put(node->nsec.object);
 	kfree(node);
+}
+
+static int sel_netnode_populate_labels(
+	const struct cred *cred,
+	const void *addr,
+	u16 family,
+	struct selinux_object_identity *object)
+{
+	struct selinux_object_label_value
+		values[SELINUX_NS_MAX_DEPTH + 1] = {};
+	struct selinux_state *states[SELINUX_NS_MAX_DEPTH + 1] = {};
+	const struct cred *level_cred = cred;
+	struct selinux_state *state = cred_selinux_state(cred);
+	u32 addrlen;
+	u16 count = 0;
+	int rc;
+
+	switch (family) {
+	case PF_INET:
+		addrlen = sizeof(struct in_addr);
+		break;
+	case PF_INET6:
+		addrlen = sizeof(struct in6_addr);
+		break;
+	default:
+		return -EINVAL;
+	}
+	while (state) {
+		const struct cred_security_struct *security;
+
+		if (!level_cred || count >= ARRAY_SIZE(states))
+			return -ESTALE;
+		security = selinux_cred(level_cred);
+		if (security->state != state)
+			return -ESTALE;
+		states[count] = state;
+		rc = security_node_sid(
+			state, family, addr, addrlen, &values[count].sid);
+		if (rc)
+			return rc;
+		values[count].sclass = SECCLASS_NODE;
+		values[count].source = SELINUX_LABEL_SOURCE_NETWORK;
+		count++;
+		level_cred = security->parent_cred;
+		state = state->parent;
+	}
+	if (level_cred)
+		return -ESTALE;
+	return selinux_object_labels_set_chain(
+		object, states, values, count, GFP_ATOMIC);
 }
 
 /**
@@ -107,8 +154,6 @@ static unsigned int sel_netnode_hashfn_ipv6(const struct in6_addr *addr)
 
 /**
  * sel_netnode_find - Search for a node record
- * @domain_id: stable SELinux label-domain identity
- * @snapshot: immutable policy generation
  * @addr: IP address
  * @family: address family
  *
@@ -117,10 +162,7 @@ static unsigned int sel_netnode_hashfn_ipv6(const struct in6_addr *addr)
  * entry can not be found in the table return NULL.
  *
  */
-static struct sel_netnode *sel_netnode_find(
-	u64 domain_id,
-	const struct selinux_policy_snapshot *snapshot, const void *addr,
-	u16 family)
+static struct sel_netnode *sel_netnode_find(const void *addr, u16 family)
 {
 	unsigned int idx;
 	struct sel_netnode *node;
@@ -137,27 +179,19 @@ static struct sel_netnode *sel_netnode_find(
 		return NULL;
 	}
 
-	list_for_each_entry_rcu(node, &sel_netnode_hash[idx].list, list) {
-		if (node->nsec.family != family ||
-		    !selinux_policy_cache_key_matches(&node->nsec.policy,
-						      domain_id, snapshot))
-			continue;
-#ifdef CONFIG_SECURITY_SELINUX_NS
-		if (!node->sid_handle ||
-		    global_sid_handle_sid(node->sid_handle) != node->nsec.sid)
-			continue;
-#endif
-		switch (family) {
-		case PF_INET:
-			if (node->nsec.addr.ipv4 == *(const __be32 *)addr)
-				return node;
-			break;
-		case PF_INET6:
-			if (ipv6_addr_equal(&node->nsec.addr.ipv6, addr))
-				return node;
-			break;
-		}
-	}
+	list_for_each_entry_rcu(node, &sel_netnode_hash[idx].list, list)
+		if (node->nsec.family == family)
+			switch (family) {
+			case PF_INET:
+				if (node->nsec.addr.ipv4 == *(const __be32 *)addr)
+					return node;
+				break;
+			case PF_INET6:
+				if (ipv6_addr_equal(&node->nsec.addr.ipv6,
+						    addr))
+					return node;
+				break;
+			}
 
 	return NULL;
 }
@@ -203,13 +237,10 @@ static void sel_netnode_insert(struct sel_netnode *node)
 }
 
 /**
- * sel_netnode_sid_slow - Lookup the SID of a network address using the policy
- * @state: the SELinux state
- * @snapshot: immutable policy generation
+ * sel_netnode_object_slow - Resolve a network-node identity for the chain
  * @addr: the IP address
  * @family: the address family
  * @sid: node SID
- * @out_handle: strong handle paired with @sid
  *
  * Description:
  * This function determines the SID of a network address by querying the
@@ -218,131 +249,68 @@ static void sel_netnode_insert(struct sel_netnode *node)
  * failure.
  *
  */
-static int sel_netnode_sid_slow(
-	struct selinux_state *state,
-	const struct selinux_policy_snapshot *snapshot, const void *addr,
-	u16 family, u32 *sid,
-	struct selinux_global_sid_handle **out_handle)
+static int sel_netnode_object_slow(
+	const struct cred *cred,
+	const void *addr,
+	u16 family,
+	struct selinux_object_identity **object)
 {
 	int ret = 0;
-	u64 domain_id = state->label_domain->id;
 	struct sel_netnode *node;
 	struct sel_netnode *new;
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	struct selinux_global_sid_handle *sid_handle = NULL;
-	struct selinux_global_sid_handle *cache_handle;
-#endif
-
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	if (!out_handle)
-		return -EINVAL;
-	*out_handle = NULL;
-#else
-	(void)out_handle;
-#endif
 
 	spin_lock_bh(&sel_netnode_lock);
-	node = sel_netnode_find(domain_id, snapshot, addr, family);
+	node = sel_netnode_find(addr, family);
 	if (node != NULL) {
-		*sid = node->nsec.sid;
-#ifdef CONFIG_SECURITY_SELINUX_NS
-		sid_handle = global_sid_handle_dup(node->sid_handle);
-		if (IS_ERR(sid_handle)) {
-			ret = PTR_ERR(sid_handle);
-			sid_handle = NULL;
+		struct selinux_object_label_value value;
+
+		if (selinux_object_label_get(
+			    cred_selinux_state(cred), node->nsec.object, &value)) {
+			ret = sel_netnode_populate_labels(
+				cred, addr, family, node->nsec.object);
+			if (ret)
+				goto out;
 		}
-#endif
+		*object = selinux_object_identity_get(node->nsec.object);
 		goto out;
 	}
 
-	/* If this memory allocation fails still return 0. The SID
-	 * is valid, it just won't be added to the cache.
-	 */
 	new = kmalloc_obj(*new, GFP_ATOMIC);
-	switch (family) {
-	case PF_INET:
-#ifdef CONFIG_SECURITY_SELINUX_NS
-		sid_handle = security_node_sid_handle(
-			state, PF_INET, addr, sizeof(struct in_addr), sid);
-		ret = IS_ERR(sid_handle) ? PTR_ERR(sid_handle) : 0;
-		if (IS_ERR(sid_handle))
-			sid_handle = NULL;
-#else
-		ret = security_node_sid(state, PF_INET,
-					addr, sizeof(struct in_addr), sid);
-#endif
-		if (new)
-			new->nsec.addr.ipv4 = *(const __be32 *)addr;
-		break;
-	case PF_INET6:
-#ifdef CONFIG_SECURITY_SELINUX_NS
-		sid_handle = security_node_sid_handle(
-			state, PF_INET6, addr, sizeof(struct in6_addr), sid);
-		ret = IS_ERR(sid_handle) ? PTR_ERR(sid_handle) : 0;
-		if (IS_ERR(sid_handle))
-			sid_handle = NULL;
-#else
-		ret = security_node_sid(state, PF_INET6,
-					addr, sizeof(struct in6_addr), sid);
-#endif
-		if (new)
-			new->nsec.addr.ipv6 = *(const struct in6_addr *)addr;
-		break;
-	default:
-		BUG();
-		ret = -EINVAL;
+	if (!new) {
+		ret = -ENOMEM;
+		goto out;
 	}
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	if (!ret && (!*sid || global_sid_handle_sid(sid_handle) != *sid))
-		ret = -ESTALE;
-#endif
-	if (!ret && !selinux_policy_snapshot_valid(state, snapshot))
-		ret = -ESTALE;
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	if (!ret && new) {
-		cache_handle = global_sid_handle_dup(sid_handle);
-		if (IS_ERR(cache_handle)) {
-			kfree(new);
-			new = NULL;
-		}
-	}
-#endif
-	if (ret == 0 && new) {
-		new->nsec.family = family;
-		new->nsec.sid = *sid;
-		selinux_policy_cache_key_init(&new->nsec.policy, domain_id,
-					      snapshot);
-#ifdef CONFIG_SECURITY_SELINUX_NS
-		new->sid_handle = cache_handle;
-#endif
-		sel_netnode_insert(new);
-	} else
+	new->nsec.object = selinux_object_identity_alloc(
+		init_selinux_state, GFP_ATOMIC);
+	if (IS_ERR(new->nsec.object)) {
+		ret = PTR_ERR(new->nsec.object);
 		kfree(new);
-
-out:
-	spin_unlock_bh(&sel_netnode_lock);
-	if (!ret && !selinux_policy_snapshot_valid(state, snapshot))
-		ret = -ESTALE;
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	if (!ret && (!sid_handle || !*sid ||
-		     global_sid_handle_sid(sid_handle) != *sid))
-		ret = -ESTALE;
-	if (!ret) {
-		*out_handle = sid_handle;
-		sid_handle = NULL;
+		goto out;
 	}
-	global_sid_handle_put(sid_handle);
-#endif
-	if (unlikely(ret && ret != -ESTALE))
+	ret = sel_netnode_populate_labels(cred, addr, family, new->nsec.object);
+	if (ret) {
+		selinux_object_identity_put(new->nsec.object);
+		kfree(new);
+		goto out;
+	}
+	new->nsec.family = family;
+	if (family == PF_INET)
+		new->nsec.addr.ipv4 = *(const __be32 *)addr;
+	else
+		new->nsec.addr.ipv6 = *(const struct in6_addr *)addr;
+	sel_netnode_insert(new);
+	*object = selinux_object_identity_get(new->nsec.object);
+
+	out:
+	spin_unlock_bh(&sel_netnode_lock);
+	if (unlikely(ret))
 		pr_warn("SELinux: failure in %s(), unable to determine network node label\n",
 			__func__);
 	return ret;
 }
 
 /**
- * sel_netnode_sid_snapshot_handle - Lookup the SID of a network address
- * @state: the SELinux state
- * @snapshot: immutable policy generation
+ * sel_netnode_object - Lookup the stable identity of a network address
  * @addr: the IP address
  * @family: the address family
  * @sid: node SID
@@ -355,130 +323,28 @@ out:
  * on failure.
  *
  */
-#ifdef CONFIG_SECURITY_SELINUX_NS
-struct selinux_global_sid_handle *
-sel_netnode_sid_snapshot_handle(
-	struct selinux_state *state,
-	const struct selinux_policy_snapshot *snapshot, const void *addr,
-	u16 family, u32 *sid)
+int sel_netnode_object(const struct cred *cred, const void *addr, u16 family,
+		       struct selinux_object_identity **object)
 {
-	struct selinux_global_sid_handle *handle;
 	struct sel_netnode *node;
-	bool valid;
-	int rc;
+	struct selinux_object_label_value value;
 
-	if (!state || !state->label_domain || !snapshot || !sid ||
-	    !snapshot->chain_epoch)
-		return ERR_PTR(-EINVAL);
-
-	rcu_read_lock();
-	node = sel_netnode_find(state->label_domain->id, snapshot, addr, family);
-	if (likely(node != NULL)) {
-		*sid = node->nsec.sid;
-		handle = global_sid_handle_dup(node->sid_handle);
-		valid = selinux_policy_snapshot_valid(state, snapshot);
-		rcu_read_unlock();
-		if (IS_ERR(handle))
-			return handle;
-		if (!valid || !*sid || global_sid_handle_sid(handle) != *sid) {
-			global_sid_handle_put(handle);
-			return ERR_PTR(-ESTALE);
-		}
-		return handle;
-	}
-	rcu_read_unlock();
-
-	rc = sel_netnode_sid_slow(state, snapshot, addr, family, sid, &handle);
-	return rc ? ERR_PTR(rc) : handle;
-}
-
-struct selinux_global_sid_handle *
-sel_netnode_sid_handle(struct selinux_state *state, const void *addr,
-		      u16 family, u32 *sid)
-{
-	struct selinux_global_sid_handle *handle;
-	struct selinux_policy_snapshot snapshot;
-	unsigned int retry;
-	int rc;
-
-	for (retry = 0; retry < 3; retry++) {
-		rc = selinux_policy_snapshot_read(state, &snapshot);
-		if (rc == -EAGAIN || rc == -ESTALE)
-			continue;
-		if (rc)
-			return ERR_PTR(rc);
-		handle = sel_netnode_sid_snapshot_handle(
-			state, &snapshot, addr, family, sid);
-		if (!IS_ERR(handle) || PTR_ERR(handle) != -ESTALE)
-			return handle;
-	}
-	return ERR_PTR(-ESTALE);
-}
-#endif
-
-int sel_netnode_sid_snapshot(
-	struct selinux_state *state,
-	const struct selinux_policy_snapshot *snapshot, const void *addr,
-	u16 family, u32 *sid)
-{
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	struct selinux_global_sid_handle *handle;
-
-	handle = sel_netnode_sid_snapshot_handle(state, snapshot, addr, family,
-						 sid);
-	if (IS_ERR(handle))
-		return PTR_ERR(handle);
-	global_sid_handle_put(handle);
-	return 0;
-#else
-	struct sel_netnode *node;
-	bool valid;
-
-	if (!state || !state->label_domain || !snapshot ||
-	    !snapshot->chain_epoch)
+	if (!cred || !object)
 		return -EINVAL;
+	*object = NULL;
+
 	rcu_read_lock();
-	node = sel_netnode_find(state->label_domain->id, snapshot, addr, family);
-	if (likely(node != NULL)) {
-		*sid = node->nsec.sid;
-		valid = selinux_policy_snapshot_valid(state, snapshot);
+	node = sel_netnode_find(addr, family);
+	if (likely(node != NULL) &&
+	    !selinux_object_label_get(
+		    cred_selinux_state(cred), node->nsec.object, &value)) {
+		*object = selinux_object_identity_get(node->nsec.object);
 		rcu_read_unlock();
-		return valid ? 0 : -ESTALE;
+		return 0;
 	}
 	rcu_read_unlock();
-	return sel_netnode_sid_slow(state, snapshot, addr, family, sid, NULL);
-#endif
-}
 
-int sel_netnode_sid(struct selinux_state *state, const void *addr, u16 family,
-		    u32 *sid)
-{
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	struct selinux_global_sid_handle *handle;
-
-	handle = sel_netnode_sid_handle(state, addr, family, sid);
-	if (IS_ERR(handle))
-		return PTR_ERR(handle);
-	global_sid_handle_put(handle);
-	return 0;
-#else
-	struct selinux_policy_snapshot snapshot;
-	unsigned int retry;
-	int rc;
-
-	for (retry = 0; retry < 3; retry++) {
-		rc = selinux_policy_snapshot_read(state, &snapshot);
-		if (rc == -EAGAIN || rc == -ESTALE)
-			continue;
-		if (rc)
-			return rc;
-		rc = sel_netnode_sid_snapshot(state, &snapshot, addr, family,
-					       sid);
-		if (rc != -ESTALE)
-			return rc;
-	}
-	return -ESTALE;
-#endif
+	return sel_netnode_object_slow(cred, addr, family, object);
 }
 
 /**
@@ -497,8 +363,8 @@ void sel_netnode_flush(void)
 	for (idx = 0; idx < SEL_NETNODE_HASH_SIZE; idx++) {
 		list_for_each_entry_safe(node, node_tmp,
 					 &sel_netnode_hash[idx].list, list) {
-				list_del_rcu(&node->list);
-				call_rcu(&node->rcu, sel_netnode_free);
+			list_del_rcu(&node->list);
+			call_rcu(&node->rcu, sel_netnode_free);
 		}
 		sel_netnode_hash[idx].size = 0;
 	}

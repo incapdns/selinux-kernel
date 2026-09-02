@@ -3813,7 +3813,7 @@ shmem_mknod(struct mnt_idmap *idmap, struct inode *dir,
 		goto out_iput;
 	error = security_inode_init_security(inode, dir, &dentry->d_name,
 					     shmem_initxattrs, NULL);
-	if (error)
+	if (error && error != -EOPNOTSUPP)
 		goto out_iput;
 
 	error = simple_offset_add(shmem_get_offset_ctx(dir), dentry);
@@ -3845,8 +3845,7 @@ shmem_tmpfile(struct mnt_idmap *idmap, struct inode *dir,
 		error = PTR_ERR(inode);
 		goto err_out;
 	}
-	error = security_inode_init_security(inode, dir,
-					     &file_dentry(file)->d_name,
+	error = security_inode_init_security(inode, dir, NULL,
 					     shmem_initxattrs, NULL);
 	if (error && error != -EOPNOTSUPP)
 		goto out_iput;
@@ -4044,7 +4043,7 @@ static int shmem_symlink(struct mnt_idmap *idmap, struct inode *dir,
 
 	error = security_inode_init_security(inode, dir, &dentry->d_name,
 					     shmem_initxattrs, NULL);
-	if (error)
+	if (error && error != -EOPNOTSUPP)
 		goto out_iput;
 
 	error = simple_offset_add(shmem_get_offset_ctx(dir), dentry);
@@ -5187,12 +5186,6 @@ static const struct inode_operations shmem_dir_inode_operations = {
 	.rename		= shmem_rename2,
 	.tmpfile	= shmem_tmpfile,
 	.get_offset_ctx	= shmem_get_offset_ctx,
-	.security_create_plan_ops =
-		SECURITY_INODE_CREATE_OP(SECURITY_INODE_CREATE) |
-		SECURITY_INODE_CREATE_OP(SECURITY_INODE_MKNOD) |
-		SECURITY_INODE_CREATE_OP(SECURITY_INODE_MKDIR) |
-		SECURITY_INODE_CREATE_OP(SECURITY_INODE_SYMLINK) |
-		SECURITY_INODE_CREATE_OP(SECURITY_INODE_TMPFILE),
 #endif
 #ifdef CONFIG_TMPFS_XATTR
 	.listxattr	= shmem_listxattr,

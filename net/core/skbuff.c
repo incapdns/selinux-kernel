@@ -51,6 +51,7 @@
 #endif
 #include <linux/string.h>
 #include <linux/skbuff.h>
+#include <linux/security.h>
 #include <linux/skbuff_ref.h>
 #include <linux/splice.h>
 #include <linux/cache.h>
@@ -1168,6 +1169,7 @@ fastpath:
 
 void skb_release_head_state(struct sk_buff *skb)
 {
+	security_skb_provenance_free(skb);
 	skb_dst_drop(skb);
 	if (skb->destructor) {
 		DEBUG_NET_WARN_ON_ONCE(in_hardirq());
@@ -1187,10 +1189,6 @@ void skb_release_head_state(struct sk_buff *skb)
 	}
 	nf_reset_ct(skb);
 	skb_ext_reset(skb);
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	selinux_net_provenance_put(skb->secmark_provenance);
-	skb->secmark_provenance = NULL;
-#endif
 }
 
 /* Free everything but the sk_buff shell. */
@@ -1573,6 +1571,7 @@ static void __copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
 	new->queue_mapping = old->queue_mapping;
 
 	memcpy(&new->headers, &old->headers, sizeof(new->headers));
+	security_skb_provenance_clone(new, old);
 	CHECK_SKB_FIELD(protocol);
 	CHECK_SKB_FIELD(csum);
 	CHECK_SKB_FIELD(hash);
@@ -1590,10 +1589,6 @@ static void __copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
 	CHECK_SKB_FIELD(mark);
 #ifdef CONFIG_NETWORK_SECMARK
 	CHECK_SKB_FIELD(secmark);
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	CHECK_SKB_FIELD(secmark_provenance);
-	selinux_net_provenance_get(new->secmark_provenance);
-#endif
 #endif
 #ifdef CONFIG_NET_RX_BUSY_POLL
 	CHECK_SKB_FIELD(napi_id);
@@ -6303,10 +6298,6 @@ void skb_scrub_packet(struct sk_buff *skb, bool xnet)
 		return;
 
 	skb->mark = 0;
-#ifdef CONFIG_SECURITY_SELINUX_NS
-	/* Preserve the ABI mark, but never carry authority across netns. */
-	skb_set_secmark(skb, skb->secmark, NULL);
-#endif
 	skb_clear_tstamp(skb);
 }
 EXPORT_SYMBOL_GPL(skb_scrub_packet);

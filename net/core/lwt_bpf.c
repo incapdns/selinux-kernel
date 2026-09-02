@@ -237,12 +237,7 @@ static int bpf_lwt_xmit_reroute(struct sk_buff *skb)
 		fl6.daddr = iph6->daddr;
 		fl6.saddr = iph6->saddr;
 
-		{
-			struct xfrm_flow_origin origin = xfrm_flow_origin_skb(skb);
-
-			dst = ip6_dst_lookup_flow_origin(net, skb->sk, &fl6,
-							  NULL, &origin);
-		}
+		dst = ip6_dst_lookup_flow(net, skb->sk, &fl6, NULL);
 		if (IS_ERR(dst)) {
 			err = PTR_ERR(dst);
 			goto err;

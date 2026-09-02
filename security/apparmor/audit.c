@@ -149,7 +149,7 @@ void aa_audit_msg(int type, struct apparmor_audit_data *ad,
 		  void (*cb) (struct audit_buffer *, void *))
 {
 	ad->type = type;
-	(void)common_lsm_audit_status(&ad->common, audit_pre, cb);
+	common_lsm_audit(&ad->common, audit_pre, cb);
 }
 
 /**
@@ -264,15 +264,11 @@ int aa_audit_rule_known(struct audit_krule *rule)
 	return 0;
 }
 
-int aa_audit_rule_match(const struct lsm_prop_ref *ref,
-			const struct lsm_prop *prop, u32 field, u32 op,
-			void *vrule)
+int aa_audit_rule_match(struct lsm_prop *prop, u32 field, u32 op, void *vrule)
 {
 	struct aa_audit_rule *rule = vrule;
 	struct aa_label *label;
 	int found = 0;
-
-	(void)ref;
 
 	label = prop->apparmor.label;
 

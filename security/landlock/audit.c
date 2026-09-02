@@ -128,7 +128,7 @@ static void log_domain(struct landlock_hierarchy *const hierarchy)
 	audit_log_untrustedstring(ab, hierarchy->details->exe_path);
 	audit_log_format(ab, " comm=");
 	audit_log_untrustedstring(ab, hierarchy->details->comm);
-	(void)audit_log_end_status(ab);
+	audit_log_end(ab);
 
 	/*
 	 * There may be race condition leading to logging of the same domain
@@ -668,7 +668,7 @@ void landlock_log_denial(const struct landlock_cred_security *const subject,
 	audit_log_format(ab, "domain=%llx blockers=", youngest_denied->id);
 	log_blockers(ab, request->type, missing);
 	audit_log_lsm_data(ab, &request->audit);
-	(void)audit_log_end_status(ab);
+	audit_log_end(ab);
 
 	/* Logs this domain the first time it shows in log. */
 	log_domain(youngest_denied);
@@ -710,7 +710,7 @@ void landlock_log_drop_domain(const struct landlock_hierarchy *const hierarchy)
 
 	audit_log_format(ab, "domain=%llx status=deallocated denials=%llu",
 			 hierarchy->id, atomic64_read(&hierarchy->num_denials));
-	(void)audit_log_end_status(ab);
+	audit_log_end(ab);
 }
 
 #ifdef CONFIG_SECURITY_LANDLOCK_KUNIT_TEST

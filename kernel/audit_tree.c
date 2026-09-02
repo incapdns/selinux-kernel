@@ -538,7 +538,7 @@ static void audit_tree_log_remove_rule(struct audit_context *context,
 	audit_log_untrustedstring(ab, rule->tree->pathname);
 	audit_log_key(ab, rule->filterkey);
 	audit_log_format(ab, " list=%d res=1", rule->listnr);
-	(void)audit_log_end_status(ab);
+	audit_log_end(ab);
 }
 
 static void kill_rules(struct audit_context *context, struct audit_tree *tree)

@@ -153,9 +153,10 @@ struct cred {
 extern void __put_cred(struct cred *);
 extern void exit_creds(struct task_struct *);
 extern int copy_creds(struct task_struct *, u64);
-extern const struct cred *get_task_cred(struct task_struct *);
+extern const struct cred *get_task_cred(const struct task_struct *);
 extern struct cred *cred_alloc_blank(void);
 extern struct cred *prepare_creds(void);
+extern struct cred *prepare_creds_from(const struct cred *old);
 extern struct cred *prepare_exec_creds(void);
 extern int commit_creds(struct cred *);
 extern void abort_creds(struct cred *);

@@ -9,7 +9,6 @@
 #include <linux/user_namespace.h>
 
 static __cacheline_aligned_in_smp DEFINE_SEQLOCK(ns_tree_lock);
-static atomic64_t namespace_cookie = ATOMIC64_INIT(NS_LAST_INIT_ID + 1);
 
 DEFINE_LOCK_GUARD_0(ns_tree_writer,
 		    write_seqlock(&ns_tree_lock),
@@ -392,40 +391,13 @@ struct ns_common *__ns_tree_adjoined_rcu(struct ns_common *ns,
  */
 u64 __ns_tree_gen_id(struct ns_common *ns, u64 id)
 {
-	s64 cookie_value, next;
+	static atomic64_t namespace_cookie = ATOMIC64_INIT(NS_LAST_INIT_ID + 1);
 
-	if (id) {
+	if (id)
 		ns->ns_id = id;
-		return ns->ns_id;
-	}
-	do {
-		cookie_value = atomic64_read(&namespace_cookie);
-		if (cookie_value < 0 || cookie_value == S64_MAX)
-			return 0;
-		next = cookie_value + 1;
-	} while (atomic64_cmpxchg(&namespace_cookie, cookie_value, next) !=
-		 cookie_value);
-	ns->ns_id = next;
+	else
+		ns->ns_id = atomic64_inc_return(&namespace_cookie);
 	return ns->ns_id;
-}
-
-int __ns_tree_reserve_id(struct ns_common *ns, u64 expected_id)
-{
-	s64 cookie_value;
-
-	if (!expected_id || expected_id > S64_MAX)
-		return -EINVAL;
-	for (;;) {
-		cookie_value = atomic64_read(&namespace_cookie);
-		if (cookie_value < 0 || expected_id <= cookie_value)
-			return -ESTALE;
-		if (atomic64_cmpxchg(&namespace_cookie, cookie_value,
-				     expected_id) == cookie_value) {
-			ns->ns_id = expected_id;
-			return 0;
-		}
-		cpu_relax();
-	}
 }
 
 struct klistns {

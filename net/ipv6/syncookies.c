@@ -16,7 +16,6 @@
 #include <net/secure_seq.h>
 #include <net/ipv6.h>
 #include <net/tcp.h>
-#include <net/xfrm.h>
 #include <net/tcp_ecn.h>
 
 #define COOKIEBITS 24	/* Upper bits store count */
@@ -248,13 +247,7 @@ struct sock *cookie_v6_check(struct sock *sk, struct sk_buff *skb)
 
 		ip6_ecmp_set_mp_hash(net, &fl6, tcp_rsk(req)->txhash);
 
-		{
-			struct xfrm_flow_origin origin =
-				xfrm_flow_origin_request(req);
-
-			dst = ip6_dst_lookup_flow_origin(net, sk, &fl6, final_p,
-							&origin);
-		}
+		dst = ip6_dst_lookup_flow(net, sk, &fl6, final_p);
 		if (IS_ERR(dst)) {
 			SKB_DR_SET(reason, IP_OUTNOROUTES);
 			goto out_free;

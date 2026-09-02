@@ -256,25 +256,16 @@ static void unix_table_double_unlock(struct net *net,
 static void unix_get_secdata(struct scm_cookie *scm, struct sk_buff *skb)
 {
 	UNIXCB(skb).secid = scm->secid;
-	UNIXCB(skb).security = security_scm_get(scm->security);
 }
 
 static inline void unix_set_secdata(struct scm_cookie *scm, struct sk_buff *skb)
 {
 	scm->secid = UNIXCB(skb).secid;
-	scm->security = security_scm_get(UNIXCB(skb).security);
 }
 
 static inline bool unix_secdata_eq(struct scm_cookie *scm, struct sk_buff *skb)
 {
-	return scm->secid == UNIXCB(skb).secid &&
-	       security_scm_secdata_eq(scm->security, UNIXCB(skb).security);
-}
-
-static inline void unix_drop_secdata(struct sk_buff *skb)
-{
-	security_scm_put(UNIXCB(skb).security);
-	UNIXCB(skb).security = NULL;
+	return (scm->secid == UNIXCB(skb).secid);
 }
 #else
 static inline void unix_get_secdata(struct scm_cookie *scm, struct sk_buff *skb)
@@ -286,10 +277,6 @@ static inline void unix_set_secdata(struct scm_cookie *scm, struct sk_buff *skb)
 static inline bool unix_secdata_eq(struct scm_cookie *scm, struct sk_buff *skb)
 {
 	return true;
-}
-
-static inline void unix_drop_secdata(struct sk_buff *skb)
-{
 }
 #endif /* CONFIG_SECURITY_NETWORK */
 
@@ -1394,9 +1381,7 @@ static int unix_bind_bsd(struct sock *sk, struct sockaddr_un *sunaddr,
 	idmap = mnt_idmap(parent.mnt);
 	err = security_path_mknod(&parent, dentry, mode, 0);
 	if (!err)
-		err = vfs_mknod_mnt(idmap, parent.mnt,
-				    d_inode(parent.dentry), dentry,
-				    mode, 0, NULL);
+		err = vfs_mknod(idmap, d_inode(parent.dentry), dentry, mode, 0, NULL);
 	if (err)
 		goto out_path;
 	err = mutex_lock_interruptible(&u->bindlock);
@@ -1422,7 +1407,7 @@ out_unlock:
 	err = -EINVAL;
 out_unlink:
 	/* failed after successful mknod?  unlink what we'd created... */
-	vfs_unlink_mnt(idmap, parent.mnt, d_inode(parent.dentry), dentry, NULL);
+	vfs_unlink(idmap, d_inode(parent.dentry), dentry, NULL);
 out_path:
 	end_creating_path(&parent, dentry);
 out:
@@ -1982,7 +1967,6 @@ static void unix_destruct_scm(struct sk_buff *skb)
 	struct scm_cookie scm = {};
 
 	swap(scm.pid, UNIXCB(skb).pid);
-	unix_drop_secdata(skb);
 
 	if (UNIXCB(skb).fp)
 		unix_detach_fds(&scm, skb);
@@ -2005,10 +1989,10 @@ static int unix_scm_to_skb(struct scm_cookie *scm, struct sk_buff *skb, bool sen
 	UNIXCB(skb).gid = scm->creds.gid;
 	UNIXCB(skb).fp = NULL;
 	unix_get_secdata(scm, skb);
-	skb->destructor = unix_wfree;
 	if (scm->fp && send_fds)
 		err = unix_attach_fds(scm, skb);
 
+	skb->destructor = unix_wfree;
 	return err;
 }
 
@@ -3037,7 +3021,7 @@ unlock:
 			/* Never glue messages from different writers */
 			if (!unix_skb_scm_eq(skb, &scm))
 				break;
-		} else if (unix_may_passcred(sk) || sk->sk_scm_security) {
+		} else if (unix_may_passcred(sk)) {
 			/* Copy credentials */
 			unix_skb_to_scm(skb, &scm);
 			check_creds = true;

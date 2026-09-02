@@ -26,7 +26,6 @@
 
 struct inode;
 struct dentry;
-struct vfsmount;
 
 static inline bool is_posix_acl_xattr(const char *name)
 {
@@ -80,52 +79,25 @@ struct xattr {
 ssize_t __vfs_getxattr(struct dentry *, struct inode *, const char *, void *, size_t);
 ssize_t vfs_getxattr(struct mnt_idmap *, struct dentry *, const char *,
 		     void *, size_t);
-ssize_t vfs_getxattr_mnt(struct mnt_idmap *idmap,
-			 const struct vfsmount *mnt, struct dentry *dentry,
-			 const char *name, void *value, size_t size);
 ssize_t vfs_listxattr(struct dentry *d, char *list, size_t size);
-ssize_t vfs_listxattr_mnt(const struct vfsmount *mnt, struct dentry *d,
-			  char *list, size_t size);
 int __vfs_setxattr(struct mnt_idmap *, struct dentry *, struct inode *,
 		   const char *, const void *, size_t, int);
-int __vfs_setxattr_noperm_mnt(struct mnt_idmap *, const struct vfsmount *,
-			      struct dentry *, const char *, const void *,
-			      size_t, int);
 int __vfs_setxattr_noperm(struct mnt_idmap *, struct dentry *,
-				   const char *, const void *, size_t, int);
+			  const char *, const void *, size_t, int);
 int __vfs_setxattr_locked(struct mnt_idmap *, struct dentry *,
 			  const char *, const void *, size_t, int,
 			  struct delegated_inode *);
-int __vfs_setxattr_locked_mnt(struct mnt_idmap *idmap,
-			      const struct vfsmount *mnt,
-			      struct dentry *dentry, const char *name,
-			      const void *value, size_t size, int flags,
-			      struct delegated_inode *delegated_inode);
 int vfs_setxattr(struct mnt_idmap *, struct dentry *, const char *,
 		 const void *, size_t, int);
-int vfs_setxattr_mnt(struct mnt_idmap *idmap, const struct vfsmount *mnt,
-		     struct dentry *dentry, const char *name,
-		     const void *value, size_t size, int flags);
 int __vfs_removexattr(struct mnt_idmap *, struct dentry *, const char *);
 int __vfs_removexattr_locked(struct mnt_idmap *, struct dentry *,
 			     const char *, struct delegated_inode *);
-int __vfs_removexattr_locked_mnt(struct mnt_idmap *idmap,
-				 const struct vfsmount *mnt,
-				 struct dentry *dentry, const char *name,
-				 struct delegated_inode *delegated_inode);
 int vfs_removexattr(struct mnt_idmap *, struct dentry *, const char *);
-int vfs_removexattr_mnt(struct mnt_idmap *idmap,
-			const struct vfsmount *mnt, struct dentry *dentry,
-			const char *name);
 
 ssize_t generic_listxattr(struct dentry *dentry, char *buffer, size_t buffer_size);
 int vfs_getxattr_alloc(struct mnt_idmap *idmap,
 		       struct dentry *dentry, const char *name,
 		       char **xattr_value, size_t size, gfp_t flags);
-int vfs_getxattr_alloc_mnt(struct mnt_idmap *idmap,
-			   const struct vfsmount *mnt, struct dentry *dentry,
-			   const char *name, char **xattr_value, size_t size,
-			   gfp_t flags);
 
 int xattr_supports_user_prefix(struct inode *inode);
 

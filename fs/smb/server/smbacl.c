@@ -1178,12 +1178,8 @@ int smb_inherit_dacl(struct ksmbd_conn *conn,
 	struct smb_ace *parent_aces, *aces;
 	struct smb_acl *parent_pdacl;
 	struct smb_ntsd *parent_pntsd = NULL;
-	struct dentry *parent = path->dentry->d_parent;
-	struct path parent_path = {
-		.mnt = path->mnt,
-		.dentry = parent,
-	};
 	struct smb_sid owner_sid, group_sid;
+	struct dentry *parent = path->dentry->d_parent;
 	struct mnt_idmap *idmap = mnt_idmap(path->mnt);
 	int inherited_flags = 0, flags = 0, i, nt_size = 0, pdacl_size;
 	int rc = 0, pntsd_type, ppntsd_size, acl_len, aces_size;
@@ -1194,7 +1190,7 @@ int smb_inherit_dacl(struct ksmbd_conn *conn,
 	bool is_dir = S_ISDIR(d_inode(path->dentry)->i_mode);
 
 	ppntsd_size = ksmbd_vfs_get_sd_xattr(conn, idmap,
-					    &parent_path, &parent_pntsd);
+					    parent, &parent_pntsd);
 	if (ppntsd_size <= 0)
 		return -ENOENT;
 
@@ -1457,7 +1453,7 @@ int smb_check_perm_dacl(struct ksmbd_conn *conn, const struct path *path,
 
 	ksmbd_debug(SMB, "check permission using windows acl\n");
 	pntsd_size = ksmbd_vfs_get_sd_xattr(conn, idmap,
-					    path, &pntsd);
+					    path->dentry, &pntsd);
 	if (pntsd_size <= 0 || !pntsd)
 		goto err_out;
 
@@ -1662,7 +1658,7 @@ int set_info_sec(struct ksmbd_conn *conn, struct ksmbd_tree_connect *tcon,
 	}
 
 	inode_lock(inode);
-	rc = notify_change_mnt(idmap, path->mnt, path->dentry, &newattrs, NULL);
+	rc = notify_change(idmap, path->dentry, &newattrs, NULL);
 	inode_unlock(inode);
 	if (rc)
 		goto out;

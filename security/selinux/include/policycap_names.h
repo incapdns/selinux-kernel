@@ -23,7 +23,6 @@ const char *const selinux_policycap_names[__POLICYDB_CAP_MAX] = {
 	"functionfs_seclabel",
 	"memfd_class",
 	"bpf_token_perms",
-	"bpf_object_perms",
 };
 /* clang-format on */
 

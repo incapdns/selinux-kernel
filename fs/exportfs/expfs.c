@@ -142,8 +142,7 @@ static struct dentry *reconnect_one(struct vfsmount *mnt,
 	if (err)
 		goto out_err;
 	dprintk("%s: found name: %s\n", __func__, nbuf);
-	tmp = lookup_one_unlocked_mnt(mnt_idmap(mnt), mnt, &QSTR(nbuf),
-				      parent);
+	tmp = lookup_one_unlocked(mnt_idmap(mnt), &QSTR(nbuf), parent);
 	if (IS_ERR(tmp)) {
 		dprintk("lookup failed: %ld\n", PTR_ERR(tmp));
 		err = PTR_ERR(tmp);
@@ -550,8 +549,7 @@ exportfs_decode_fh_raw(struct vfsmount *mnt, struct fid *fid, int fh_len,
 			goto err_result;
 		}
 
-		nresult = lookup_one_unlocked_mnt(mnt_idmap(mnt), mnt,
-					      &QSTR(nbuf), target_dir);
+		nresult = lookup_one_unlocked(mnt_idmap(mnt), &QSTR(nbuf), target_dir);
 		if (!IS_ERR(nresult)) {
 			if (unlikely(nresult->d_inode != result->d_inode)) {
 				dput(nresult);

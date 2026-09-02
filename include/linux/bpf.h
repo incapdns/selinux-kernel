@@ -60,7 +60,6 @@ struct bpf_func_state;
 struct ftrace_ops;
 struct cgroup;
 struct bpf_token;
-struct perf_event_relation;
 struct user_namespace;
 struct super_block;
 struct inode;
@@ -1917,8 +1916,6 @@ struct bpf_link {
 	enum bpf_link_type type;
 	const struct bpf_link_ops *ops;
 	struct bpf_prog *prog;
-	void *security;
-	bool security_initialized;
 
 	u32 flags;
 	enum bpf_attach_type attach_type;
@@ -2445,8 +2442,6 @@ struct bpf_event_entry {
 	struct perf_event *event;
 	struct file *perf_file;
 	struct file *map_file;
-	struct perf_event_relation *read_relation;
-	struct perf_event_relation *write_relation;
 	struct rcu_head rcu;
 };
 
@@ -2490,9 +2485,6 @@ u64 bpf_event_output(struct bpf_map *map, u64 flags, void *meta, u64 meta_size,
  */
 struct bpf_prog_array_item {
 	struct bpf_prog *prog;
-	/* Optional durable authority for perf-triggered execution. */
-	struct perf_event_relation *perf_relation;
-	bool perf_relation_required;
 	union {
 		struct bpf_cgroup_storage *cgroup_storage[MAX_BPF_CGROUP_STORAGE_TYPE];
 		u64 bpf_cookie;
@@ -2523,9 +2515,6 @@ int bpf_prog_array_copy_to_user(struct bpf_prog_array *progs,
 
 void bpf_prog_array_delete_safe(struct bpf_prog_array *progs,
 				struct bpf_prog *old_prog);
-struct perf_event_relation *
-bpf_prog_array_delete_safe_with_perf_relation(
-	struct bpf_prog_array *progs, struct bpf_prog *old_prog);
 int bpf_prog_array_delete_safe_at(struct bpf_prog_array *array, int index);
 int bpf_prog_array_update_at(struct bpf_prog_array *array, int index,
 			     struct bpf_prog *prog);
@@ -2537,13 +2526,6 @@ int bpf_prog_array_copy(struct bpf_prog_array *old_array,
 			struct bpf_prog *include_prog,
 			u64 bpf_cookie,
 			struct bpf_prog_array **new_array);
-int bpf_prog_array_copy_with_perf_relation(
-	struct bpf_prog_array *old_array, struct bpf_prog *exclude_prog,
-	struct bpf_prog *include_prog, u64 bpf_cookie,
-	struct perf_event_relation *relation,
-	struct bpf_prog_array **new_array);
-bool bpf_prog_array_item_relation_valid(
-	const struct bpf_prog_array_item *item);
 
 struct bpf_run_ctx {};
 
@@ -2611,11 +2593,6 @@ bpf_prog_run_array(const struct bpf_prog_array *array,
 	old_run_ctx = bpf_set_run_ctx(&run_ctx.run_ctx);
 	item = &array->items[0];
 	while ((prog = READ_ONCE(item->prog))) {
-		if (unlikely(READ_ONCE(item->perf_relation_required)) &&
-		    unlikely(!bpf_prog_array_item_relation_valid(item))) {
-			item++;
-			continue;
-		}
 		run_ctx.bpf_cookie = item->bpf_cookie;
 		ret &= run_prog(prog, ctx);
 		item++;
@@ -2658,11 +2635,6 @@ bpf_prog_run_array_uprobe(const struct bpf_prog_array *array,
 	old_run_ctx = bpf_set_run_ctx(&run_ctx.run_ctx);
 	item = &array->items[0];
 	while ((prog = READ_ONCE(item->prog))) {
-		if (unlikely(READ_ONCE(item->perf_relation_required)) &&
-		    unlikely(!bpf_prog_array_item_relation_valid(item))) {
-			item++;
-			continue;
-		}
 		if (!prog->sleepable)
 			rcu_read_lock();
 
@@ -2709,8 +2681,6 @@ static inline void bpf_enable_instrumentation(void)
 extern const struct super_operations bpf_super_ops;
 extern const struct file_operations bpf_map_fops;
 extern const struct file_operations bpf_prog_fops;
-extern const struct file_operations bpf_link_fops;
-extern const struct file_operations bpf_link_fops_poll;
 extern const struct file_operations bpf_iter_fops;
 extern const struct file_operations bpf_token_fops;
 
@@ -2920,9 +2890,7 @@ void bpf_link_init_sleepable(struct bpf_link *link, enum bpf_link_type type,
 void bpf_tramp_link_init(struct bpf_tramp_link *link, enum bpf_link_type type,
 			 const struct bpf_link_ops *ops, struct bpf_prog *prog,
 			 enum bpf_attach_type attach_type, u64 cookie);
-int bpf_link_prime(struct bpf_link *link, struct bpf_link_primer *primer,
-		   const struct bpf_prog *related_prog,
-		   const struct bpf_map *related_map);
+int bpf_link_prime(struct bpf_link *link, struct bpf_link_primer *primer);
 int bpf_link_settle(struct bpf_link_primer *primer);
 void bpf_link_cleanup(struct bpf_link_primer *primer);
 void bpf_link_inc(struct bpf_link *link);
@@ -3273,11 +3241,6 @@ bpf_prog_run_array_sleepable(const struct bpf_prog_array *array,
 			item++;
 			continue;
 		}
-		if (unlikely(READ_ONCE(item->perf_relation_required)) &&
-		    unlikely(!bpf_prog_array_item_relation_valid(item))) {
-			item++;
-			continue;
-		}
 
 		if (unlikely(!bpf_prog_get_recursion_context(prog))) {
 			bpf_prog_inc_misses_counter(prog);
@@ -3357,9 +3320,7 @@ static inline void bpf_tramp_link_init(struct bpf_tramp_link *link, enum bpf_lin
 }
 
 static inline int bpf_link_prime(struct bpf_link *link,
-				 struct bpf_link_primer *primer,
-				 const struct bpf_prog *related_prog,
-				 const struct bpf_map *related_map)
+				 struct bpf_link_primer *primer)
 {
 	return -EOPNOTSUPP;
 }

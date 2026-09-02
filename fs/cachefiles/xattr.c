@@ -67,9 +67,9 @@ int cachefiles_set_object_xattr(struct cachefiles_object *object)
 	if (ret == 0) {
 		ret = mnt_want_write_file(file);
 		if (ret == 0) {
-			ret = vfs_setxattr_mnt(&nop_mnt_idmap, file->f_path.mnt,
-					       dentry, cachefiles_xattr_cache, buf,
-					       sizeof(struct cachefiles_xattr) + len, 0);
+			ret = vfs_setxattr(&nop_mnt_idmap, dentry,
+					   cachefiles_xattr_cache, buf,
+					   sizeof(struct cachefiles_xattr) + len, 0);
 			mnt_drop_write_file(file);
 		}
 	}
@@ -116,8 +116,7 @@ int cachefiles_check_auxdata(struct cachefiles_object *object, struct file *file
 
 	xlen = cachefiles_inject_read_error();
 	if (xlen == 0)
-		xlen = vfs_getxattr_mnt(&nop_mnt_idmap, file->f_path.mnt,
-					dentry, cachefiles_xattr_cache, buf, tlen);
+		xlen = vfs_getxattr(&nop_mnt_idmap, dentry, cachefiles_xattr_cache, buf, tlen);
 	if (xlen != tlen) {
 		if (xlen < 0) {
 			ret = xlen;
@@ -168,8 +167,8 @@ int cachefiles_remove_object_xattr(struct cachefiles_cache *cache,
 	if (ret == 0) {
 		ret = mnt_want_write(cache->mnt);
 		if (ret == 0) {
-			ret = vfs_removexattr_mnt(&nop_mnt_idmap, cache->mnt,
-						  dentry, cachefiles_xattr_cache);
+			ret = vfs_removexattr(&nop_mnt_idmap, dentry,
+					      cachefiles_xattr_cache);
 			mnt_drop_write(cache->mnt);
 		}
 	}
@@ -231,9 +230,9 @@ bool cachefiles_set_volume_xattr(struct cachefiles_volume *volume)
 	if (ret == 0) {
 		ret = mnt_want_write(volume->cache->mnt);
 		if (ret == 0) {
-			ret = vfs_setxattr_mnt(&nop_mnt_idmap, volume->cache->mnt,
-					       dentry, cachefiles_xattr_cache,
-					       buf, len, 0);
+			ret = vfs_setxattr(&nop_mnt_idmap, dentry,
+					   cachefiles_xattr_cache,
+					   buf, len, 0);
 			mnt_drop_write(volume->cache->mnt);
 		}
 	}
@@ -277,8 +276,7 @@ int cachefiles_check_volume_xattr(struct cachefiles_volume *volume)
 
 	xlen = cachefiles_inject_read_error();
 	if (xlen == 0)
-		xlen = vfs_getxattr_mnt(&nop_mnt_idmap, volume->cache->mnt,
-					dentry, cachefiles_xattr_cache, buf, len);
+		xlen = vfs_getxattr(&nop_mnt_idmap, dentry, cachefiles_xattr_cache, buf, len);
 	if (xlen != len) {
 		if (xlen < 0) {
 			ret = xlen;
