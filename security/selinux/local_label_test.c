@@ -7,6 +7,7 @@
 
 #include "flask.h"
 #include "object_label.h"
+#include "resource.h"
 #include "security.h"
 
 struct selinux_local_label_fixture {
@@ -238,11 +239,58 @@ static void selinux_clone_copies_each_policy_label(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, observed.sid, child.sid);
 }
 
+static void selinux_initial_state_is_not_child_quota_limited(
+	struct kunit *test)
+{
+	struct selinux_local_label_fixture *fixture = test->priv;
+	struct selinux_resource_account *resources =
+		fixture->parent->resources;
+	u64 global_objects = selinux_kunit_resource_global_objects();
+	u64 global_bytes = selinux_kunit_resource_global_bytes();
+	u64 owner_objects = selinux_kunit_resource_total_objects(resources);
+	u64 owner_bytes = selinux_kunit_resource_total_bytes(resources);
+	u64 objects = CONFIG_SECURITY_SELINUX_RESOURCE_OBJECTS_PER_USERNS + 1ULL;
+	u64 bytes = 4096;
+
+	KUNIT_ASSERT_EQ(test,
+			 selinux_resource_reserve(
+				 resources,
+				 SELINUX_RESOURCE_OBJECT_IDENTITY,
+				 objects,
+				 bytes),
+			 0);
+	KUNIT_EXPECT_EQ(test,
+			selinux_kunit_resource_total_objects(resources),
+			owner_objects + objects);
+	KUNIT_EXPECT_EQ(test,
+			selinux_kunit_resource_total_bytes(resources),
+			owner_bytes + bytes);
+	KUNIT_EXPECT_EQ(test,
+			selinux_kunit_resource_global_objects(),
+			global_objects);
+	KUNIT_EXPECT_EQ(test,
+			selinux_kunit_resource_global_bytes(),
+			global_bytes);
+
+	selinux_resource_release(
+		resources,
+		SELINUX_RESOURCE_OBJECT_IDENTITY,
+		objects,
+		bytes);
+	KUNIT_EXPECT_EQ(test,
+			selinux_kunit_resource_total_objects(resources),
+			owner_objects);
+	KUNIT_EXPECT_EQ(test,
+			selinux_kunit_resource_total_bytes(resources),
+			owner_bytes);
+}
+
 static struct kunit_case selinux_local_label_test_cases[] = {
 	KUNIT_CASE(selinux_policy_local_labels_are_independent),
 	KUNIT_CASE(selinux_missing_policy_label_is_local_unlabeled),
 	KUNIT_CASE(selinux_guarded_updates_are_atomic),
 	KUNIT_CASE(selinux_clone_copies_each_policy_label),
+	KUNIT_CASE(selinux_initial_state_is_not_child_quota_limited),
 	{},
 };
 

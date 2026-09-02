@@ -203,6 +203,38 @@ static bool selinux_resource_sub_checked(atomic64_t *counter, u64 amount)
 	}
 }
 
+static bool selinux_resource_account_is_initial(
+	const struct selinux_resource_account *account)
+{
+	return account->owner == &init_user_ns;
+}
+
+static int selinux_resource_reserve_initial(
+	struct selinux_resource_account *account,
+	enum selinux_resource_kind kind, u64 objects, u64 bytes)
+{
+	/*
+	 * The initial SELinux state labels ordinary host inodes, sockets and
+	 * tasks.  Those allocations are trusted host operation, not resources
+	 * delegated to an unprivileged SELinux namespace.  Keep exact owner and
+	 * per-kind accounting, but do not let child containment limits make the
+	 * host unable to allocate a socket or inode.
+	 */
+	if (!selinux_resource_add_bounded(&account->total_objects, objects,
+					 S64_MAX))
+		return -EOVERFLOW;
+	if (!selinux_resource_add_bounded(&account->total_bytes, bytes,
+					 S64_MAX)) {
+		WARN_ON_ONCE(!selinux_resource_sub_checked(
+			&account->total_objects, objects));
+		return -EOVERFLOW;
+	}
+
+	atomic64_add(objects, &account->objects[kind]);
+	atomic64_add(bytes, &account->bytes[kind]);
+	return 0;
+}
+
 struct selinux_resource_account *
 selinux_resource_account_get_owner(struct user_namespace *owner)
 {
@@ -310,6 +342,9 @@ int selinux_resource_reserve(struct selinux_resource_account *account,
 {
 	if (!account || kind >= SELINUX_RESOURCE_KINDS || (!objects && !bytes))
 		return -EINVAL;
+	if (selinux_resource_account_is_initial(account))
+		return selinux_resource_reserve_initial(
+			account, kind, objects, bytes);
 #ifdef CONFIG_SECURITY_SELINUX_KUNIT_TEST
 	if (selinux_resource_reserve_kunit_fault_take(
 		    account, SELINUX_RESOURCE_RESERVE_KUNIT_FAULT_GLOBAL_OBJECTS))
@@ -389,14 +424,19 @@ void selinux_resource_release(struct selinux_resource_account *account,
 			      enum selinux_resource_kind kind, u64 objects,
 			      u64 bytes)
 {
+	bool initial;
+
 	if (WARN_ON_ONCE(!account || kind >= SELINUX_RESOURCE_KINDS))
 		return;
+	initial = selinux_resource_account_is_initial(account);
 	WARN_ON_ONCE(!selinux_resource_sub_checked(&account->bytes[kind], bytes));
 	WARN_ON_ONCE(!selinux_resource_sub_checked(&account->objects[kind],
 						 objects));
 	WARN_ON_ONCE(!selinux_resource_sub_checked(&account->total_bytes, bytes));
 	WARN_ON_ONCE(!selinux_resource_sub_checked(&account->total_objects,
 						 objects));
+	if (initial)
+		return;
 	WARN_ON_ONCE(!selinux_resource_sub_checked(
 		&selinux_resource_global_bytes, bytes));
 	WARN_ON_ONCE(!selinux_resource_sub_checked(
